@@ -143,6 +143,7 @@ class ProxyWindow:
         self._low_price_tree: ttk.Treeview | None = None
         self._low_price_refresh_button: ttk.Button | None = None
         self._low_price_refreshing = False
+        self._low_price_refresh_generation = 0
         self._low_price_items_by_product_id: dict[str, LowPriceAccount] = {}
         self._low_price_product_id_by_item: dict[str, str] = {}
         self._low_price_item_by_product_id: dict[str, str] = {}
@@ -2377,12 +2378,15 @@ del "%~f0" >nul 2>nul
     def refresh_low_price_accounts(self) -> None:
         if self._low_price_tree is None or self._low_price_refreshing:
             return
+        self._low_price_refresh_generation += 1
+        refresh_generation = self._low_price_refresh_generation
+        self._clear_low_price_detail_cache()
         self._low_price_refreshing = True
         self._set_low_price_buttons_state()
         proxy_url = self._get_proxy_for_usage_request()
-        Thread(target=self._refresh_low_price_accounts_worker, args=(proxy_url,), daemon=True).start()
+        Thread(target=self._refresh_low_price_accounts_worker, args=(proxy_url, refresh_generation), daemon=True).start()
 
-    def _refresh_low_price_accounts_worker(self, proxy_url: str) -> None:
+    def _refresh_low_price_accounts_worker(self, proxy_url: str, refresh_generation: int) -> None:
         try:
             items_by_product_id: dict[str, LowPriceAccount] = {}
             with ThreadPoolExecutor(max_workers=10) as executor:
@@ -2404,11 +2408,13 @@ del "%~f0" >nul 2>nul
             items = []
             error = str(exc)
         try:
-            self._post_ui(lambda: self._finish_low_price_refresh(items, error))
+            self._post_ui(lambda: self._finish_low_price_refresh(items, error, refresh_generation))
         except tk.TclError:
             pass
 
-    def _finish_low_price_refresh(self, items: list[LowPriceAccount], error: str) -> None:
+    def _finish_low_price_refresh(self, items: list[LowPriceAccount], error: str, refresh_generation: int) -> None:
+        if refresh_generation != self._low_price_refresh_generation:
+            return
         self._low_price_refreshing = False
         self._set_low_price_buttons_state()
         if self._low_price_tree is None:
@@ -2432,6 +2438,13 @@ del "%~f0" >nul 2>nul
             self._low_price_refresh_button.config(text="刷新", state="normal")
             return
         self._low_price_refresh_button.config(text="刷新中", state="disabled")
+
+    def _clear_low_price_detail_cache(self) -> None:
+        self._low_price_seller_info_by_product_id.clear()
+        self._low_price_details_by_product_id.clear()
+        with self._low_price_seller_info_lock:
+            self._low_price_seller_info_inflight.clear()
+            self._low_price_seller_info_updated.clear()
 
     def _render_low_price_items(self) -> None:
         if self._low_price_tree is None:
@@ -2506,6 +2519,7 @@ del "%~f0" >nul 2>nul
             self._schedule_low_price_visible_seller_update()
             return
         proxy_url = self._get_proxy_for_usage_request()
+        refresh_generation = self._low_price_refresh_generation
         for product_id in visible_product_ids:
             item = self._low_price_items_by_product_id.get(product_id)
             if item is None or not item.href:
@@ -2522,7 +2536,13 @@ del "%~f0" >nul 2>nul
                 ):
                     continue
                 self._low_price_seller_info_inflight.add(product_id)
-            self._low_price_seller_info_executor.submit(self._fetch_low_price_product_info_worker, product_id, item.href, proxy_url)
+            self._low_price_seller_info_executor.submit(
+                self._fetch_low_price_product_info_worker,
+                product_id,
+                item.href,
+                proxy_url,
+                refresh_generation,
+            )
 
     def _get_visible_low_price_product_ids(self) -> list[str]:
         if self._low_price_tree is None:
@@ -2536,9 +2556,18 @@ del "%~f0" >nul 2>nul
                 visible_product_ids.append(product_id)
         return visible_product_ids
 
-    def _fetch_low_price_product_info_worker(self, product_id: str, href: str, proxy_url: str) -> None:
+    def _fetch_low_price_product_info_worker(
+        self,
+        product_id: str,
+        href: str,
+        proxy_url: str,
+        refresh_generation: int,
+    ) -> None:
         try:
             with self._low_price_seller_info_lock:
+                if refresh_generation != self._low_price_refresh_generation:
+                    self._low_price_seller_info_inflight.discard(product_id)
+                    return
                 if product_id in self._low_price_seller_info_updated:
                     self._low_price_seller_info_inflight.discard(product_id)
                     return
@@ -2549,10 +2578,11 @@ del "%~f0" >nul 2>nul
             error = str(exc)
         try:
             self._post_ui(
-                lambda value=product_id, info=product_info, err=error: self._finish_low_price_product_info_update(
+                lambda value=product_id, info=product_info, err=error, generation=refresh_generation: self._finish_low_price_product_info_update(
                     value,
                     info,
                     err,
+                    generation,
                 )
             )
         except tk.TclError:
@@ -2563,9 +2593,12 @@ del "%~f0" >nul 2>nul
         product_id: str,
         product_info: LowPriceProductInfo,
         error: str,
+        refresh_generation: int,
     ) -> None:
         with self._low_price_seller_info_lock:
             self._low_price_seller_info_inflight.discard(product_id)
+            if refresh_generation != self._low_price_refresh_generation:
+                return
             if not error:
                 self._low_price_seller_info_updated.add(product_id)
         if error:
@@ -2752,6 +2785,8 @@ del "%~f0" >nul 2>nul
 
     def _on_low_price_window_destroy(self, event: tk.Event) -> None:
         if event.widget is self._low_price_window:
+            self._low_price_refresh_generation += 1
+            self._low_price_refreshing = False
             if self._low_price_visible_update_after_id is not None:
                 try:
                     self.root.after_cancel(self._low_price_visible_update_after_id)
@@ -2767,6 +2802,10 @@ del "%~f0" >nul 2>nul
             self._low_price_titles_by_item.clear()
             self._low_price_details_by_item.clear()
             self._low_price_details_by_product_id.clear()
+            self._low_price_seller_info_by_product_id.clear()
+            with self._low_price_seller_info_lock:
+                self._low_price_seller_info_inflight.clear()
+                self._low_price_seller_info_updated.clear()
 
     def _start_correct_traffic_countdown(self) -> None:
         if self._correct_traffic_after_id is not None:
