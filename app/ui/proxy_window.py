@@ -2249,6 +2249,8 @@ del "%~f0" >nul 2>nul
             return
         if not self._refresh_config():
             return
+        if not messagebox.askyesno("一键刷新令牌", "将尝试刷新所有本地授权文件的令牌。\n\n确认现在执行吗？"):
+            return
         self._refresh_tokens_running = True
         if self._refresh_tokens_button is not None:
             self._refresh_tokens_button.config(text="刷新中", state="disabled")
