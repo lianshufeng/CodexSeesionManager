@@ -267,6 +267,7 @@ class LowPriceAccountService:
         return parser.items
 
     def fetch_catalog_accounts(self, proxy_url: str = "", page: int = 1, count: int = 30) -> list[LowPriceAccount]:
+        language, currency = self._parse_cookie_settings(self.COOKIE)
         query = urlencode(
             {
                 "categoryId": "",
@@ -278,7 +279,7 @@ class LowPriceAccountService:
                 "ownerCategoryId": "",
                 "sellerId": "",
                 "sellerName": "",
-                "currency": "USD",
+                "currency": currency,
                 "page": str(max(page, 1)),
                 "count": str(count),
                 "individual": "false",
@@ -289,7 +290,7 @@ class LowPriceAccountService:
                 "priceTo": "450",
                 "includeAggregations": "false",
                 "fuzzy": "false",
-                "lang": "en-US",
+                "lang": language,
             }
         )
         request = Request(
@@ -297,6 +298,9 @@ class LowPriceAccountService:
             headers={
                 "User-Agent": "Mozilla/5.0",
                 "Accept": "application/json,text/javascript,*/*;q=0.8",
+                "Accept-Language": language,
+                "Cookie": self.COOKIE,
+                "X-Currency": currency,
             },
         )
         opener = self._build_opener(proxy_url)
