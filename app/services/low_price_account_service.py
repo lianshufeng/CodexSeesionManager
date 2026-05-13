@@ -162,7 +162,14 @@ class _LowPriceOptionParser(HTMLParser):
         self._depth += 1
         attr_map = {key: value or "" for key, value in attrs}
         classes = attr_map.get("class", "").split()
-        if tag == "input" and ("cl_selected2_option" in classes or "cl_checked_option" in classes):
+        input_type = attr_map.get("type", "").lower()
+        has_price_option_data = bool(attr_map.get("data-id") and attr_map.get("data-item-id"))
+        if (
+            tag == "input"
+            and input_type == "radio"
+            and has_price_option_data
+            and ("cl_selected2_option" in classes or "cl_checked_option" in classes)
+        ):
             self._current = {
                 "option_id": attr_map.get("data-id", ""),
                 "value_id": attr_map.get("value", ""),
