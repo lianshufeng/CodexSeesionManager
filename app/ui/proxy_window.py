@@ -3643,9 +3643,20 @@ del "%~f0" >nul 2>nul
         self._add_tray_icon()
         self.root.withdraw()
 
+    def request_restore_window(self) -> None:
+        self._post_ui(self.restore_window)
+
+    def restore_window(self) -> None:
+        self._restore_from_tray()
+
     def _restore_from_tray(self) -> None:
         self.root.deiconify()
         self.root.lift()
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.after(200, lambda: self.root.attributes("-topmost", False))
+        except tk.TclError:
+            pass
         self.root.focus_force()
 
     def _add_tray_icon(self) -> None:

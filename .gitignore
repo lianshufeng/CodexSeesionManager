@@ -2,6 +2,7 @@
 /__pycache__
 /logs
 /config.json
+/.codex_session_manager.lock
 /codex_session.egg-info
 /build
 /auth

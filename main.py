@@ -80,8 +80,25 @@ def _install_exception_hooks(root) -> None:
 
 
 def main() -> None:
+    from app.utils.path_utils import app_root
+    from app.utils.single_instance import SingleInstance
+
+    single_instance = SingleInstance(app_root())
+    if single_instance.notify_existing(timeout=0.2):
+        return
+    if not single_instance.acquire():
+        if not single_instance.notify_existing():
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "程序已在当前目录运行。",
+                "启动提示",
+                _MB_OK | _MB_ICONWARNING,
+            )
+        return
+
     if not _is_admin():
         if _show_admin_prompt():
+            single_instance.close()
             if _restart_as_admin():
                 return
             ctypes.windll.user32.MessageBoxW(
@@ -90,26 +107,32 @@ def main() -> None:
                 "启动失败",
                 _MB_OK | _MB_ICONWARNING,
             )
+        else:
+            single_instance.close()
         sys.exit(1)
 
-    from app.services.log_service import get_log_service
+    try:
+        from app.services.log_service import get_log_service
 
-    log_service = get_log_service()
-    log_service.install()
+        log_service = get_log_service()
+        log_service.install()
 
-    from app.ui.proxy_window import ProxyWindow
-    import tkinter as tk
+        from app.ui.proxy_window import ProxyWindow
+        import tkinter as tk
 
-    root = tk.Tk()
-    _install_exception_hooks(root)
-    icon_path = _get_resource_path("icon", "icon.ico")
-    if os.path.exists(icon_path):
-        try:
-            root.iconbitmap(icon_path)
-        except tk.TclError:
-            pass
-    ProxyWindow(root)
-    root.mainloop()
+        root = tk.Tk()
+        _install_exception_hooks(root)
+        icon_path = _get_resource_path("icon", "icon.ico")
+        if os.path.exists(icon_path):
+            try:
+                root.iconbitmap(icon_path)
+            except tk.TclError:
+                pass
+        window = ProxyWindow(root)
+        single_instance.start_restore_server(window.request_restore_window)
+        root.mainloop()
+    finally:
+        single_instance.close()
 
 
 if __name__ == "__main__":
