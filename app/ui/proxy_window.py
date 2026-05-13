@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 import re
 import socket
@@ -2383,9 +2383,19 @@ del "%~f0" >nul 2>nul
     def _refresh_low_price_accounts_worker(self, proxy_url: str) -> None:
         try:
             items_by_product_id: dict[str, LowPriceAccount] = {}
-            for page in range(1, 6):
-                for item in self.low_price_account_service.fetch_accounts(proxy_url, page=page):
-                    items_by_product_id.setdefault(item.product_id, item)
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                html_futures = [
+                    executor.submit(self.low_price_account_service.fetch_accounts, proxy_url, page=page)
+                    for page in range(1, 6)
+                ]
+                catalog_futures = [
+                    executor.submit(self.low_price_account_service.fetch_catalog_accounts, proxy_url, page=page)
+                    for page in range(1, 6)
+                ]
+                wait(html_futures + catalog_futures)
+                for future in html_futures + catalog_futures:
+                    for item in future.result():
+                        items_by_product_id.setdefault(item.product_id, item)
             items = list(items_by_product_id.values())
             error = ""
         except Exception as exc:

@@ -217,6 +217,7 @@ class _LowPriceOptionParser(HTMLParser):
 
 class LowPriceAccountService:
     URL = "https://plati.market/asp/block_goods_category_2.asp"
+    CATALOG_URL = "https://api.digiseller.com/api/cataloguer/front/products"
     COOKIE = (
         "language=en%2DUS; vz=b441d9a3%2D83bf%2D4135%2D92b6%2D83f69e6fe366; "
         "customerid=58dd3bd0f59740e5aa7d736c6f723b07; curr=USD; __ddg1_=bFxxT4IGHcCLSxg6vH7E; "
@@ -265,6 +266,47 @@ class LowPriceAccountService:
         parser.feed(html)
         return parser.items
 
+    def fetch_catalog_accounts(self, proxy_url: str = "", page: int = 1, count: int = 30) -> list[LowPriceAccount]:
+        query = urlencode(
+            {
+                "categoryId": "",
+                "getProductsRecursive": "true",
+                "sellerCategoryId": "",
+                "productId": "",
+                "productName": "CHATGPT",
+                "ownerId": "plati",
+                "ownerCategoryId": "",
+                "sellerId": "",
+                "sellerName": "",
+                "currency": "USD",
+                "page": str(max(page, 1)),
+                "count": str(count),
+                "individual": "false",
+                "video": "false",
+                "image": "false",
+                "sortBy": "popular",
+                "priceFrom": "0",
+                "priceTo": "450",
+                "includeAggregations": "false",
+                "fuzzy": "false",
+                "lang": "en-US",
+            }
+        )
+        request = Request(
+            f"{self.CATALOG_URL}?{query}",
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json,text/javascript,*/*;q=0.8",
+            },
+        )
+        opener = self._build_opener(proxy_url)
+        response_context = opener.open(request, timeout=15) if opener is not None else urlopen(request, timeout=15)
+        with response_context as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            payload = response.read().decode(charset, "replace")
+        data = json.loads(payload)
+        return [self._catalog_item_to_account(item) for item in data.get("content", {}).get("items", [])]
+
     def fetch_seller_info(self, href: str, proxy_url: str = "") -> LowPriceSellerInfo:
         return self.fetch_product_info(href, proxy_url).seller_info
 
@@ -291,6 +333,44 @@ class LowPriceAccountService:
         path = href if href.startswith("/") else f"/{href}"
         separator = "&" if "?" in path else "?"
         return f"https://plati.market{path}{separator}ai=1426781"
+
+    def _catalog_item_to_account(self, item: dict) -> LowPriceAccount:
+        product_id = str(item.get("product_id") or "")
+        title = self._catalog_item_title(item)
+        name_url = str(item.get("name_url") or "")
+        return LowPriceAccount(
+            product_id=product_id,
+            title=title,
+            price=self._format_catalog_price(item.get("price"), str(item.get("currency") or "USD")),
+            sales=self._format_catalog_sales(item.get("month_sales"), bool(item.get("month_sales_exceeded"))),
+            credit=self._compact_number_text(str(int(float(item.get("seller_rating") or 0)))),
+            store_sales=self._format_catalog_sales(item.get("hide_total_sales") or item.get("total_sales"), False),
+            href=f"/itm/{name_url}/{product_id}" if name_url and product_id else "",
+        )
+
+    def _catalog_item_title(self, item: dict) -> str:
+        names = item.get("name") or []
+        for name in names:
+            if name.get("locale") == "en-US":
+                return str(name.get("value") or "")
+        if names:
+            return str(names[0].get("value") or "")
+        return ""
+
+    def _format_catalog_price(self, price: object, currency: str) -> str:
+        try:
+            amount = f"{float(price):.2f}".rstrip("0").rstrip(".")
+        except (TypeError, ValueError):
+            return ""
+        suffix = "$" if currency.upper() == "USD" else currency
+        return f"{amount} {suffix}".strip()
+
+    def _format_catalog_sales(self, sales: object, exceeded: bool) -> str:
+        try:
+            value = str(int(float(sales)))
+        except (TypeError, ValueError):
+            return ""
+        return f"{value}+" if exceeded else value
 
     def _parse_seller_info(self, html: str) -> LowPriceSellerInfo:
         match = re.search(
