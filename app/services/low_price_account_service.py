@@ -218,23 +218,20 @@ class _LowPriceOptionParser(HTMLParser):
 class LowPriceAccountService:
     URL = "https://plati.market/asp/block_goods_category_2.asp"
     CATALOG_URL = "https://api.digiseller.com/api/cataloguer/front/products"
-    COOKIE = (
-        "language=en%2DUS; vz=b441d9a3%2D83bf%2D4135%2D92b6%2D83f69e6fe366; "
-        "customerid=58dd3bd0f59740e5aa7d736c6f723b07; curr=USD; __ddg1_=bFxxT4IGHcCLSxg6vH7E; "
-        "digiseller-currency=USD; __ddgid_=j0SEQJjyvawclzJc; __ddg2_=rz5Do54N0zmmbp58; "
-        "email=251708339%40qq%2Ecom; uid=90C5F520%2DAE5B%2D4C08%2DB3FC%2D6B5A94F560AF; "
-        "_ga=GA1.1.1917781672.1761410754; _ga_33RMCM93S8=GS2.1.s1776000174$o1$g1$t1776000221$j13$l0$h0; "
-        "_ga_698HPYCMKC=GS2.1.s1776584100$o6$g0$t1776584100$j60$l0$h1824466282; "
-        "ASPSESSIONIDCAACCCDS=KDPBKHADIGECMDPJBAKEFEJB; ASPSESSIONIDSACQCQSR=DJGPGPADFOIMEDLPMEMFEAID; "
-        "ASPSESSIONIDSSRSARST=BHLKMCPCKNKBLMNKOCKHHHBL; ASPSESSIONIDQSDDBRQR=IIFOPFADKPFHDIKNFGIEKOEA; "
-        "ASPSESSIONIDAQCAAQSS=NBBIKCADFKFDHOBDKCNBOKIN; __ddg9_=83.229.122.128; lastsrch=chatgpt; "
-        "_ym_d=1777216976; _ym_isad=2; _ym_visorc=b; items_list_view=grid; "
-        "_ga_2WF69VW4C9=GS2.1.s1777216973$o59$g1$t1777217327$j60$l0$h0; __ddg10_=1777217332; "
-        "__ddg8_=sFcnqwjvfhL3P32g"
-    )
+    PLATI_PROXY_PREFIX = "https://proxy.jpy.wang/plati.market/"
+    BASE_COOKIE = "language=en%2DUS; curr=USD; digiseller-currency=USD; items_list_view=grid"
+    DDG_COOKIE_PATTERN = re.compile(r"(?:^|;)\s*__ddg1_=([^;]+)")
+
+    def __init__(self) -> None:
+        self._ddg_cookie_value = ""
+
+    def start_refresh_cycle(self, proxy_url: str = "") -> None:
+        self._refresh_ddg_cookie(proxy_url, force=True)
 
     def fetch_accounts(self, proxy_url: str = "", page: int = 1, rows: int = 24) -> list[LowPriceAccount]:
-        language, currency = self._parse_cookie_settings(self.COOKIE)
+        language, currency = self._parse_cookie_settings(self.BASE_COOKIE)
+        if not self._ddg_cookie_value:
+            self._refresh_ddg_cookie(proxy_url)
         query = urlencode(
             {
                 "id_cb": "1267",
@@ -252,10 +249,12 @@ class LowPriceAccountService:
                 "User-Agent": "Mozilla/5.0",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": language,
-                "Cookie": self.COOKIE,
                 "X-Currency": currency,
             },
         )
+        cookie = self._cookie_header()
+        if cookie:
+            request.add_header("Cookie", cookie)
         opener = self._build_opener(proxy_url)
         response_context = opener.open(request, timeout=15) if opener is not None else urlopen(request, timeout=15)
         with response_context as response:
@@ -267,7 +266,7 @@ class LowPriceAccountService:
         return parser.items
 
     def fetch_catalog_accounts(self, proxy_url: str = "", page: int = 1, count: int = 30) -> list[LowPriceAccount]:
-        language, currency = self._parse_cookie_settings(self.COOKIE)
+        language, currency = self._parse_cookie_settings(self.BASE_COOKIE)
         query = urlencode(
             {
                 "categoryId": "",
@@ -299,10 +298,12 @@ class LowPriceAccountService:
                 "User-Agent": "Mozilla/5.0",
                 "Accept": "application/json,text/javascript,*/*;q=0.8",
                 "Accept-Language": language,
-                "Cookie": self.COOKIE,
                 "X-Currency": currency,
             },
         )
+        cookie = self._cookie_header()
+        if cookie:
+            request.add_header("Cookie", cookie)
         opener = self._build_opener(proxy_url)
         response_context = opener.open(request, timeout=15) if opener is not None else urlopen(request, timeout=15)
         with response_context as response:
@@ -321,9 +322,11 @@ class LowPriceAccountService:
             headers={
                 "User-Agent": "Mozilla/5.0",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Cookie": self.COOKIE,
             },
         )
+        cookie = self._cookie_header()
+        if cookie:
+            request.add_header("Cookie", cookie)
         opener = self._build_opener(proxy_url)
         response_context = opener.open(request, timeout=15) if opener is not None else urlopen(request, timeout=15)
         with response_context as response:
@@ -336,7 +339,7 @@ class LowPriceAccountService:
     def _build_product_url(self, href: str) -> str:
         path = href if href.startswith("/") else f"/{href}"
         separator = "&" if "?" in path else "?"
-        return f"https://plati.market{path}{separator}ai=1426781"
+        return f"{self.PLATI_PROXY_PREFIX}{path.lstrip('/')}{separator}ai=1426781"
 
     def _catalog_item_to_account(self, item: dict) -> LowPriceAccount:
         product_id = str(item.get("product_id") or "")
@@ -443,7 +446,7 @@ class LowPriceAccountService:
             return ""
         xml = f'<response><option O="{option_id}" V="{value_id}"/></response>'
         url = (
-            "https://plati.market/asp/price_options.asp"
+            f"{self.PLATI_PROXY_PREFIX}asp/price_options.asp"
             f"?p={quote(product_id)}&n=0&c=USD&x={quote(xml, safe='')}"
         )
         request = Request(
@@ -451,9 +454,11 @@ class LowPriceAccountService:
             headers={
                 "User-Agent": "Mozilla/5.0",
                 "Accept": "application/json,text/javascript,*/*;q=0.8",
-                "Cookie": self.COOKIE,
             },
         )
+        cookie = self._cookie_header()
+        if cookie:
+            request.add_header("Cookie", cookie)
         opener = self._build_opener(proxy_url)
         response_context = opener.open(request, timeout=5) if opener is not None else urlopen(request, timeout=5)
         with response_context as response:
@@ -505,6 +510,62 @@ class LowPriceAccountService:
         if not re.search(r"\d", value):
             return value
         return re.sub(r"\s+", "", value)
+
+    def _refresh_ddg_cookie(self, proxy_url: str, force: bool = False) -> None:
+        if self._ddg_cookie_value and not force:
+            return
+        self._ddg_cookie_value = ""
+        language, currency = self._parse_cookie_settings(self.BASE_COOKIE)
+        query = urlencode(
+            {
+                "categoryId": "",
+                "getProductsRecursive": "true",
+                "sellerCategoryId": "",
+                "productId": "",
+                "productName": "CHATGPT",
+                "ownerId": "plati",
+                "ownerCategoryId": "",
+                "sellerId": "",
+                "sellerName": "",
+                "currency": currency,
+                "page": "1",
+                "count": "1",
+                "individual": "false",
+                "video": "false",
+                "image": "false",
+                "sortBy": "popular",
+                "priceFrom": "0",
+                "priceTo": "450",
+                "includeAggregations": "false",
+                "fuzzy": "false",
+                "lang": language,
+            }
+        )
+        request = Request(
+            f"{self.CATALOG_URL}?{query}",
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json,text/javascript,*/*;q=0.8",
+                "Accept-Language": language,
+                "X-Currency": currency,
+            },
+        )
+        opener = self._build_opener(proxy_url)
+        response_context = opener.open(request, timeout=15) if opener is not None else urlopen(request, timeout=15)
+        with response_context as response:
+            self._capture_ddg_cookie(response.headers)
+
+    def _cookie_header(self) -> str:
+        value = self._ddg_cookie_value.strip()
+        return f"{self.BASE_COOKIE}; __ddg1_={value}" if value else ""
+
+    def _capture_ddg_cookie(self, headers) -> None:
+        values = headers.get_all("Set-Cookie") or []
+        for value in values:
+            match = self.DDG_COOKIE_PATTERN.search(value)
+            if match:
+                self._ddg_cookie_value = match.group(1)
+                return
 
     def _build_opener(self, proxy_url: str):
         normalized = self._normalize_proxy_url(proxy_url)

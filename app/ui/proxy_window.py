@@ -2404,6 +2404,7 @@ del "%~f0" >nul 2>nul
 
     def _refresh_low_price_accounts_worker(self, proxy_url: str, refresh_generation: int) -> None:
         try:
+            self.low_price_account_service.start_refresh_cycle(proxy_url)
             items_by_product_id: dict[str, LowPriceAccount] = {}
             with ThreadPoolExecutor(max_workers=10) as executor:
                 html_futures = [
