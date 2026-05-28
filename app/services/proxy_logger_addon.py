@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import socket
@@ -204,30 +205,51 @@ class ProxyLoggerAddon:
             self._report_control_event(f"MANUAL_KILL_RESULT {killed} {tracked} {reset}")
             _log(f"手动矫正流量，tracked={tracked} reset={reset} killed={killed}")
 
-    def _get_selected_access_token(self) -> str:
+    def _get_selected_auth(self) -> tuple[str, str]:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
         if not port_text:
-            return ""
+            return "", ""
         try:
             port = int(port_text)
         except ValueError:
-            return ""
+            return "", ""
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2) as conn:
                 conn.settimeout(0.2)
+                conn.sendall(b"AUTH\n")
                 data = conn.recv(4096)
         except OSError:
-            return ""
-        return data.decode("utf-8", errors="ignore").strip()
+            return "", ""
+        text = data.decode("utf-8", errors="ignore").strip()
+        if not text:
+            return "", ""
+        try:
+            auth = json.loads(text)
+        except json.JSONDecodeError:
+            return text, ""
+        if not isinstance(auth, dict):
+            return "", ""
+        return str(auth.get("access_token") or ""), str(auth.get("account_id") or "")
 
-    def _rewrite_bearer_headers(self, flow: http.HTTPFlow, access_token: str) -> None:
+    def _rewrite_auth_headers(self, flow: http.HTTPFlow, access_token: str, account_id: str) -> None:
         if not access_token:
             return
         headers = flow.request.headers
+        rewritten = False
         for key, value in list(headers.items()):
             if not isinstance(value, str) or not value.startswith("Bearer "):
                 continue
             headers[key] = f"Bearer {access_token}"
+            rewritten = True
+        if not account_id or not rewritten:
+            return
+        account_header_found = False
+        for key in list(headers.keys()):
+            if key.lower() == "chatgpt-account-id":
+                headers[key] = account_id
+                account_header_found = True
+        if not account_header_found:
+            headers["ChatGPT-Account-ID"] = account_id
 
     def _extract_bearer_token(self, flow: http.HTTPFlow) -> str:
         for value in flow.request.headers.values():
@@ -352,10 +374,10 @@ class ProxyLoggerAddon:
         self._track_flow(flow)
         self._cleanup_flows()
         original_token = self._extract_bearer_token(flow)
-        selected_token = self._get_selected_access_token()
+        selected_token, selected_account_id = self._get_selected_auth()
         preserve_original = bool(original_token and self._should_preserve_original_bearer(flow))
         if selected_token and not preserve_original:
-            self._rewrite_bearer_headers(flow, selected_token)
+            self._rewrite_auth_headers(flow, selected_token, selected_account_id)
         usage_token = original_token if preserve_original else selected_token or original_token
         if usage_token:
             self._report_access_token_used(usage_token)

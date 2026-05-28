@@ -125,6 +125,7 @@ class ProxyWindow:
         self._upstream_proxy = self.service.config.upstream_proxy
         self._auto_load_target_refresh_token = ""
         self._auto_load_target_access_token = ""
+        self._auto_load_target_account_id = ""
         self._last_used_access_token = ""
         self._proxy_kill_pending = False
         self._proxy_kill_pending_access_token = ""
@@ -693,7 +694,7 @@ class ProxyWindow:
             return
         row = max(rows, key=lambda item: (self._quota_priority(item.quota), item.refresh_token))
         target_changed = row.refresh_token != current_refresh_token or row.access_token != current_access_token
-        self._set_auto_load_target(row.refresh_token, row.access_token)
+        self._set_auto_load_target(row.refresh_token, row.access_token, row.account_id)
         if target_changed:
             print(
                 f"[AutoLoad] 负载目标: account_id={row.account_id} refresh_token={row.refresh_token} quota={row.quota}",
@@ -702,14 +703,16 @@ class ProxyWindow:
         self._sync_proxy_kill_pending_with_target(row.access_token)
         self.refresh_auth_files(update_status=False)
 
-    def _set_auto_load_target(self, refresh_token: str, access_token: str) -> None:
+    def _set_auto_load_target(self, refresh_token: str, access_token: str, account_id: str = "") -> None:
         with self._auto_load_lock:
             target_changed = (
                 refresh_token != self._auto_load_target_refresh_token
                 or access_token != self._auto_load_target_access_token
+                or account_id != self._auto_load_target_account_id
             )
             self._auto_load_target_refresh_token = refresh_token
             self._auto_load_target_access_token = access_token
+            self._auto_load_target_account_id = account_id
             if target_changed:
                 self._auto_load_target_selected_at = time.monotonic()
                 if self._proxy_kill_pending_reason == "quota_drop":
@@ -1619,6 +1622,16 @@ class ProxyWindow:
         with self._auto_load_lock:
             return self._auto_load_target_access_token if self._auto_load_enabled else ""
 
+    def _get_auto_load_target_auth_payload(self) -> str:
+        with self._auto_load_lock:
+            if not self._auto_load_enabled:
+                token = ""
+                account_id = ""
+            else:
+                token = self._auto_load_target_access_token
+                account_id = self._auto_load_target_account_id
+        return json.dumps({"access_token": token, "account_id": account_id}, ensure_ascii=False)
+
     def _start_auto_load_control_server(self) -> int:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1697,6 +1710,9 @@ class ProxyWindow:
                         conn.sendall(("1\n" if self._consume_manual_proxy_kill_pending() else "0\n").encode("utf-8"))
                         continue
                     if payload == "IDLE_TIMEOUT":
+                        continue
+                    if payload == "AUTH":
+                        conn.sendall((self._get_auto_load_target_auth_payload() + "\n").encode("utf-8"))
                         continue
                     token = self._get_auto_load_target_access_token()
                     conn.sendall((token + "\n").encode("utf-8"))
