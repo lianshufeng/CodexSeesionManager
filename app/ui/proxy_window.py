@@ -116,6 +116,8 @@ class ProxyWindow:
         self._tooltip: tk.Toplevel | None = None
         self._tooltip_label: ttk.Label | None = None
         self._auth_menu: tk.Menu | None = None
+        self._auth_load_strategy_menu: tk.Menu | None = None
+        self._auth_load_strategy_var = tk.StringVar(value="normal")
         self._auto_load_lock = Lock()
         self._proxy_lock = Lock()
         auto_load_enabled = loaded_config.auto_load if loaded_config is not None else True
@@ -363,33 +365,33 @@ class ProxyWindow:
         auth_columns = (
             "currentMark",
             "loadMark",
+            "loadStrategy",
             "accountId",
             "email",
             "tokenRefreshTime",
             "quotaRefreshTime",
             "quota",
             "planType",
-            "traffic",
         )
         self.auth_tree = ttk.Treeview(auth_wrap, columns=auth_columns, show="headings", selectmode="browse", height=5)
         self.auth_tree.heading("currentMark", text="当前")
         self.auth_tree.heading("loadMark", text="负载")
+        self.auth_tree.heading("loadStrategy", text="策略")
         self.auth_tree.heading("accountId", text="账户id")
         self.auth_tree.heading("email", text="邮箱")
         self.auth_tree.heading("tokenRefreshTime", text="令牌刷新时间")
         self.auth_tree.heading("quotaRefreshTime", text="额度刷新时间")
         self.auth_tree.heading("quota", text="额度(5h/7d)")
         self.auth_tree.heading("planType", text="类型")
-        self.auth_tree.heading("traffic", text="流量")
         self.auth_tree.column("currentMark", width=46, anchor="center", stretch=False)
         self.auth_tree.column("loadMark", width=46, anchor="center", stretch=False)
-        self.auth_tree.column("accountId", width=210, anchor="w", stretch=True)
-        self.auth_tree.column("email", width=190, anchor="w", stretch=True)
-        self.auth_tree.column("tokenRefreshTime", width=124, anchor="center", stretch=False)
-        self.auth_tree.column("quotaRefreshTime", width=124, anchor="center", stretch=False)
-        self.auth_tree.column("quota", width=112, anchor="center", stretch=False)
-        self.auth_tree.column("planType", width=76, anchor="center", stretch=False)
-        self.auth_tree.column("traffic", width=88, anchor="center", stretch=False)
+        self.auth_tree.column("loadStrategy", width=58, anchor="center", stretch=False)
+        self.auth_tree.column("accountId", width=240, anchor="w", stretch=True)
+        self.auth_tree.column("email", width=210, anchor="w", stretch=True)
+        self.auth_tree.column("tokenRefreshTime", width=132, anchor="center", stretch=False)
+        self.auth_tree.column("quotaRefreshTime", width=132, anchor="center", stretch=False)
+        self.auth_tree.column("quota", width=126, anchor="center", stretch=False)
+        self.auth_tree.column("planType", width=86, anchor="center", stretch=False)
         self.auth_tree.bind("<Double-1>", self._on_auth_tree_double_click)
         self.auth_tree.bind("<Button-3>", self._on_auth_tree_right_click)
         self.auth_tree.bind("<Delete>", self._on_auth_tree_delete_key)
@@ -398,8 +400,28 @@ class ProxyWindow:
         self.auth_tree.bind("<Leave>", lambda _event: self._hide_tooltip())
         self._auth_menu = tk.Menu(self.root, tearoff=0)
         self._auth_menu.add_command(label="切换", command=self._activate_selected_auth_row)
-        self._auth_menu.add_command(label="禁用", command=self._toggle_selected_auth_row_disabled)
         self._auth_menu.add_command(label="删除", command=self._delete_selected_auth_row)
+        self._auth_menu.add_command(label="备注", command=self._edit_selected_auth_note)
+        self._auth_load_strategy_menu = tk.Menu(self._auth_menu, tearoff=0)
+        self._auth_load_strategy_menu.add_radiobutton(
+            label="正常",
+            variable=self._auth_load_strategy_var,
+            value="normal",
+            command=lambda: self._set_selected_auth_load_strategy("normal"),
+        )
+        self._auth_load_strategy_menu.add_radiobutton(
+            label="优先",
+            variable=self._auth_load_strategy_var,
+            value="priority",
+            command=lambda: self._set_selected_auth_load_strategy("priority"),
+        )
+        self._auth_load_strategy_menu.add_radiobutton(
+            label="禁用",
+            variable=self._auth_load_strategy_var,
+            value="disabled",
+            command=lambda: self._set_selected_auth_load_strategy("disabled"),
+        )
+        self._auth_menu.add_cascade(label="负载策略", menu=self._auth_load_strategy_menu)
 
         auth_scroll = ttk.Scrollbar(auth_wrap, orient="vertical", command=self.auth_tree.yview)
         self.auth_tree.configure(yscrollcommand=auth_scroll.set)
@@ -664,7 +686,7 @@ class ProxyWindow:
 
     def _update_traffic_status(self, up_bytes: int, down_bytes: int) -> None:
         self._traffic_status_var.set(
-            f"上行: {self._format_traffic_bytes(up_bytes)}  下行: {self._format_traffic_bytes(down_bytes)}"
+            f"上行: {self._format_traffic_bytes(up_bytes, 3)}  下行: {self._format_traffic_bytes(down_bytes, 3)}"
         )
 
     def _on_auto_load_toggled(self) -> None:
@@ -692,6 +714,13 @@ class ProxyWindow:
             self._clear_proxy_kill_pending()
             print("[AutoLoad] 当前没有可选授权文件", flush=True)
             return
+        priority_rows = [
+            row
+            for row in rows
+            if row.load_strategy == "priority" and self._quota_priority(row.quota) != 0
+        ]
+        if priority_rows:
+            rows = priority_rows
         row = max(rows, key=lambda item: (self._quota_priority(item.quota), item.refresh_token))
         target_changed = row.refresh_token != current_refresh_token or row.access_token != current_access_token
         self._set_auto_load_target(row.refresh_token, row.access_token, row.account_id)
@@ -2877,14 +2906,19 @@ del "%~f0" >nul 2>nul
         dialog.resizable(True, True)
         dialog.grab_set()
         self._bind_dialog_close_keys(dialog)
-        self._center_child_window(dialog, 460, 360)
+        self._center_child_window(dialog, 520, 430)
+        dialog.minsize(520, 430)
+        dialog.rowconfigure(0, weight=1)
+        dialog.columnconfigure(0, weight=1)
 
         body = ttk.Frame(dialog, padding=12)
-        body.pack(fill="both", expand=True)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.rowconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1)
 
-        ttk.Label(body, text="选择要强制结束的进程").pack(anchor="w")
+        ttk.Label(body, text="选择要强制结束的进程").grid(row=0, column=0, sticky="w")
         tree_frame = ttk.Frame(body)
-        tree_frame.pack(fill="both", expand=True, pady=(8, 10))
+        tree_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 10))
 
         process_tree = ttk.Treeview(tree_frame, columns=("pid",), selectmode="extended")
         process_tree.heading("#0", text="进程名称")
@@ -2902,6 +2936,8 @@ del "%~f0" >nul 2>nul
 
         def insert_process(parent: str, row: CodexProcessRow, depth: int) -> None:
             item_id = str(row.pid)
+            if item_id in item_depths:
+                return
             process_tree.insert(parent, "end", iid=item_id, text=row.name, values=(row.pid,), open=True)
             item_depths[item_id] = depth
             for child in row.children:
@@ -2912,12 +2948,18 @@ del "%~f0" >nul 2>nul
         all_items = tuple(item_depths)
         root_items = process_tree.get_children("")
         if all_items:
-            process_tree.selection_set(root_items)
+            def select_root_process_items() -> None:
+                process_tree.selection_set(root_items)
+                process_tree.focus(root_items[0])
+                process_tree.see(root_items[0])
+                process_tree.focus_set()
+
+            dialog.after(0, select_root_process_items)
         else:
             process_tree.insert("", "end", text="未找到 Codex.exe 或 codex.exe 进程", values=("",))
 
-        button_row = ttk.Frame(body)
-        button_row.pack(fill="x")
+        button_row = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        button_row.grid(row=1, column=0, sticky="ew")
         button_row.columnconfigure(0, weight=1)
         button_row.columnconfigure(1, weight=0)
         button_row.columnconfigure(2, weight=1)
@@ -2952,7 +2994,7 @@ del "%~f0" >nul 2>nul
         child_pids = {
             child.pid
             for process in root_processes
-            for child in self._safe_children(process)
+            for child in self._safe_children(process, recursive=True)
         }
         roots = [process for process in root_processes if process.pid not in child_pids]
         return [self._build_process_row(process) for process in sorted(roots, key=lambda item: item.pid)]
@@ -2966,9 +3008,9 @@ del "%~f0" >nul 2>nul
         children.sort(key=lambda row: row.pid)
         return CodexProcessRow(pid=process.pid, name=process_name, children=children)
 
-    def _safe_children(self, process: psutil.Process) -> list[psutil.Process]:
+    def _safe_children(self, process: psutil.Process, recursive: bool = False) -> list[psutil.Process]:
         try:
-            return process.children()
+            return process.children(recursive=recursive)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return []
 
@@ -2977,7 +3019,7 @@ del "%~f0" >nul 2>nul
         ordered_process_ids = sorted(process_ids, key=lambda pid: item_depths.get(str(pid), 0), reverse=True)
         for process_id in ordered_process_ids:
             result = subprocess.run(
-                ["taskkill", "/pid", str(process_id), "/f"],
+                ["taskkill", "/pid", str(process_id), "/t", "/f"],
                 capture_output=True,
                 text=True,
                 encoding="gbk",
@@ -3019,14 +3061,14 @@ del "%~f0" >nul 2>nul
                 "end",
                 values=(
                     "★" if row.current else "",
-                    "¤" if row.disabled else "●" if row.refresh_token == load_refresh_token else "",
+                    self._format_auth_load_mark(row, load_refresh_token),
+                    self._format_auth_load_strategy(row.load_strategy),
                     self._shorten_middle(row.account_id, 16, 10),
                     self._shorten_middle(row.email, 18, 12),
                     self._format_last_refresh(row.last_refresh),
                     self._format_last_refresh(row.quota_refresh_time_5h),
                     row.quota,
                     row.plan_type or "",
-                    row.traffic,
                 ),
             )
             self._auth_rows_by_item[item] = row
@@ -3039,14 +3081,15 @@ del "%~f0" >nul 2>nul
             (
                 row.current,
                 row.disabled,
+                row.load_strategy,
                 row.refresh_token == load_refresh_token,
                 row.account_id,
                 row.email,
+                row.note,
                 row.last_refresh,
                 row.quota_refresh_time_5h,
                 row.quota,
                 row.plan_type or "",
-                row.traffic,
             )
             for row in rows
         )
@@ -3169,6 +3212,18 @@ del "%~f0" >nul 2>nul
         except ValueError:
             return -1.0
 
+    def _format_auth_load_mark(self, row: AuthFileRow, load_refresh_token: str) -> str:
+        if row.refresh_token == load_refresh_token:
+            return "●"
+        return ""
+
+    def _format_auth_load_strategy(self, load_strategy: str) -> str:
+        if load_strategy == "priority":
+            return "优先"
+        if load_strategy == "disabled":
+            return "禁用"
+        return "正常"
+
     def _is_normal_quota(self, quota: str) -> bool:
         value = quota.strip()
         return bool(value and value != "—")
@@ -3233,7 +3288,7 @@ del "%~f0" >nul 2>nul
             print(
                 f"  account_id={row.account_id} refresh_token={row.refresh_token} "
                 f"last_refresh={row.last_refresh} quota={row.quota} "
-                f"{'current' if row.current else ''} {'disabled' if row.disabled else ''}",
+                f"{'current' if row.current else ''} load_strategy={row.load_strategy}",
                 flush=True,
             )
         kept_rows = [row for row in rows if row.account_id and row.refresh_token not in delete_tokens]
@@ -3317,12 +3372,12 @@ del "%~f0" >nul 2>nul
         return f"{text[:keep_prefix]}...{text[-keep_suffix:]}"
 
     def _build_auth_tooltip(self, row: AuthFileRow) -> str:
-        traffic = row.traffic
         quota = row.quota or ""
         lines = [
             f"账户ID: {row.account_id or '-'}",
             f"用户ID: {row.user_id or ''}",
             f"邮箱: {row.email or ''}",
+            f"备注: {row.note or ''}",
             f"刷新令牌: {row.refresh_token or '-'}",
             f"访问令牌: {row.access_token or ''}",
             f"令牌刷新时间: {self._format_tooltip_time(row.last_refresh)}",
@@ -3330,8 +3385,7 @@ del "%~f0" >nul 2>nul
             f"额度刷新时间(7天): {self._format_tooltip_time(row.quota_refresh_time_7d)}",
             f"额度(5h/7d): {quota}",
             f"类型: {row.plan_type or ''}",
-            f"流量: {traffic}",
-            f"状态: {'禁用' if row.disabled else '启用'}",
+            f"负载策略: {self._format_auth_load_strategy(row.load_strategy)}",
         ]
         return "\n".join(lines)
 
@@ -3390,7 +3444,7 @@ del "%~f0" >nul 2>nul
             return
         self.auth_tree.selection_set(row_id)
         self.auth_tree.focus(row_id)
-        self._auth_menu.entryconfig(1, label="启用" if row.disabled else "禁用")
+        self._auth_load_strategy_var.set(row.load_strategy)
         try:
             self._auth_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -3410,10 +3464,78 @@ del "%~f0" >nul 2>nul
         if row is not None:
             self._delete_auth_row(row)
 
-    def _toggle_selected_auth_row_disabled(self) -> None:
+    def _set_selected_auth_load_strategy(self, load_strategy: str) -> None:
         row = self._get_selected_auth_row()
         if row is not None:
-            self._set_auth_row_disabled(row, not row.disabled)
+            self._set_auth_row_load_strategy(row, load_strategy)
+
+    def _edit_selected_auth_note(self) -> None:
+        row = self._get_selected_auth_row()
+        if row is None:
+            return
+        note = self._ask_auth_note(row.note)
+        if note is None:
+            return
+        ok, message = self.auth_sync_service.set_auth_note(row.refresh_token, note)
+        if not ok:
+            messagebox.showerror("更新备注失败", message)
+            return
+        self.refresh_auth_files()
+
+    def _ask_auth_note(self, initial_note: str) -> str | None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("备注")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        result: dict[str, str | None] = {"value": None}
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="备注（留空清除）").pack(anchor="w")
+
+        text = ttk.Entry(body, width=64)
+        text.pack(fill="x", pady=(6, 10))
+        if initial_note:
+            text.insert(0, self._normalize_auth_note(initial_note))
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x")
+
+        def save() -> None:
+            result["value"] = self._normalize_auth_note(text.get())
+            dialog.destroy()
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        ttk.Button(buttons, text="保存", command=save).pack(side="right")
+        ttk.Button(buttons, text="取消", command=cancel).pack(side="right", padx=(0, 8))
+        dialog.bind("<Escape>", lambda _event: cancel())
+        dialog.bind("<Return>", lambda _event: save())
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.update_idletasks()
+        self._center_child_window_to_content(dialog)
+        dialog.grab_set()
+        text.focus_set()
+        text.selection_range(0, "end")
+        self.root.wait_window(dialog)
+        return result["value"]
+
+    def _normalize_auth_note(self, note: str) -> str:
+        return " ".join(note.split())
+
+    def _center_child_window_to_content(self, window: tk.Toplevel) -> None:
+        self.root.update_idletasks()
+        width = window.winfo_width()
+        height = window.winfo_height()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_width = self.root.winfo_width()
+        root_height = self.root.winfo_height()
+        x = root_x + max((root_width - width) // 2, 0)
+        y = root_y + max((root_height - height) // 2, 0)
+        window.geometry(f"+{x}+{y}")
 
     def _get_selected_auth_row(self) -> AuthFileRow | None:
         selection = self.auth_tree.selection()
@@ -3443,12 +3565,12 @@ del "%~f0" >nul 2>nul
                 self._recompute_auto_load_target()
         self.refresh_auth_files()
 
-    def _set_auth_row_disabled(self, row: AuthFileRow, disabled: bool) -> None:
-        ok, message = self.auth_sync_service.set_auth_disabled(row.refresh_token, disabled)
+    def _set_auth_row_load_strategy(self, row: AuthFileRow, load_strategy: str) -> None:
+        ok, message = self.auth_sync_service.set_auth_load_strategy(row.refresh_token, load_strategy)
         if not ok:
-            messagebox.showerror("更新状态失败", message)
+            messagebox.showerror("更新负载策略失败", message)
             return
-        if disabled and row.refresh_token == self._get_auto_load_target_refresh_token():
+        if load_strategy == "disabled" and row.refresh_token == self._get_auto_load_target_refresh_token():
             self._set_auto_load_target("", "")
             self._clear_proxy_kill_pending()
         if self.auto_load_var.get():
@@ -3628,14 +3750,14 @@ del "%~f0" >nul 2>nul
             return f"{size_bytes / 1024:.1f} KB"
         return f"{size_bytes / (1024 * 1024):.1f} MB"
 
-    def _format_traffic_bytes(self, size_bytes: int) -> str:
+    def _format_traffic_bytes(self, size_bytes: int, precision: int = 1) -> str:
         if size_bytes < 1024:
             return f"{size_bytes}B"
         if size_bytes < 1024 * 1024:
-            return f"{size_bytes / 1024:.1f}K"
+            return f"{size_bytes / 1024:.{precision}f}K"
         if size_bytes < 1024 * 1024 * 1024:
-            return f"{size_bytes / (1024 * 1024):.1f}M"
-        return f"{size_bytes / (1024 * 1024 * 1024):.1f}G"
+            return f"{size_bytes / (1024 * 1024):.{precision}f}M"
+        return f"{size_bytes / (1024 * 1024 * 1024):.{precision}f}G"
 
     def _tray_icon_watchdog(self) -> None:
         if self._closing:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +10,17 @@ from threading import Event, Lock, Thread
 from typing import Callable
 
 from app.utils.path_utils import app_root
+
+
+_MANAGER_METADATA_KEY = "_codex_session_manager"
+_LOAD_STRATEGY_NORMAL = "normal"
+_LOAD_STRATEGY_PRIORITY = "priority"
+_LOAD_STRATEGY_DISABLED = "disabled"
+_LOAD_STRATEGIES = {
+    _LOAD_STRATEGY_NORMAL,
+    _LOAD_STRATEGY_PRIORITY,
+    _LOAD_STRATEGY_DISABLED,
+}
 
 
 @dataclass
@@ -27,6 +37,8 @@ class AuthFileRow:
     traffic: int = 0
     current: bool = False
     disabled: bool = False
+    load_strategy: str = _LOAD_STRATEGY_NORMAL
+    note: str = ""
     file_name: str = ""
     access_token: str = ""
 
@@ -156,6 +168,31 @@ class AuthSyncService:
             return None
         return data
 
+    def _write_auth_data(self, path: Path, data: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _manager_metadata(self, data: dict[str, object]) -> dict[str, object]:
+        metadata = data.get(_MANAGER_METADATA_KEY)
+        return metadata if isinstance(metadata, dict) else {}
+
+    def _load_strategy(self, data: dict[str, object]) -> str:
+        metadata = self._manager_metadata(data)
+        strategy = str(metadata.get("load_strategy") or "").strip()
+        if strategy in _LOAD_STRATEGIES:
+            return strategy
+        if bool(metadata.get("disabled")):
+            return _LOAD_STRATEGY_DISABLED
+        return _LOAD_STRATEGY_NORMAL
+
+    def _auth_note(self, data: dict[str, object]) -> str:
+        return " ".join(str(self._manager_metadata(data).get("note") or "").split())
+
+    def _strip_manager_metadata(self, data: dict[str, object]) -> dict[str, object]:
+        cleaned = dict(data)
+        cleaned.pop(_MANAGER_METADATA_KEY, None)
+        return cleaned
+
     def _parse_last_refresh_timestamp(self, text: str) -> float:
         value = text.strip()
         if not value:
@@ -223,9 +260,11 @@ class AuthSyncService:
         self.target_dir.mkdir(parents=True, exist_ok=True)
         target_path = self.target_dir / f"{refresh_token}.json"
         target_state = None
+        target_metadata: dict[str, object] = {}
         if target_path.exists():
             target_data = self._read_auth_data(target_path)
             if target_data is not None:
+                target_metadata = dict(self._manager_metadata(target_data))
                 target_tokens = target_data.get("tokens")
                 if isinstance(target_tokens, dict):
                     target_state = (
@@ -242,8 +281,14 @@ class AuthSyncService:
             and self._is_target_newer_than_source(target_state[3], source_state["last_refresh"])
         )
         if target_state != content_signature and not target_is_newer:
-            shutil.copy2(self.source_path, target_path)
-            copied = True
+            source_data = self._read_auth_data(self.source_path)
+            if source_data is not None:
+                if target_metadata:
+                    source_data[_MANAGER_METADATA_KEY] = target_metadata
+                else:
+                    source_data.pop(_MANAGER_METADATA_KEY, None)
+                self._write_auth_data(target_path, source_data)
+                copied = True
 
         source_changed = file_signature != self._last_notified_source_signature
         if source_changed:
@@ -264,8 +309,11 @@ class AuthSyncService:
             return False, f"找不到文件: {target_path}"
 
         try:
+            data = self._read_auth_data(target_path)
+            if data is None:
+                return False, f"授权文件格式无效: {target_path}"
             self.source_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target_path, self.source_path)
+            self._write_auth_data(self.source_path, self._strip_manager_metadata(data))
         except OSError as exc:
             return False, str(exc)
 
@@ -326,17 +374,42 @@ class AuthSyncService:
                 print(f"[AuthSync] 删除回调异常: {exc}\n{traceback.format_exc()}", flush=True)
         return True, ""
 
-    def set_auth_disabled(self, refresh_token: str, disabled: bool) -> tuple[bool, str]:
+    def set_auth_load_strategy(self, refresh_token: str, load_strategy: str) -> tuple[bool, str]:
         if not refresh_token:
             return False, "刷新令牌不能为空。"
+
+        strategy = load_strategy.strip()
+        if strategy not in _LOAD_STRATEGIES:
+            return False, f"负载策略无效: {load_strategy}"
 
         self.target_dir.mkdir(parents=True, exist_ok=True)
         target_path = self.target_dir / f"{refresh_token}.json"
         if not target_path.exists():
             return False, f"找不到文件: {target_path}"
 
+        data = self._read_auth_data(target_path)
+        if data is None:
+            return False, f"授权文件格式无效: {target_path}"
+
+        metadata = dict(self._manager_metadata(data))
+        metadata.pop("disabled", None)
+        if strategy != _LOAD_STRATEGY_NORMAL:
+            metadata["load_strategy"] = strategy
+            data[_MANAGER_METADATA_KEY] = metadata
+        else:
+            metadata.pop("load_strategy", None)
+            if metadata:
+                data[_MANAGER_METADATA_KEY] = metadata
+            else:
+                data.pop(_MANAGER_METADATA_KEY, None)
+
+        try:
+            self._write_auth_data(target_path, data)
+        except OSError as exc:
+            return False, str(exc)
+
         with self._state_lock:
-            if disabled:
+            if strategy == _LOAD_STRATEGY_DISABLED:
                 self._disabled_refresh_tokens.add(refresh_token)
             else:
                 self._disabled_refresh_tokens.discard(refresh_token)
@@ -345,7 +418,48 @@ class AuthSyncService:
             try:
                 self._on_change()
             except Exception as exc:
-                print(f"[AuthSync] 禁用状态回调异常: {exc}\n{traceback.format_exc()}", flush=True)
+                print(f"[AuthSync] 负载策略回调异常: {exc}\n{traceback.format_exc()}", flush=True)
+        return True, ""
+
+    def set_auth_disabled(self, refresh_token: str, disabled: bool) -> tuple[bool, str]:
+        strategy = _LOAD_STRATEGY_DISABLED if disabled else _LOAD_STRATEGY_NORMAL
+        return self.set_auth_load_strategy(refresh_token, strategy)
+
+    def set_auth_note(self, refresh_token: str, note: str) -> tuple[bool, str]:
+        if not refresh_token:
+            return False, "刷新令牌不能为空。"
+
+        self.target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = self.target_dir / f"{refresh_token}.json"
+        if not target_path.exists():
+            return False, f"找不到文件: {target_path}"
+
+        data = self._read_auth_data(target_path)
+        if data is None:
+            return False, f"授权文件格式无效: {target_path}"
+
+        metadata = dict(self._manager_metadata(data))
+        value = " ".join(note.split())
+        if value:
+            metadata["note"] = value
+            data[_MANAGER_METADATA_KEY] = metadata
+        else:
+            metadata.pop("note", None)
+            if metadata:
+                data[_MANAGER_METADATA_KEY] = metadata
+            else:
+                data.pop(_MANAGER_METADATA_KEY, None)
+
+        try:
+            self._write_auth_data(target_path, data)
+        except OSError as exc:
+            return False, str(exc)
+
+        if self._on_change is not None:
+            try:
+                self._on_change()
+            except Exception as exc:
+                print(f"[AuthSync] 备注回调异常: {exc}\n{traceback.format_exc()}", flush=True)
         return True, ""
 
     def list_auth_rows(self) -> list[AuthFileRow]:
@@ -376,6 +490,10 @@ class AuthSyncService:
 
             refresh_token = str(tokens.get("refresh_token") or path.stem)
             access_token = str(tokens.get("access_token") or "")
+            load_strategy = self._load_strategy(data)
+            disabled = load_strategy == _LOAD_STRATEGY_DISABLED or refresh_token in disabled_refresh_tokens
+            if disabled:
+                load_strategy = _LOAD_STRATEGY_DISABLED
             with self._state_lock:
                 self._access_token_to_refresh_token[access_token] = refresh_token
             rows.append(
@@ -391,7 +509,9 @@ class AuthSyncService:
                     quota_refresh_time_7d=quota_refresh_time_7d_by_refresh_token.get(refresh_token, ""),
                     traffic=traffic_by_refresh_token.get(refresh_token, 0),
                     current=refresh_token == current_refresh_token,
-                    disabled=refresh_token in disabled_refresh_tokens,
+                    disabled=disabled,
+                    load_strategy=load_strategy,
+                    note=self._auth_note(data),
                     file_name=path.name,
                     access_token=access_token,
                 )
