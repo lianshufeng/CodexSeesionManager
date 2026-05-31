@@ -31,7 +31,7 @@ from app.version import APP_VERSION
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
 from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
-from app.services.auth_usage_service import AuthQuotaItem, AuthUsageService
+from app.services.auth_usage_service import QUOTA_REFRESH_FAILED, AuthQuotaItem, AuthUsageService
 from app.services.cloud_sync_service import CloudSyncConfig, CloudSyncFile, CloudSyncService, CloudSyncVersion
 from app.services.low_price_account_service import (
     LowPriceAccount,
@@ -708,7 +708,7 @@ class ProxyWindow:
             current_refresh_token = self._auto_load_target_refresh_token
             current_access_token = self._auto_load_target_access_token
         rows = self.auth_sync_service.list_auth_rows()
-        rows = [row for row in rows if not row.disabled]
+        rows = [row for row in rows if not row.disabled and self._is_auto_load_quota_usable(row.quota)]
         if not rows:
             self._set_auto_load_target("", "")
             self._clear_proxy_kill_pending()
@@ -717,7 +717,7 @@ class ProxyWindow:
         priority_rows = [
             row
             for row in rows
-            if row.load_strategy == "priority" and self._quota_priority(row.quota) != 0
+            if row.load_strategy == "priority"
         ]
         if priority_rows:
             rows = priority_rows
@@ -3202,15 +3202,29 @@ del "%~f0" >nul 2>nul
         return f"{text[:keep_prefix]}...{text[-keep_suffix:]}"
 
     def _quota_priority(self, quota: str) -> float:
+        percentages = self._quota_percentages(quota)
+        if not percentages:
+            return -1.0
+        return percentages[0]
+
+    def _quota_percentages(self, quota: str) -> list[float]:
         if not quota:
-            return -1.0
-        match = re.search(r"(\d+(?:\.\d+)?)%", quota)
-        if not match:
-            return -1.0
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return -1.0
+            return []
+        values: list[float] = []
+        for match in re.finditer(r"(\d+(?:\.\d+)?)%", quota):
+            try:
+                values.append(float(match.group(1)))
+            except ValueError:
+                continue
+        return values
+
+    def _is_auto_load_quota_usable(self, quota: str) -> bool:
+        percentages = self._quota_percentages(quota)
+        if not percentages or percentages[0] <= 0:
+            return False
+        if len(percentages) >= 2 and percentages[1] <= 0:
+            return False
+        return True
 
     def _format_auth_load_mark(self, row: AuthFileRow, load_refresh_token: str) -> str:
         if row.refresh_token == load_refresh_token:
@@ -3226,7 +3240,7 @@ del "%~f0" >nul 2>nul
 
     def _is_normal_quota(self, quota: str) -> bool:
         value = quota.strip()
-        return bool(value and value != "—")
+        return bool(value and value not in {"—", QUOTA_REFRESH_FAILED})
 
     def _last_refresh_sort_key(self, text: str) -> float:
         if not text:

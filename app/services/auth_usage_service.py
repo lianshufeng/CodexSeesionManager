@@ -15,6 +15,9 @@ from app.services.auth_sync_service import AuthSyncService
 from app.utils.chatgpt_usage_fetcher import ChatGPTUsageFetcher
 
 
+QUOTA_REFRESH_FAILED = "额度更新失败"
+
+
 @dataclass(frozen=True, slots=True)
 class AuthQuotaItem:
     refresh_token: str
@@ -283,11 +286,45 @@ class AuthUsageService:
         quota_refresh_time_cache: dict[str, str],
         quota_refresh_time_7d_cache: dict[str, str],
     ) -> AuthQuotaItem | None:
-        result = self.fetcher.fetch(access_token, account_id)
+        try:
+            result = self.fetcher.fetch(access_token, account_id)
+        except Exception as exc:
+            self._log(f"额度刷新失败: refresh_token={refresh_token} message={exc}")
+            result = None
+        if result is None:
+            with self._quota_lock:
+                item = AuthQuotaItem(
+                    refresh_token=refresh_token,
+                    account_id=account_id,
+                    quota=QUOTA_REFRESH_FAILED,
+                    plan_type=plan_type_cache.get(refresh_token, ""),
+                    user_id=user_id_cache.get(refresh_token, ""),
+                    email=email_cache.get(refresh_token, ""),
+                    quota_refreshed_at_5h=quota_refresh_time_cache.get(refresh_token, ""),
+                    quota_refreshed_at_7d=quota_refresh_time_7d_cache.get(refresh_token, ""),
+                )
+                self._quota_items_by_token[refresh_token] = item
+                cache[refresh_token] = item.quota
+            self._pending_items.put(item)
+            return item
         if not result.quota:
             if result.message:
                 self._log(f"额度刷新失败: refresh_token={refresh_token} message={result.message}")
-            return None
+            with self._quota_lock:
+                item = AuthQuotaItem(
+                    refresh_token=refresh_token,
+                    account_id=account_id,
+                    quota=QUOTA_REFRESH_FAILED,
+                    plan_type=plan_type_cache.get(refresh_token, ""),
+                    user_id=user_id_cache.get(refresh_token, ""),
+                    email=email_cache.get(refresh_token, ""),
+                    quota_refreshed_at_5h=quota_refresh_time_cache.get(refresh_token, ""),
+                    quota_refreshed_at_7d=quota_refresh_time_7d_cache.get(refresh_token, ""),
+                )
+                self._quota_items_by_token[refresh_token] = item
+                cache[refresh_token] = item.quota
+            self._pending_items.put(item)
+            return item
 
         plan_type = result.plan_type or plan_type_cache.get(refresh_token, "")
         user_id = result.user_id or user_id_cache.get(refresh_token, "")
