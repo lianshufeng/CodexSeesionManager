@@ -1,4 +1,4 @@
-cx-Freeze>=8,<9
+cx-Freeze==8.6.4
 mitmproxy==11.0.2
 pillow==12.2.0
 psutil==7.2.2

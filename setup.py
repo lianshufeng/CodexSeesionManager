@@ -34,6 +34,7 @@ setup(
         "build_exe": {
             "build_exe": os.environ.get("BUILD_EXE_DIR", str(project_root / "build" / "exe.win-amd64-3.11")),
             "include_files": include_files,
+            "include_msvcr": True,
             "packages": ["mitmproxy", "mitmproxy_rs", "mitmproxy_windows", "psutil", "websocket", "pystray", "PIL"],
             "excludes": []  # 不需要的库可以排除掉
         }

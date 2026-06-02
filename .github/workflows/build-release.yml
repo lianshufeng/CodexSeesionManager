@@ -19,7 +19,7 @@ permissions:
 jobs:
   build:
     name: Build Windows EXE
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
@@ -28,13 +28,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.11.15"
 
       - name: Install dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -r requirement.txt
+          python --version
+          python -m pip freeze
 
       - name: Prepare build variables
         id: vars
