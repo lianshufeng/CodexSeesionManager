@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ _LOAD_STRATEGIES = {
     _LOAD_STRATEGY_PRIORITY,
     _LOAD_STRATEGY_DISABLED,
 }
+_FALLBACK_HASH_LENGTH = 32
 
 
 @dataclass
@@ -172,6 +174,33 @@ class AuthSyncService:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _safe_auth_file_stem(self, account_id: str, refresh_token: str) -> str:
+        stem = "".join(
+            char if char.isalnum() or char in ("-", "_", ".") else "_"
+            for char in account_id.strip()
+        ).strip(" .")
+        if stem:
+            return stem
+        digest = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
+        return f"rt_{digest[:_FALLBACK_HASH_LENGTH]}"
+
+    def _auth_file_path(self, account_id: str, refresh_token: str) -> Path:
+        return self.target_dir / f"{self._safe_auth_file_stem(account_id, refresh_token)}.json"
+
+    def _find_auth_file_by_refresh_token(self, refresh_token: str) -> Path | None:
+        if not self.target_dir.exists():
+            return None
+        for path in sorted(self.target_dir.glob("*.json"), key=lambda item: item.name):
+            data = self._read_auth_data(path)
+            if data is None:
+                continue
+            tokens = data.get("tokens")
+            if not isinstance(tokens, dict):
+                continue
+            if str(tokens.get("refresh_token") or path.stem) == refresh_token:
+                return path
+        return None
+
     def _manager_metadata(self, data: dict[str, object]) -> dict[str, object]:
         metadata = data.get(_MANAGER_METADATA_KEY)
         return metadata if isinstance(metadata, dict) else {}
@@ -258,11 +287,13 @@ class AuthSyncService:
         )
 
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = self.target_dir / f"{refresh_token}.json"
+        target_path = self._auth_file_path(source_state["account_id"], refresh_token)
+        legacy_path = self._find_auth_file_by_refresh_token(refresh_token)
+        metadata_path = target_path if target_path.exists() else legacy_path
         target_state = None
         target_metadata: dict[str, object] = {}
-        if target_path.exists():
-            target_data = self._read_auth_data(target_path)
+        if metadata_path is not None and metadata_path.exists():
+            target_data = self._read_auth_data(metadata_path)
             if target_data is not None:
                 target_metadata = dict(self._manager_metadata(target_data))
                 target_tokens = target_data.get("tokens")
@@ -288,6 +319,11 @@ class AuthSyncService:
                 else:
                     source_data.pop(_MANAGER_METADATA_KEY, None)
                 self._write_auth_data(target_path, source_data)
+                if legacy_path is not None and legacy_path != target_path:
+                    try:
+                        legacy_path.unlink()
+                    except OSError:
+                        pass
                 copied = True
 
         source_changed = file_signature != self._last_notified_source_signature
@@ -304,9 +340,9 @@ class AuthSyncService:
             return False, "刷新令牌不能为空。"
 
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = self.target_dir / f"{refresh_token}.json"
-        if not target_path.exists():
-            return False, f"找不到文件: {target_path}"
+        target_path = self._find_auth_file_by_refresh_token(refresh_token)
+        if target_path is None:
+            return False, f"找不到刷新令牌对应的授权文件: {refresh_token}"
 
         try:
             data = self._read_auth_data(target_path)
@@ -334,9 +370,9 @@ class AuthSyncService:
             return False, "刷新令牌不能为空。"
 
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = self.target_dir / f"{refresh_token}.json"
-        if not target_path.exists():
-            return False, f"找不到文件: {target_path}"
+        target_path = self._find_auth_file_by_refresh_token(refresh_token)
+        if target_path is None:
+            return False, f"找不到刷新令牌对应的授权文件: {refresh_token}"
 
         current_state = self._read_source_state(force=True)
         current_refresh_token = current_state["refresh_token"] if current_state is not None else ""
@@ -383,9 +419,9 @@ class AuthSyncService:
             return False, f"负载策略无效: {load_strategy}"
 
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = self.target_dir / f"{refresh_token}.json"
-        if not target_path.exists():
-            return False, f"找不到文件: {target_path}"
+        target_path = self._find_auth_file_by_refresh_token(refresh_token)
+        if target_path is None:
+            return False, f"找不到刷新令牌对应的授权文件: {refresh_token}"
 
         data = self._read_auth_data(target_path)
         if data is None:
@@ -430,9 +466,9 @@ class AuthSyncService:
             return False, "刷新令牌不能为空。"
 
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = self.target_dir / f"{refresh_token}.json"
-        if not target_path.exists():
-            return False, f"找不到文件: {target_path}"
+        target_path = self._find_auth_file_by_refresh_token(refresh_token)
+        if target_path is None:
+            return False, f"找不到刷新令牌对应的授权文件: {refresh_token}"
 
         data = self._read_auth_data(target_path)
         if data is None:
