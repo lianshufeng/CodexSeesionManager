@@ -13,10 +13,10 @@
 
 - 优先使用 `conda` 环境运行
 - 环境名称：`codex_session`
-- Python 版本：`3.11`
+- Python 版本：`3.13`
 - 启动或执行任务前，先检查该环境是否存在
 - 如果 `codex_session` 不存在，不要直接创建，先询问用户是否需要创建
-- 如果用户确认需要创建，则使用 `conda` 创建 `codex_session`，并确保 Python 版本为 `3.11` 或更高
+- 如果用户确认需要创建，则使用 `conda` 创建 `codex_session`，并确保 Python 版本为 `3.13` 或更高
 - 依赖统一维护在 `requirement.txt`，新增或修改第三方依赖时优先更新该文件
 
 ## 代码分层
