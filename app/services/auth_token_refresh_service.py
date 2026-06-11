@@ -81,10 +81,7 @@ class AuthTokenRefreshService:
             tokens["refresh_token"] = new_refresh_token
         data["last_refresh"] = self._utc_now_text()
 
-        new_path = path.with_name(f"{new_refresh_token}.json")
-        self._write_auth_data(new_path, data)
-        if new_path != path and path.exists():
-            path.unlink()
+        self.auth_sync_service.save_refreshed_auth_file(path, data, old_refresh_token, new_refresh_token)
         return True
 
     def _request_refresh(self, refresh_token: str, opener: request.OpenerDirector) -> dict[str, object]:

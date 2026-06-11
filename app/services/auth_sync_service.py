@@ -187,6 +187,49 @@ class AuthSyncService:
     def _auth_file_path(self, account_id: str, refresh_token: str) -> Path:
         return self.target_dir / f"{self._safe_auth_file_stem(account_id, refresh_token)}.json"
 
+    def save_refreshed_auth_file(
+        self,
+        original_path: Path,
+        data: dict[str, object],
+        old_refresh_token: str,
+        new_refresh_token: str,
+    ) -> None:
+        tokens = data.get("tokens")
+        if not isinstance(tokens, dict):
+            raise RuntimeError("授权文件格式无效")
+
+        account_id = str(data.get("account_id") or tokens.get("account_id") or "")
+        target_path = self._auth_file_path(account_id, new_refresh_token)
+        current_state = self._read_source_state(force=True)
+        was_current = current_state is not None and current_state["refresh_token"] == old_refresh_token
+
+        self._write_auth_data(target_path, data)
+        if target_path != original_path and original_path.exists():
+            original_path.unlink()
+
+        with self._state_lock:
+            self._quota_by_refresh_token.pop(old_refresh_token, None)
+            self._plan_type_by_refresh_token.pop(old_refresh_token, None)
+            self._user_id_by_refresh_token.pop(old_refresh_token, None)
+            self._email_by_refresh_token.pop(old_refresh_token, None)
+            self._quota_refresh_time_5h_by_refresh_token.pop(old_refresh_token, None)
+            self._quota_refresh_time_7d_by_refresh_token.pop(old_refresh_token, None)
+            self._traffic_by_refresh_token[new_refresh_token] = self._traffic_by_refresh_token.pop(old_refresh_token, 0)
+            if old_refresh_token in self._disabled_refresh_tokens:
+                self._disabled_refresh_tokens.discard(old_refresh_token)
+                self._disabled_refresh_tokens.add(new_refresh_token)
+            self._access_token_to_refresh_token = {
+                access_token: mapped_refresh_token
+                for access_token, mapped_refresh_token in self._access_token_to_refresh_token.items()
+                if mapped_refresh_token != old_refresh_token
+            }
+
+        if was_current:
+            self.source_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_auth_data(self.source_path, self._strip_manager_metadata(data))
+
+        self.invalidate_cached_state()
+
     def _find_auth_file_by_refresh_token(self, refresh_token: str) -> Path | None:
         if not self.target_dir.exists():
             return None
