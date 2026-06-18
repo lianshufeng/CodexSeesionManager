@@ -60,6 +60,7 @@ _UPDATE_CHUNK_SIZE = 1024 * 256
 _UPDATES_DIR_NAME = ".updates"
 _UPDATE_EXTRACT_DIR_NAME = "extracted"
 _UPDATE_SCRIPT_NAME = "apply_update.bat"
+_LOW_PRICE_FETCH_PAGE_COUNT = 8
 
 
 @dataclass
@@ -145,6 +146,9 @@ class ProxyWindow:
         self._low_price_window: tk.Toplevel | None = None
         self._low_price_tree: ttk.Treeview | None = None
         self._low_price_refresh_button: ttk.Button | None = None
+        self._low_price_search_var = tk.StringVar(value="")
+        self._low_price_search_status_var = tk.StringVar(value="")
+        self._low_price_search_var.trace_add("write", self._on_low_price_search_changed)
         self._low_price_refreshing = False
         self._low_price_refresh_generation = 0
         self._low_price_items_by_product_id: dict[str, LowPriceAccount] = {}
@@ -2364,6 +2368,17 @@ del "%~f0" >nul 2>nul
         self._low_price_refresh_button = ttk.Button(action_row, text="刷新", command=self.refresh_low_price_accounts)
         self._low_price_refresh_button.pack(side="right")
 
+        search_wrap = ttk.Frame(action_row)
+        search_wrap.pack(side="left", fill="x", expand=True, padx=(0, 12))
+        ttk.Label(search_wrap, text="标题检索").pack(side="left", padx=(0, 8))
+        search_entry = ttk.Entry(search_wrap, textvariable=self._low_price_search_var, width=44)
+        search_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(search_wrap, text="清空", command=lambda: self._low_price_search_var.set("")).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Label(action_row, textvariable=self._low_price_search_status_var).pack(side="right", padx=(0, 12))
+        self._low_price_search_var.set("")
+
         tree_frame = ttk.Frame(body)
         tree_frame.pack(fill="both", expand=True)
 
@@ -2438,11 +2453,11 @@ del "%~f0" >nul 2>nul
             with ThreadPoolExecutor(max_workers=10) as executor:
                 html_futures = [
                     executor.submit(self.low_price_account_service.fetch_accounts, proxy_url, page=page)
-                    for page in range(1, 6)
+                    for page in range(1, _LOW_PRICE_FETCH_PAGE_COUNT + 1)
                 ]
                 catalog_futures = [
                     executor.submit(self.low_price_account_service.fetch_catalog_accounts, proxy_url, page=page)
-                    for page in range(1, 6)
+                    for page in range(1, _LOW_PRICE_FETCH_PAGE_COUNT + 1)
                 ]
                 wait(html_futures + catalog_futures)
                 for future in html_futures + catalog_futures:
@@ -2501,7 +2516,9 @@ del "%~f0" >nul 2>nul
         self._low_price_item_by_product_id.clear()
         self._low_price_titles_by_item.clear()
         self._low_price_details_by_item.clear()
-        for item in sorted(self._low_price_items_by_product_id.values(), key=self._low_price_sort_key):
+        filtered_items = self._filtered_low_price_items()
+        self._low_price_search_status_var.set(f"{len(filtered_items)} / {len(self._low_price_items_by_product_id)}")
+        for item in sorted(filtered_items, key=self._low_price_sort_key):
             details = self._low_price_details_by_product_id.get(item.product_id, "")
             item_id = self._low_price_tree.insert(
                 "",
@@ -2514,6 +2531,19 @@ del "%~f0" >nul 2>nul
             self._low_price_titles_by_item[item_id] = item.title
             if details:
                 self._low_price_details_by_item[item_id] = details
+        self._schedule_low_price_visible_seller_update()
+
+    def _filtered_low_price_items(self) -> list[LowPriceAccount]:
+        keyword = self._low_price_search_var.get().strip().casefold()
+        items = list(self._low_price_items_by_product_id.values())
+        if not keyword:
+            return items
+        return [item for item in items if keyword in item.title.casefold()]
+
+    def _on_low_price_search_changed(self, *_args: object) -> None:
+        if self._low_price_tree is None:
+            return
+        self._render_low_price_items()
 
     def _low_price_row_values(
         self,
