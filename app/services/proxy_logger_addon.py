@@ -24,6 +24,7 @@ _AUTH_REFRESH_BODY_MARKERS = (
     b"grant_type=refresh_token",
     b'"grant_type":"refresh_token"',
 )
+_CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 
 
 class _MibTcpRow(ctypes.Structure):
@@ -258,6 +259,13 @@ class ProxyLoggerAddon:
             return value.removeprefix("Bearer ").strip()
         return ""
 
+    def _strip_codex_responses_lite_header(self, flow: http.HTTPFlow) -> None:
+        headers = flow.request.headers
+        for key in list(headers.keys()):
+            if key.lower() == _CODEX_RESPONSES_LITE_HEADER:
+                del headers[key]
+                _log("已移除 Codex Responses Lite 头，使用完整 Responses 路径")
+
     def _should_preserve_original_bearer(self, flow: http.HTTPFlow) -> bool:
         request = flow.request
         url = str(getattr(request, "pretty_url", "") or getattr(request, "url", "") or "").lower()
@@ -373,6 +381,7 @@ class ProxyLoggerAddon:
         self._mark_activity()
         self._track_flow(flow)
         self._cleanup_flows()
+        self._strip_codex_responses_lite_header(flow)
         original_token = self._extract_bearer_token(flow)
         selected_token, selected_account_id = self._get_selected_auth()
         preserve_original = bool(original_token and self._should_preserve_original_bearer(flow))
