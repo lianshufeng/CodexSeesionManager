@@ -187,6 +187,66 @@ class AuthSyncService:
     def _auth_file_path(self, account_id: str, refresh_token: str) -> Path:
         return self.target_dir / f"{self._safe_auth_file_stem(account_id, refresh_token)}.json"
 
+    def save_logged_in_auth_file(self, data: dict[str, object]) -> tuple[str, str]:
+        tokens = data.get("tokens")
+        if not isinstance(tokens, dict):
+            raise RuntimeError("授权文件格式无效")
+
+        account_id = str(data.get("account_id") or tokens.get("account_id") or "")
+        refresh_token = str(tokens.get("refresh_token") or "").strip()
+        access_token = str(tokens.get("access_token") or "").strip()
+        if not refresh_token or not access_token:
+            raise RuntimeError("授权文件缺少必要 token")
+
+        self.target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = self._auth_file_path(account_id, refresh_token)
+        legacy_path = self._find_auth_file_by_refresh_token(refresh_token)
+        metadata_path = target_path if target_path.exists() else legacy_path
+        old_refresh_token = ""
+        if metadata_path is not None and metadata_path.exists():
+            target_data = self._read_auth_data(metadata_path)
+            if target_data is not None:
+                metadata = self._manager_metadata(target_data)
+                if metadata:
+                    data[_MANAGER_METADATA_KEY] = dict(metadata)
+                target_tokens = target_data.get("tokens")
+                if isinstance(target_tokens, dict):
+                    old_refresh_token = str(target_tokens.get("refresh_token") or "")
+
+        self._write_auth_data(target_path, data)
+        if legacy_path is not None and legacy_path != target_path:
+            try:
+                legacy_path.unlink()
+            except OSError:
+                pass
+
+        with self._state_lock:
+            if old_refresh_token and old_refresh_token != refresh_token:
+                self._quota_by_refresh_token.pop(old_refresh_token, None)
+                self._plan_type_by_refresh_token.pop(old_refresh_token, None)
+                self._user_id_by_refresh_token.pop(old_refresh_token, None)
+                self._email_by_refresh_token.pop(old_refresh_token, None)
+                self._quota_refresh_time_5h_by_refresh_token.pop(old_refresh_token, None)
+                self._quota_refresh_time_7d_by_refresh_token.pop(old_refresh_token, None)
+                self._traffic_by_refresh_token[refresh_token] = self._traffic_by_refresh_token.pop(old_refresh_token, 0)
+                if old_refresh_token in self._disabled_refresh_tokens:
+                    self._disabled_refresh_tokens.discard(old_refresh_token)
+                    self._disabled_refresh_tokens.add(refresh_token)
+                self._access_token_to_refresh_token = {
+                    mapped_access_token: mapped_refresh_token
+                    for mapped_access_token, mapped_refresh_token in self._access_token_to_refresh_token.items()
+                    if mapped_refresh_token != old_refresh_token
+                }
+            self._access_token_to_refresh_token[access_token] = refresh_token
+
+        self.invalidate_cached_state()
+        if self._on_change is not None:
+            try:
+                self._on_change()
+            except Exception as exc:
+                print(f"[AuthSync] 登录授权回调异常: {exc}\n{traceback.format_exc()}", flush=True)
+        return account_id, refresh_token
+
     def save_refreshed_auth_file(
         self,
         original_path: Path,

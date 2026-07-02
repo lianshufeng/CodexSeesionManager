@@ -28,6 +28,7 @@ import psutil
 from PIL import Image
 
 from app.version import APP_VERSION
+from app.services.auth_login_service import AuthLoginResult, AuthLoginService
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
 from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
@@ -90,6 +91,7 @@ class ProxyWindow:
             self.service.config.upstream_proxy = loaded_config.upstream_proxy
             self.service.config.use_upstream_proxy = loaded_config.use_upstream_proxy
         self.auth_sync_service = AuthSyncService()
+        self.auth_login_service = AuthLoginService(self.auth_sync_service)
         self.auth_token_refresh_service = AuthTokenRefreshService(self.auth_sync_service)
         self.auth_usage_service = AuthUsageService(self.auth_sync_service)
         self.low_price_account_service = LowPriceAccountService()
@@ -141,6 +143,8 @@ class ProxyWindow:
         self._correct_traffic_refreshing = False
         self._clean_auth_button: ttk.Button | None = None
         self._clean_auth_refreshing = False
+        self._update_auth_button: ttk.Button | None = None
+        self._auth_login_running = False
         self._refresh_tokens_button: ttk.Button | None = None
         self._refresh_tokens_running = False
         self._low_price_window: tk.Toplevel | None = None
@@ -340,8 +344,8 @@ class ProxyWindow:
         self._correct_traffic_button.pack(side="right")
         self._clean_auth_button = ttk.Button(auth_options, text="清理授权", command=self.clean_auth_files)
         self._clean_auth_button.pack(side="right", padx=(0, 8))
-        update_auth_button = ttk.Button(auth_options, text="更新授权", command=self.update_auth)
-        update_auth_button.pack(side="right", padx=(0, 8))
+        self._update_auth_button = ttk.Button(auth_options, text="更新授权", command=self.update_auth)
+        self._update_auth_button.pack(side="right", padx=(0, 8))
         low_price_button = ttk.Button(auth_options, text="低价购号", command=self.open_low_price_window)
         low_price_button.pack(side="right", padx=(0, 8))
         self._refresh_tokens_button = ttk.Button(auth_options, text="一键刷新令牌", command=self.refresh_all_tokens)
@@ -355,7 +359,7 @@ class ProxyWindow:
             "遍历授权文件并刷新访问令牌",
         )
         self._bind_widget_tooltip(
-            update_auth_button,
+            self._update_auth_button,
             "更新授权文件",
         )
         self._bind_widget_tooltip(
@@ -2196,27 +2200,37 @@ del "%~f0" >nul 2>nul
         print(f"已刷新 {install_count} 项 / {auth_count} 个文件")
 
     def update_auth(self) -> None:
-        if not messagebox.askyesno("更新授权", "是否创建新的授权文件？\n注意：本次操作会结束Codex进程"):
+        if self._auth_login_running:
             return
-        auth_path = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".codex" / "auth.json"
+        if not self._refresh_config():
+            return
+        self._auth_login_running = True
+        proxy_url = self._upstream_proxy if self._use_upstream_proxy else ""
+        Thread(target=self._update_auth_worker, args=(proxy_url,), daemon=True).start()
+
+    def _update_auth_worker(self, proxy_url: str) -> None:
+        result: AuthLoginResult | None = None
+        error = ""
         try:
-            if auth_path.exists():
-                auth_path.unlink()
-                print(f"[ProxyWindow] 已删除授权文件: {auth_path}", flush=True)
-            else:
-                print(f"[ProxyWindow] 授权文件不存在: {auth_path}", flush=True)
-        except OSError as exc:
-            messagebox.showerror("更新授权失败", f"删除授权文件失败: {exc}")
+            result = self.auth_login_service.login_and_save(proxy_url, log=lambda message: print(message, flush=True))
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self._post_ui(lambda value=result, message=error: self._finish_update_auth(value, message))
+        except tk.TclError:
+            pass
+
+    def _finish_update_auth(self, result: AuthLoginResult | None, error: str) -> None:
+        self._auth_login_running = False
+        if error:
+            messagebox.showerror("更新授权失败", error)
             return
 
-        for image_name in ("Codex.exe", "code.exe"):
-            self._kill_process_by_image_name(image_name)
-
-        launch_row = self._get_default_codex_launch_row()
-        if launch_row is None:
-            messagebox.showerror("更新授权失败", "未找到可启动的 Codex 安装项。")
-            return
-        self._launch_codex(launch_row)
+        self.refresh_auth_files(update_status=False)
+        self.auth_usage_service.request_refresh()
+        self._recompute_auto_load_target()
+        account_text = result.account_id if result is not None and result.account_id else "未知账号"
+        print(f"[ProxyWindow] 授权已保存: {account_text}", flush=True)
 
     def correct_traffic(self) -> None:
         if self._correct_traffic_refreshing:
