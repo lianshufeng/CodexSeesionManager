@@ -144,7 +144,6 @@ class ProxyWindow:
         self._clean_auth_button: ttk.Button | None = None
         self._clean_auth_refreshing = False
         self._update_auth_button: ttk.Button | None = None
-        self._auth_login_running = False
         self._refresh_tokens_button: ttk.Button | None = None
         self._refresh_tokens_running = False
         self._low_price_window: tk.Toplevel | None = None
@@ -2200,11 +2199,8 @@ del "%~f0" >nul 2>nul
         print(f"已刷新 {install_count} 项 / {auth_count} 个文件")
 
     def update_auth(self) -> None:
-        if self._auth_login_running:
-            return
         if not self._refresh_config():
             return
-        self._auth_login_running = True
         proxy_url = self._upstream_proxy if self._use_upstream_proxy else ""
         Thread(target=self._update_auth_worker, args=(proxy_url,), daemon=True).start()
 
@@ -2221,7 +2217,6 @@ del "%~f0" >nul 2>nul
             pass
 
     def _finish_update_auth(self, result: AuthLoginResult | None, error: str) -> None:
-        self._auth_login_running = False
         if error:
             messagebox.showerror("更新授权失败", error)
             return
