@@ -125,6 +125,8 @@ class ProxyWindow:
         self._proxy_lock = Lock()
         auto_load_enabled = loaded_config.auto_load if loaded_config is not None else True
         self.auto_load_var = tk.BooleanVar(value=auto_load_enabled)
+        quota_warmup_enabled = loaded_config.quota_warmup if loaded_config is not None else False
+        self.quota_warmup_var = tk.BooleanVar(value=quota_warmup_enabled)
         self._auto_load_enabled = auto_load_enabled
         self._use_upstream_proxy = self.service.config.use_upstream_proxy
         self._upstream_proxy = self.service.config.upstream_proxy
@@ -215,6 +217,15 @@ class ProxyWindow:
         self._cleanup_old_update_files()
         self.root.after(50, self._drain_ui_queue)
         self.root.after(_TRAY_WATCHDOG_INTERVAL_MS, self._tray_icon_watchdog)
+        self.auth_login_service.set_result_callback(
+            lambda result, error: self._post_ui(
+                lambda value=result, message=error: self._finish_update_auth(value, message)
+            )
+        )
+        try:
+            self.auth_login_service.start_callback_listener(log=lambda message: print(message, flush=True))
+        except Exception as exc:
+            print(f"[AuthLogin] 登录回调监听启动失败: {exc}", flush=True)
         self.auth_sync_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
         self.auth_usage_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
         self.auth_usage_service.set_quota_change_callback(
@@ -339,6 +350,14 @@ class ProxyWindow:
         auth_options = ttk.Frame(auth_frame)
         auth_options.pack(fill="x", pady=(0, 6))
         ttk.Checkbutton(auth_options, text="自动负载", variable=self.auto_load_var, command=self._on_auto_load_toggled).pack(side="left")
+        quota_warmup_check = ttk.Checkbutton(
+            auth_options,
+            text="额度预热",
+            variable=self.quota_warmup_var,
+            command=self._on_quota_warmup_toggled,
+        )
+        quota_warmup_check.pack(side="left", padx=(8, 0))
+        self._bind_widget_tooltip(quota_warmup_check, "优先使用5小时额度不低于99%的可用账号，使额度周期尽早开始")
         self._correct_traffic_button = ttk.Button(auth_options, text="矫正流量", command=self.correct_traffic)
         self._correct_traffic_button.pack(side="right")
         self._clean_auth_button = ttk.Button(auth_options, text="清理授权", command=self.clean_auth_files)
@@ -708,6 +727,10 @@ class ProxyWindow:
         self._clear_proxy_kill_pending()
         self.refresh_auth_files(update_status=False)
 
+    def _on_quota_warmup_toggled(self) -> None:
+        self._persist_config()
+        self._recompute_auto_load_target()
+
     def _recompute_auto_load_target(self) -> None:
         with self._auto_load_lock:
             if not self._auto_load_enabled:
@@ -721,12 +744,18 @@ class ProxyWindow:
             self._clear_proxy_kill_pending()
             print("[AutoLoad] 当前没有可选授权文件", flush=True)
             return
+        using_warmup = False
+        if self.quota_warmup_var.get():
+            warmup_rows = [row for row in rows if self._is_quota_warmup_candidate(row.quota)]
+            if warmup_rows:
+                rows = warmup_rows
+                using_warmup = True
         priority_rows = [
             row
             for row in rows
             if row.load_strategy == "priority"
         ]
-        if priority_rows:
+        if priority_rows and not using_warmup:
             rows = priority_rows
         row = max(rows, key=lambda item: (self._quota_priority(item.quota), item.refresh_token))
         target_changed = row.refresh_token != current_refresh_token or row.access_token != current_access_token
@@ -910,6 +939,7 @@ class ProxyWindow:
                 upstream_proxy=upstream_proxy,
                 use_upstream_proxy=self.use_upstream_proxy_var.get(),
                 auto_load=self.auto_load_var.get(),
+                quota_warmup=self.quota_warmup_var.get(),
                 cloud_s3_address=self.cloud_s3_address_var.get().strip(),
                 cloud_bucket_name=self.cloud_bucket_name_var.get().strip(),
                 cloud_account=self.cloud_account_var.get().strip(),
@@ -1614,6 +1644,7 @@ class ProxyWindow:
         self.upstream_proxy_var.set(loaded_config.upstream_proxy)
         self.use_upstream_proxy_var.set(loaded_config.use_upstream_proxy)
         self.auto_load_var.set(loaded_config.auto_load)
+        self.quota_warmup_var.set(loaded_config.quota_warmup)
         self.cloud_s3_address_var.set(loaded_config.cloud_s3_address)
         self.cloud_bucket_name_var.set(loaded_config.cloud_bucket_name)
         self.cloud_account_var.set(loaded_config.cloud_account)
@@ -2202,19 +2233,10 @@ del "%~f0" >nul 2>nul
         if not self._refresh_config():
             return
         proxy_url = self._upstream_proxy if self._use_upstream_proxy else ""
-        Thread(target=self._update_auth_worker, args=(proxy_url,), daemon=True).start()
-
-    def _update_auth_worker(self, proxy_url: str) -> None:
-        result: AuthLoginResult | None = None
-        error = ""
         try:
-            result = self.auth_login_service.login_and_save(proxy_url, log=lambda message: print(message, flush=True))
+            self.auth_login_service.start_login(proxy_url, log=lambda message: print(message, flush=True))
         except Exception as exc:
-            error = str(exc)
-        try:
-            self._post_ui(lambda value=result, message=error: self._finish_update_auth(value, message))
-        except tk.TclError:
-            pass
+            messagebox.showerror("更新授权失败", str(exc))
 
     def _finish_update_auth(self, result: AuthLoginResult | None, error: str) -> None:
         if error:
@@ -3264,6 +3286,10 @@ del "%~f0" >nul 2>nul
         if len(percentages) >= 2 and percentages[1] <= 0:
             return False
         return True
+
+    def _is_quota_warmup_candidate(self, quota: str) -> bool:
+        percentages = self._quota_percentages(quota)
+        return bool(percentages) and percentages[0] >= 99 and all(value > 0 for value in percentages)
 
     def _format_auth_load_mark(self, row: AuthFileRow, load_refresh_token: str) -> str:
         if row.refresh_token == load_refresh_token:

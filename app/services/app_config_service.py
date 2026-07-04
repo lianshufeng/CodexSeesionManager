@@ -13,6 +13,7 @@ class AppConfig:
     upstream_proxy: str = "127.0.0.1:1088"
     use_upstream_proxy: bool = True
     auto_load: bool = True
+    quota_warmup: bool = False
     cloud_s3_address: str = ""
     cloud_bucket_name: str = ""
     cloud_account: str = ""
@@ -42,6 +43,7 @@ class AppConfigService:
         upstream_proxy = str(data.get("upstream_proxy") or "127.0.0.1:1088")
         use_upstream_proxy = bool(data.get("use_upstream_proxy", True))
         auto_load = bool(data.get("auto_load", True))
+        quota_warmup = bool(data.get("quota_warmup", False))
         cloud_storage = data.get("cloud_storage")
         if not isinstance(cloud_storage, dict):
             cloud_storage = {}
@@ -50,6 +52,7 @@ class AppConfigService:
             upstream_proxy=upstream_proxy,
             use_upstream_proxy=use_upstream_proxy,
             auto_load=auto_load,
+            quota_warmup=quota_warmup,
             cloud_s3_address=str(cloud_storage.get("s3_address") or ""),
             cloud_bucket_name=str(cloud_storage.get("bucket_name") or ""),
             cloud_account=str(cloud_storage.get("account") or ""),
@@ -63,6 +66,7 @@ class AppConfigService:
             "upstream_proxy": config.upstream_proxy,
             "use_upstream_proxy": config.use_upstream_proxy,
             "auto_load": config.auto_load,
+            "quota_warmup": config.quota_warmup,
             "cloud_storage": {
                 "s3_address": config.cloud_s3_address,
                 "bucket_name": config.cloud_bucket_name,

@@ -4,7 +4,7 @@ import base64
 import hashlib
 import json
 import secrets
-import time
+from threading import Lock, Thread
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,40 +30,64 @@ class AuthLoginResult:
     refresh_token: str
 
 
+@dataclass
+class _PendingLogin:
+    state: str
+    code_verifier: str
+    redirect_uri: str
+    proxy_url: str
+
+
 class AuthLoginService:
     def __init__(self, auth_sync_service: AuthSyncService) -> None:
         self.auth_sync_service = auth_sync_service
+        self._lock = Lock()
+        self._callback_server: HTTPServer | None = None
+        self._callback_port = 0
+        self._callback_thread: Thread | None = None
+        self._pending_login: _PendingLogin | None = None
+        self._result_callback: Callable[[AuthLoginResult | None, str], None] | None = None
 
-    def login_and_save(
+    def set_result_callback(self, callback: Callable[[AuthLoginResult | None, str], None]) -> None:
+        self._result_callback = callback
+
+    def start_callback_listener(self, log: Callable[[str], None] | None = None) -> None:
+        with self._lock:
+            if self._callback_server is not None:
+                return
+            server = self._build_callback_server()
+            self._callback_server = server
+            self._callback_port = int(server.server_address[1])
+            self._callback_thread = Thread(target=server.serve_forever, daemon=True)
+            self._callback_thread.start()
+        if log is not None:
+            log(f"[AuthLogin] 登录回调监听已启动: http://localhost:{self._callback_port}{_CALLBACK_PATH}")
+
+    def start_login(
         self,
         proxy_url: str = "",
-        timeout_seconds: int = 300,
         log: Callable[[str], None] | None = None,
-    ) -> AuthLoginResult:
+    ) -> None:
+        self.start_callback_listener(log)
         code_verifier = self._token_urlsafe(96)
         code_challenge = self._code_challenge(code_verifier)
         state = self._token_urlsafe(32)
-        server = self._build_callback_server(state)
-        port = int(server.server_address[1])
-        redirect_uri = f"http://localhost:{port}{_CALLBACK_PATH}"
+        redirect_uri = f"http://localhost:{self._callback_port}{_CALLBACK_PATH}"
         authorize_url = self._build_authorize_url(redirect_uri, code_challenge, state)
 
+        with self._lock:
+            self._pending_login = _PendingLogin(
+                state=state,
+                code_verifier=code_verifier,
+                redirect_uri=redirect_uri,
+                proxy_url=proxy_url,
+            )
         if log is not None:
-            log(f"[AuthLogin] 等待网页登录回调: {redirect_uri}")
+            log(f"[AuthLogin] 已打开网页登录，等待回调: {redirect_uri}")
         webbrowser.open(authorize_url)
 
-        try:
-            code = self._wait_for_code(server, timeout_seconds)
-        finally:
-            server.server_close()
-
-        token_data = self._request_tokens(code, code_verifier, redirect_uri, proxy_url)
-        auth_data = self._build_auth_data(token_data)
-        account_id, refresh_token = self.auth_sync_service.save_logged_in_auth_file(auth_data)
-        return AuthLoginResult(account_id=account_id, refresh_token=refresh_token)
-
-    def _build_callback_server(self, state: str) -> HTTPServer:
-        callback_state = {"code": "", "error": ""}
+    def _build_callback_server(self) -> HTTPServer:
+        service = self
 
         class CallbackHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
@@ -75,24 +99,27 @@ class AuthLoginService:
 
                 params = parse.parse_qs(parsed.query)
                 returned_state = params.get("state", [""])[0]
-                if returned_state != state:
-                    callback_state["error"] = "网页登录状态校验失败。"
-                    self._send_page(400, "登录失败，请关闭此页面后重试。")
+                pending_login = service._take_pending_login(returned_state)
+                if pending_login is None:
+                    self._send_page(400, "没有待处理登录，请返回账户管理工具重新点击更新授权。")
                     return
 
                 error_text = params.get("error", [""])[0]
                 if error_text:
-                    callback_state["error"] = error_text
+                    service._notify_result(None, error_text)
                     self._send_page(400, "登录失败，请关闭此页面后重试。")
                     return
 
                 code = params.get("code", [""])[0]
                 if not code:
-                    callback_state["error"] = "网页登录回调缺少 code。"
+                    service._notify_result(None, "网页登录回调缺少 code。")
                     self._send_page(400, "登录失败，请关闭此页面后重试。")
                     return
 
-                callback_state["code"] = code
+                error_message = service._save_callback_login(code, pending_login)
+                if error_message:
+                    self._send_page(500, "登录失败，请返回账户管理工具查看错误。")
+                    return
                 self._send_page(200, "登录成功，可以返回账户管理工具。")
 
             def log_message(self, _format: str, *_args: object) -> None:
@@ -116,23 +143,40 @@ class AuthLoginService:
                 server = HTTPServer(("127.0.0.1", port), CallbackHandler)
             except OSError:
                 continue
-            server.callback_state = callback_state  # type: ignore[attr-defined]
             return server
         raise RuntimeError("无法监听 Codex 登录回调端口 1455 或 1457。")
 
-    def _wait_for_code(self, server: HTTPServer, timeout_seconds: int) -> str:
-        server.timeout = 1
-        deadline = time.monotonic() + timeout_seconds
-        callback_state = server.callback_state  # type: ignore[attr-defined]
-        while time.monotonic() < deadline:
-            server.handle_request()
-            code = str(callback_state.get("code") or "")
-            if code:
-                return code
-            error_text = str(callback_state.get("error") or "")
-            if error_text:
-                raise RuntimeError(error_text)
-        raise RuntimeError("等待网页登录回调超时。")
+    def _take_pending_login(self, state: str) -> _PendingLogin | None:
+        with self._lock:
+            pending_login = self._pending_login
+            if pending_login is None:
+                return None
+            if pending_login.state != state:
+                return None
+            self._pending_login = None
+            return pending_login
+
+    def _save_callback_login(self, code: str, pending_login: _PendingLogin) -> str:
+        try:
+            token_data = self._request_tokens(
+                code,
+                pending_login.code_verifier,
+                pending_login.redirect_uri,
+                pending_login.proxy_url,
+            )
+            auth_data = self._build_auth_data(token_data)
+            account_id, refresh_token = self.auth_sync_service.save_logged_in_auth_file(auth_data)
+        except Exception as exc:
+            error_message = str(exc)
+            self._notify_result(None, error_message)
+            return error_message
+        self._notify_result(AuthLoginResult(account_id=account_id, refresh_token=refresh_token), "")
+        return ""
+
+    def _notify_result(self, result: AuthLoginResult | None, error: str) -> None:
+        callback = self._result_callback
+        if callback is not None:
+            callback(result, error)
 
     def _request_tokens(
         self,
