@@ -72,6 +72,7 @@ class ProxyLoggerAddon:
         self._upload_bytes = 0
         self._download_bytes = 0
         self._live_flows: dict[str, object] = {}
+        self._last_model_rewrite_log = ""
 
     def load(self, loader) -> None:
         _log("日志插件已加载")
@@ -206,31 +207,35 @@ class ProxyLoggerAddon:
             self._report_control_event(f"MANUAL_KILL_RESULT {killed} {tracked} {reset}")
             _log(f"手动矫正流量，tracked={tracked} reset={reset} killed={killed}")
 
-    def _get_selected_auth(self) -> tuple[str, str]:
+    def _get_selected_auth(self) -> tuple[str, str, str]:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
         if not port_text:
-            return "", ""
+            return "", "", ""
         try:
             port = int(port_text)
         except ValueError:
-            return "", ""
+            return "", "", ""
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2) as conn:
                 conn.settimeout(0.2)
                 conn.sendall(b"AUTH\n")
                 data = conn.recv(4096)
         except OSError:
-            return "", ""
+            return "", "", ""
         text = data.decode("utf-8", errors="ignore").strip()
         if not text:
-            return "", ""
+            return "", "", ""
         try:
             auth = json.loads(text)
         except json.JSONDecodeError:
-            return text, ""
+            return text, "", ""
         if not isinstance(auth, dict):
-            return "", ""
-        return str(auth.get("access_token") or ""), str(auth.get("account_id") or "")
+            return "", "", ""
+        return (
+            str(auth.get("access_token") or ""),
+            str(auth.get("account_id") or ""),
+            str(auth.get("load_model") or "").strip(),
+        )
 
     def _rewrite_auth_headers(self, flow: http.HTTPFlow, access_token: str, account_id: str) -> None:
         if not access_token:
@@ -265,6 +270,100 @@ class ProxyLoggerAddon:
             if key.lower() == _CODEX_RESPONSES_LITE_HEADER:
                 del headers[key]
                 _log("已移除 Codex Responses Lite 头，使用完整 Responses 路径")
+
+    def _rewrite_model_in_payload(self, value, load_model: str) -> tuple[object, bool, str]:
+        if isinstance(value, dict):
+            changed = False
+            original_model = ""
+            rewritten: dict[object, object] = {}
+            for key, item in value.items():
+                if key == "model" and isinstance(item, str) and item != load_model:
+                    rewritten[key] = load_model
+                    changed = True
+                    if not original_model:
+                        original_model = item
+                    continue
+                new_item, item_changed, item_original_model = self._rewrite_model_in_payload(item, load_model)
+                rewritten[key] = new_item
+                changed = changed or item_changed
+                if not original_model:
+                    original_model = item_original_model
+            return rewritten, changed, original_model
+        if isinstance(value, list):
+            changed = False
+            original_model = ""
+            rewritten_items = []
+            for item in value:
+                new_item, item_changed, item_original_model = self._rewrite_model_in_payload(item, load_model)
+                rewritten_items.append(new_item)
+                changed = changed or item_changed
+                if not original_model:
+                    original_model = item_original_model
+            return rewritten_items, changed, original_model
+        return value, False, ""
+
+    def _log_model_rewrite(self, original_model: str, load_model: str) -> None:
+        signature = f"{original_model}->{load_model}"
+        if signature == self._last_model_rewrite_log:
+            return
+        self._last_model_rewrite_log = signature
+        _log(f"已强制改写模型: {original_model or '未知'} -> {load_model}")
+
+    def _rewrite_http_model(self, flow: http.HTTPFlow, load_model: str) -> bool:
+        if not load_model:
+            return False
+        body = getattr(flow.request, "raw_content", None) or b""
+        if not body:
+            return False
+        try:
+            text = body.decode("utf-8")
+            payload = json.loads(text)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        rewritten, changed, original_model = self._rewrite_model_in_payload(payload, load_model)
+        if not changed:
+            return False
+        try:
+            flow.request.set_text(json.dumps(rewritten, ensure_ascii=False, separators=(",", ":")))
+        except Exception as exc:
+            _log(f"模型改写失败: {exc}")
+            return False
+        self._log_model_rewrite(original_model, load_model)
+        return True
+
+    def _rewrite_websocket_model(self, flow: http.HTTPFlow, load_model: str) -> bool:
+        if not load_model:
+            return False
+        websocket = getattr(flow, "websocket", None)
+        messages = getattr(websocket, "messages", None)
+        if not messages:
+            return False
+        message = messages[-1]
+        content = getattr(message, "content", None)
+        if content is None:
+            return False
+        if isinstance(content, bytes):
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                return False
+        else:
+            text = str(content)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return False
+        rewritten, changed, original_model = self._rewrite_model_in_payload(payload, load_model)
+        if not changed:
+            return False
+        new_text = json.dumps(rewritten, ensure_ascii=False, separators=(",", ":"))
+        try:
+            message.content = new_text.encode("utf-8") if isinstance(content, bytes) else new_text
+        except Exception as exc:
+            _log(f"WebSocket 模型改写失败: {exc}")
+            return False
+        self._log_model_rewrite(original_model, load_model)
+        return True
 
     def _should_preserve_original_bearer(self, flow: http.HTTPFlow) -> bool:
         request = flow.request
@@ -381,13 +480,17 @@ class ProxyLoggerAddon:
         self._mark_activity()
         self._track_flow(flow)
         self._cleanup_flows()
-        self._strip_codex_responses_lite_header(flow)
         original_token = self._extract_bearer_token(flow)
-        selected_token, selected_account_id = self._get_selected_auth()
-        preserve_original = bool(original_token and self._should_preserve_original_bearer(flow))
-        if selected_token and not preserve_original:
+        selected_token, selected_account_id, load_model = self._get_selected_auth()
+        if load_model:
+            self._strip_codex_responses_lite_header(flow)
+            self._rewrite_http_model(flow, load_model)
+        preserve_original = bool(
+            original_token and (not load_model or self._should_preserve_original_bearer(flow))
+        )
+        if selected_token and load_model and not preserve_original:
             self._rewrite_auth_headers(flow, selected_token, selected_account_id)
-        usage_token = original_token if preserve_original else selected_token or original_token
+        usage_token = original_token if preserve_original or not load_model else selected_token or original_token
         if usage_token:
             self._report_access_token_used(usage_token)
         self._upload_bytes += self._estimate_http_bytes(flow.request.headers, flow.request.raw_content)
@@ -406,11 +509,17 @@ class ProxyLoggerAddon:
     def websocket_message(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()
         self._track_flow(flow)
+        _selected_token, _selected_account_id, load_model = self._get_selected_auth()
+        if load_model:
+            self._rewrite_websocket_model(flow, load_model)
         return None
 
     def websocket_start(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()
         self._track_flow(flow)
+        _selected_token, _selected_account_id, load_model = self._get_selected_auth()
+        if load_model:
+            self._strip_codex_responses_lite_header(flow)
         return None
 
     def error(self, flow: http.HTTPFlow) -> None:

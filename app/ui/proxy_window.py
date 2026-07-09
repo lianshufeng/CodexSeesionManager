@@ -31,6 +31,7 @@ from app.version import APP_VERSION
 from app.services.auth_login_service import AuthLoginResult, AuthLoginService
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
+from app.services.auth_model_capability_service import AuthModelCapabilityService
 from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
 from app.services.auth_usage_service import QUOTA_REFRESH_FAILED, AuthQuotaItem, AuthUsageService
 from app.services.cloud_sync_service import CloudSyncConfig, CloudSyncFile, CloudSyncService, CloudSyncVersion
@@ -94,6 +95,7 @@ class ProxyWindow:
         self.auth_login_service = AuthLoginService(self.auth_sync_service)
         self.auth_token_refresh_service = AuthTokenRefreshService(self.auth_sync_service)
         self.auth_usage_service = AuthUsageService(self.auth_sync_service)
+        self.auth_model_capability_service = AuthModelCapabilityService(self.auth_sync_service)
         self.low_price_account_service = LowPriceAccountService()
         self.root.title("Codex 账户管理工具")
         self.root.minsize(1040, 660)
@@ -127,6 +129,11 @@ class ProxyWindow:
         self.auto_load_var = tk.BooleanVar(value=auto_load_enabled)
         quota_warmup_enabled = loaded_config.quota_warmup if loaded_config is not None else False
         self.quota_warmup_var = tk.BooleanVar(value=quota_warmup_enabled)
+        lock_model_enabled = loaded_config.lock_model_enabled if loaded_config is not None else True
+        self.lock_model_var = tk.BooleanVar(value=lock_model_enabled)
+        load_model = loaded_config.load_model if loaded_config is not None else "gpt-5.5"
+        self.load_model_var = tk.StringVar(value=load_model)
+        self._load_model_entry: ttk.Entry | None = None
         self._auto_load_enabled = auto_load_enabled
         self._use_upstream_proxy = self.service.config.use_upstream_proxy
         self._upstream_proxy = self.service.config.upstream_proxy
@@ -226,7 +233,12 @@ class ProxyWindow:
             self.auth_login_service.start_callback_listener(log=lambda message: print(message, flush=True))
         except Exception as exc:
             print(f"[AuthLogin] 登录回调监听启动失败: {exc}", flush=True)
-        self.auth_sync_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
+        self.auth_sync_service.set_change_callback(
+            lambda: (
+                self._post_ui(self._schedule_refresh_auth_files),
+                self.auth_model_capability_service.request_refresh(),
+            )
+        )
         self.auth_usage_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
         self.auth_usage_service.set_quota_change_callback(
             lambda: (
@@ -235,8 +247,13 @@ class ProxyWindow:
             )
         )
         self.auth_usage_service.set_proxy_provider(self._get_proxy_for_usage_request)
+        self.auth_model_capability_service.set_proxy_provider(self._get_proxy_for_usage_request)
+        self.auth_model_capability_service.set_change_callback(
+            lambda: self._post_ui(lambda: self.refresh_auth_files(update_status=False))
+        )
         self.auth_sync_service.start()
         self.auth_usage_service.start()
+        self.auth_model_capability_service.start()
         self._center_window(1040, 660)
         self._load_or_probe_initial_config(loaded_config is not None)
         self._sync_proxy_config_cache()
@@ -358,6 +375,28 @@ class ProxyWindow:
         )
         quota_warmup_check.pack(side="left", padx=(8, 0))
         self._bind_widget_tooltip(quota_warmup_check, "优先使用5小时额度不低于99%的可用账号，使额度周期尽早开始")
+        lock_model_check = ttk.Checkbutton(
+            auth_options,
+            text="锁定模型",
+            variable=self.lock_model_var,
+            command=self._on_lock_model_toggled,
+        )
+        lock_model_check.pack(side="left", padx=(12, 4))
+        load_model_entry = ttk.Entry(auth_options, textvariable=self.load_model_var, width=14)
+        self._load_model_entry = load_model_entry
+        load_model_entry.pack(side="left")
+        load_model_entry.bind("<FocusOut>", lambda _event: self._persist_config())
+        load_model_entry.bind("<Return>", lambda _event: self._persist_config())
+        self._bind_widget_tooltip(
+            lock_model_check,
+            "勾选后代理会把 Codex 请求中的 model 改写为输入框里的模型，例如 gpt-5.5；"
+            "取消勾选时不锁定模型，并保留 Codex 原始模型和原始账号。",
+        )
+        self._bind_widget_tooltip(
+            load_model_entry,
+            "锁定模型名称，默认 gpt-5.5。只有左侧锁定模型勾选时生效。",
+        )
+        self._refresh_lock_model_state()
         self._correct_traffic_button = ttk.Button(auth_options, text="矫正流量", command=self.correct_traffic)
         self._correct_traffic_button.pack(side="right")
         self._clean_auth_button = ttk.Button(auth_options, text="清理授权", command=self.clean_auth_files)
@@ -731,6 +770,18 @@ class ProxyWindow:
         self._persist_config()
         self._recompute_auto_load_target()
 
+    def _on_lock_model_toggled(self) -> None:
+        if self.lock_model_var.get() and not self.load_model_var.get().strip():
+            self.load_model_var.set("gpt-5.5")
+        self._refresh_lock_model_state()
+        self._persist_config()
+
+    def _refresh_lock_model_state(self) -> None:
+        if self._load_model_entry is None:
+            return
+        state = "normal" if self.lock_model_var.get() else "disabled"
+        self._load_model_entry.configure(state=state)
+
     def _recompute_auto_load_target(self) -> None:
         with self._auto_load_lock:
             if not self._auto_load_enabled:
@@ -940,6 +991,8 @@ class ProxyWindow:
                 use_upstream_proxy=self.use_upstream_proxy_var.get(),
                 auto_load=self.auto_load_var.get(),
                 quota_warmup=self.quota_warmup_var.get(),
+                lock_model_enabled=self.lock_model_var.get(),
+                load_model=self.load_model_var.get().strip(),
                 cloud_s3_address=self.cloud_s3_address_var.get().strip(),
                 cloud_bucket_name=self.cloud_bucket_name_var.get().strip(),
                 cloud_account=self.cloud_account_var.get().strip(),
@@ -1645,6 +1698,9 @@ class ProxyWindow:
         self.use_upstream_proxy_var.set(loaded_config.use_upstream_proxy)
         self.auto_load_var.set(loaded_config.auto_load)
         self.quota_warmup_var.set(loaded_config.quota_warmup)
+        self.lock_model_var.set(loaded_config.lock_model_enabled)
+        self.load_model_var.set(loaded_config.load_model)
+        self._refresh_lock_model_state()
         self.cloud_s3_address_var.set(loaded_config.cloud_s3_address)
         self.cloud_bucket_name_var.set(loaded_config.cloud_bucket_name)
         self.cloud_account_var.set(loaded_config.cloud_account)
@@ -1689,6 +1745,11 @@ class ProxyWindow:
         with self._auto_load_lock:
             return self._auto_load_target_access_token if self._auto_load_enabled else ""
 
+    def _effective_load_model(self) -> str:
+        if not self.lock_model_var.get():
+            return ""
+        return self.load_model_var.get().strip()
+
     def _get_auto_load_target_auth_payload(self) -> str:
         with self._auto_load_lock:
             if not self._auto_load_enabled:
@@ -1697,7 +1758,14 @@ class ProxyWindow:
             else:
                 token = self._auto_load_target_access_token
                 account_id = self._auto_load_target_account_id
-        return json.dumps({"access_token": token, "account_id": account_id}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "access_token": token,
+                "account_id": account_id,
+                "load_model": self._effective_load_model(),
+            },
+            ensure_ascii=False,
+        )
 
     def _start_auto_load_control_server(self) -> int:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -3466,6 +3534,14 @@ del "%~f0" >nul 2>nul
             f"类型: {row.plan_type or ''}",
             f"负载策略: {self._format_auth_load_strategy(row.load_strategy)}",
         ]
+        model_item = self.auth_model_capability_service.item_for(row.refresh_token)
+        if model_item is None:
+            lines.append("模型能力: 等待自动刷新")
+        elif model_item.status == "ok":
+            model_names = "  ".join(model.slug for model in model_item.models)
+            lines.append(f"支持模型: {model_names}")
+        else:
+            lines.append(f"模型能力: 失败，{model_item.message}")
         return "\n".join(lines)
 
     def _on_tree_motion(self, event: tk.Event) -> None:
@@ -3971,6 +4047,7 @@ del "%~f0" >nul 2>nul
         self._closing = True
         self._remove_tray_icon()
         self._persist_config()
+        self.auth_model_capability_service.stop()
         self.auth_usage_service.stop()
         self.auth_sync_service.stop()
         self._low_price_seller_info_executor.shutdown(wait=False, cancel_futures=True)
