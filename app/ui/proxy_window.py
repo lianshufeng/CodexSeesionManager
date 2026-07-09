@@ -390,11 +390,11 @@ class ProxyWindow:
         self._bind_widget_tooltip(
             lock_model_check,
             "勾选后代理会把 Codex 请求中的 model 改写为输入框里的模型，例如 gpt-5.5；"
-            "取消勾选时不锁定模型，并保留 Codex 原始模型和原始账号。",
+            "锁定状态下输入框不可编辑，取消勾选后可编辑但不生效。",
         )
         self._bind_widget_tooltip(
             load_model_entry,
-            "锁定模型名称，默认 gpt-5.5。只有左侧锁定模型勾选时生效。",
+            "锁定模型名称，默认 gpt-5.5。取消勾选后可编辑，重新勾选后开始锁定该模型。",
         )
         self._refresh_lock_model_state()
         self._correct_traffic_button = ttk.Button(auth_options, text="矫正流量", command=self.correct_traffic)
@@ -779,7 +779,7 @@ class ProxyWindow:
     def _refresh_lock_model_state(self) -> None:
         if self._load_model_entry is None:
             return
-        state = "normal" if self.lock_model_var.get() else "disabled"
+        state = "disabled" if self.lock_model_var.get() else "normal"
         self._load_model_entry.configure(state=state)
 
     def _recompute_auto_load_target(self) -> None:
