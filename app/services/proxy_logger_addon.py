@@ -485,12 +485,10 @@ class ProxyLoggerAddon:
         if load_model:
             self._strip_codex_responses_lite_header(flow)
             self._rewrite_http_model(flow, load_model)
-        preserve_original = bool(
-            original_token and (not load_model or self._should_preserve_original_bearer(flow))
-        )
-        if selected_token and load_model and not preserve_original:
+        preserve_original = bool(original_token and self._should_preserve_original_bearer(flow))
+        if selected_token and not preserve_original:
             self._rewrite_auth_headers(flow, selected_token, selected_account_id)
-        usage_token = original_token if preserve_original or not load_model else selected_token or original_token
+        usage_token = original_token if preserve_original else selected_token or original_token
         if usage_token:
             self._report_access_token_used(usage_token)
         self._upload_bytes += self._estimate_http_bytes(flow.request.headers, flow.request.raw_content)

@@ -14,7 +14,7 @@ class AppConfig:
     use_upstream_proxy: bool = True
     auto_load: bool = True
     quota_warmup: bool = False
-    lock_model_enabled: bool = True
+    lock_model_enabled: bool = False
     load_model: str = "gpt-5.5"
     cloud_s3_address: str = ""
     cloud_bucket_name: str = ""
@@ -48,9 +48,9 @@ class AppConfigService:
         quota_warmup = bool(data.get("quota_warmup", False))
         load_model = str(data.get("load_model")).strip() if "load_model" in data else "gpt-5.5"
         if "lock_model_enabled" in data:
-            lock_model_enabled = bool(data.get("lock_model_enabled", True))
+            lock_model_enabled = bool(data.get("lock_model_enabled", False))
         else:
-            lock_model_enabled = bool(load_model)
+            lock_model_enabled = False
         cloud_storage = data.get("cloud_storage")
         if not isinstance(cloud_storage, dict):
             cloud_storage = {}

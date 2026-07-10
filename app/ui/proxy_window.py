@@ -129,7 +129,7 @@ class ProxyWindow:
         self.auto_load_var = tk.BooleanVar(value=auto_load_enabled)
         quota_warmup_enabled = loaded_config.quota_warmup if loaded_config is not None else False
         self.quota_warmup_var = tk.BooleanVar(value=quota_warmup_enabled)
-        lock_model_enabled = loaded_config.lock_model_enabled if loaded_config is not None else True
+        lock_model_enabled = loaded_config.lock_model_enabled if loaded_config is not None else False
         self.lock_model_var = tk.BooleanVar(value=lock_model_enabled)
         load_model = loaded_config.load_model if loaded_config is not None else "gpt-5.5"
         self.load_model_var = tk.StringVar(value=load_model)
@@ -394,7 +394,7 @@ class ProxyWindow:
         )
         self._bind_widget_tooltip(
             load_model_entry,
-            "锁定模型名称，默认 gpt-5.5。取消勾选后可编辑，重新勾选后开始锁定该模型。",
+            "锁定模型名称，默认不锁定；勾选后代理会把 Codex 请求中的 model 改写为输入框里的模型。",
         )
         self._refresh_lock_model_state()
         self._correct_traffic_button = ttk.Button(auth_options, text="矫正流量", command=self.correct_traffic)
@@ -3851,10 +3851,15 @@ del "%~f0" >nul 2>nul
             return
         proxy_port = self.service.config.port
         env = os.environ.copy()
-        env["HTTP_PROXY"] = f"http://127.0.0.1:{proxy_port}"
-        env["HTTPS_PROXY"] = f"http://127.0.0.1:{proxy_port}"
-        env["ALL_PROXY"] = f"http://127.0.0.1:{proxy_port}"
+        proxy_url = f"http://127.0.0.1:{proxy_port}"
+        env["HTTP_PROXY"] = proxy_url
+        env["HTTPS_PROXY"] = proxy_url
+        env["ALL_PROXY"] = proxy_url
+        env["http_proxy"] = proxy_url
+        env["https_proxy"] = proxy_url
+        env["all_proxy"] = proxy_url
         env["NO_PROXY"] = "localhost,127.0.0.1"
+        env["no_proxy"] = "localhost,127.0.0.1"
         current_dir = str(exe.parent)
         print(f"[ProxyWindow] 启动外部程序: {exe.name}", flush=True)
         if self._is_cli_codex_executable(exe):
@@ -3865,8 +3870,16 @@ del "%~f0" >nul 2>nul
                 creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
             )
             return
+        args = [str(exe)]
+        if exe.name.lower() == "chatgpt.exe":
+            args.extend(
+                [
+                    f"--proxy-server={proxy_url}",
+                    "--proxy-bypass-list=localhost;127.0.0.1;<local>",
+                ]
+            )
         subprocess.Popen(
-            [str(exe)],
+            args,
             cwd=current_dir,
             env=env,
             stdin=subprocess.DEVNULL,
