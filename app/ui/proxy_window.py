@@ -3085,7 +3085,7 @@ del "%~f0" >nul 2>nul
 
             dialog.after(0, select_root_process_items)
         else:
-            process_tree.insert("", "end", text="未找到 Codex.exe 或 codex.exe 进程", values=("",))
+            process_tree.insert("", "end", text="未找到 Codex.exe 或 ChatGPT.exe 进程", values=("",))
 
         button_row = ttk.Frame(dialog, padding=(12, 0, 12, 12))
         button_row.grid(row=1, column=0, sticky="ew")
@@ -3112,11 +3112,11 @@ del "%~f0" >nul 2>nul
         dialog.wait_window()
 
     def _list_codex_process_rows(self) -> list[CodexProcessRow]:
-        target_names = {"Codex.exe", "codex.exe"}
+        target_names = {"codex.exe", "chatgpt.exe"}
         root_processes: list[psutil.Process] = []
         for process in psutil.process_iter(["name"]):
             try:
-                if process.info.get("name") in target_names:
+                if str(process.info.get("name") or "").lower() in target_names:
                     root_processes.append(process)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -3238,6 +3238,7 @@ del "%~f0" >nul 2>nul
         normalized_path = path.replace("/", "\\")
         return (
             normalized_path.endswith("\\app\\Codex.exe")
+            or normalized_path.endswith("\\app\\ChatGPT.exe")
             or normalized_path.endswith("\\codex\\codex.exe")
             or normalized_path.endswith("\\Code.exe")
             or normalized_path.endswith("\\code.exe")
@@ -3250,7 +3251,7 @@ del "%~f0" >nul 2>nul
 
         rows: list[CodexInstallRow] = []
         for app_dir in sorted(base_dir.iterdir(), key=lambda p: p.name):
-            if not app_dir.is_dir() or not app_dir.name.startswith("OpenAI.Codex"):
+            if not app_dir.is_dir() or not app_dir.name.startswith(("OpenAI.Codex", "OpenAI.ChatGPT")):
                 continue
             for exe_path in self._iter_codex_executables(app_dir):
                 rows.append(
@@ -3881,7 +3882,7 @@ del "%~f0" >nul 2>nul
     def _iter_codex_executables(self, root: Path) -> list[Path]:
         matches: list[Path] = []
         for path in root.rglob("*"):
-            if path.is_file() and path.name in {"codex.exe", "Codex.exe", "Code"}:
+            if path.is_file() and path.name.lower() in {"codex.exe", "chatgpt.exe", "code"}:
                 matches.append(path)
         return matches
 
@@ -3893,7 +3894,7 @@ del "%~f0" >nul 2>nul
         return matches
 
     def _extract_version(self, folder_name: str) -> str:
-        match = re.match(r"^OpenAI\.Codex_(\d+(?:\.\d+)*)_", folder_name)
+        match = re.match(r"^OpenAI\.(?:Codex|ChatGPT)_(\d+(?:\.\d+)*)_", folder_name)
         if match:
             return match.group(1)
         return ""
