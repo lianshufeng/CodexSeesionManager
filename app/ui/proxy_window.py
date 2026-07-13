@@ -4047,6 +4047,14 @@ del "%~f0" >nul 2>nul
         return base_dir / "icon" / "tray_icon.ico"
 
     def _on_close(self) -> None:
+        for child in self.root.winfo_children():
+            if not isinstance(child, tk.Toplevel):
+                continue
+            try:
+                if child.winfo_exists() and child.state() != "withdrawn":
+                    return
+            except tk.TclError:
+                continue
         self._hide_to_tray()
 
     def _exit_app(self) -> None:
