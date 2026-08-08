@@ -6,7 +6,7 @@ Codex Session Manager 是一个面向 Windows 的 Codex 账户管理工具，核
 
 ## 核心能力
 
-- 自动同步 `~/.codex/auth.json` 到本地 `auth/` 管理目录。
+- 通过程序登录流程维护本地 `auth/` 授权管理目录。
 - 自动读取每个授权的账号 ID、计划类型、额度、额度刷新时间和访问令牌。
 - 默认开启自动负载，优先选择 5 小时剩余额度更高的 Codex session。
 - 代理层会对请求头中的 `Bearer accessToken` 做统一替换，不绑定单一接口 URL。
@@ -27,7 +27,7 @@ Codex Session Manager 是一个面向 Windows 的 Codex 账户管理工具，核
 
 自动负载目标由 UI 侧维护：
 
-1. `AuthSyncService` 持续监听 `~/.codex/auth.json`，把授权同步到 `auth/` 目录。
+1. `AuthSyncService` 管理程序登录流程保存到 `auth/` 目录的授权。
 2. `AuthUsageService` 定时请求 ChatGPT usage 接口，刷新每个授权的额度、计划类型和额度重置时间。
 3. `ProxyWindow` 根据授权表中未禁用账号的额度计算优先级。
 4. 选择 5 小时剩余额度百分比最高的授权作为“负载”目标。
@@ -73,7 +73,7 @@ Codex 可能存在 WebSocket 或其他长连接。目标 token 切换后，旧�
 ## 配置与数据
 
 - `config.json`：保存监听端口、二级代理、自动负载和额度预热开关。
-- `auth/`：保存从 `~/.codex/auth.json` 同步来的授权镜像。
+- `auth/`：保存程序登录流程产生的授权及管理器私有配置。
 - `.mitmproxy/`：保存 mitmproxy 证书文件。
 - `logs/`：保存运行日志。
 

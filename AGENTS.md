@@ -30,8 +30,8 @@
 
 ## 关键业务规则
 
-- `~/.codex/auth.json` 是源授权文件，`auth/` 目录是本地镜像和管理目录
-- `AuthSyncService` 负责源文件和管理目录的同步，UI 不直接读写文件
+- `~/.codex/auth.json` 是 Codex 当前生效的授权文件，`auth/` 目录是程序维护的授权管理目录
+- 程序不周期扫描或自动导入 `~/.codex/auth.json`；`AuthSyncService` 负责授权管理，UI 不直接读写文件
 - `auth/` 管理目录允许保存管理器私有扩展字段，但写回 `~/.codex/auth.json` 前必须移除这些私有字段，避免污染 Codex 原生授权文件
 - `AuthUsageService` 负责额度刷新、计划类型和刷新时间缓存
 - `ProxyLoggerAddon` 负责代理空闲检测、请求头改写和使用回报
