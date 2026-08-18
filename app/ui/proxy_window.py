@@ -42,6 +42,9 @@ from app.services.low_price_account_service import (
     LowPriceProductVariant,
     LowPriceSellerInfo,
 )
+from app.models import CREDENTIAL_TYPE_CODEX_AUTH, CREDENTIAL_TYPE_RELAY_API, RelayConfig
+from app.services.relay_config_service import RelayConfigService
+from app.services.codex_local_config_service import CodexLocalConfigService
 from app.utils.path_utils import app_root
 from tkinter import messagebox, ttk
 
@@ -96,6 +99,8 @@ class ProxyWindow:
         self.auth_token_refresh_service = AuthTokenRefreshService(self.auth_sync_service)
         self.auth_usage_service = AuthUsageService(self.auth_sync_service)
         self.auth_model_capability_service = AuthModelCapabilityService(self.auth_sync_service)
+        self.relay_config_service = RelayConfigService()
+        self.codex_local_config_service = CodexLocalConfigService()
         self.low_price_account_service = LowPriceAccountService()
         self.root.title("Codex 账户管理工具")
         self.root.minsize(1040, 660)
@@ -117,7 +122,7 @@ class ProxyWindow:
         self._launch_buttons: dict[str, ttk.Button] = {}
         self._install_tree_wrap: ttk.Frame | None = None
         self._refresh_launch_buttons_after_id: str | None = None
-        self._auth_rows_by_item: dict[str, AuthFileRow] = {}
+        self._auth_rows_by_item: dict[str, AuthFileRow | RelayConfig] = {}
         self._tooltip: tk.Toplevel | None = None
         self._tooltip_label: ttk.Label | None = None
         self._auth_menu: tk.Menu | None = None
@@ -129,6 +134,21 @@ class ProxyWindow:
         self.auto_load_var = tk.BooleanVar(value=auto_load_enabled)
         quota_warmup_enabled = loaded_config.quota_warmup if loaded_config is not None else False
         self.quota_warmup_var = tk.BooleanVar(value=quota_warmup_enabled)
+        self._active_credential_type = (
+            loaded_config.active_credential_type if loaded_config is not None else CREDENTIAL_TYPE_CODEX_AUTH
+        )
+        self._active_credential_id = loaded_config.active_credential_id if loaded_config is not None else ""
+        self._relay_previous_model_provider_line = (
+            loaded_config.relay_previous_model_provider_line if loaded_config is not None else ""
+        )
+        if (
+            self._active_credential_type == CREDENTIAL_TYPE_RELAY_API
+            and self.relay_config_service.get_relay(self._active_credential_id) is None
+        ):
+            self._active_credential_type = CREDENTIAL_TYPE_CODEX_AUTH
+            self._active_credential_id = ""
+        self._auto_load_check: ttk.Checkbutton | None = None
+        self._quota_warmup_check: ttk.Checkbutton | None = None
         lock_model_enabled = loaded_config.lock_model_enabled if loaded_config is not None else False
         self.lock_model_var = tk.BooleanVar(value=lock_model_enabled)
         load_model = loaded_config.load_model if loaded_config is not None else "gpt-5.5"
@@ -259,6 +279,7 @@ class ProxyWindow:
         self._sync_proxy_config_cache()
         self._set_config_editable(True)
         self.refresh_all()
+        self._refresh_credential_mode_state()
         self._recompute_auto_load_target()
         self._add_tray_icon()
         self.root.after(500, self._auto_start_with_certificate_check)
@@ -361,12 +382,18 @@ class ProxyWindow:
         tree_wrap.rowconfigure(0, weight=1)
         tree_wrap.columnconfigure(0, weight=1)
 
-        auth_frame = ttk.LabelFrame(tables, text="授权文件 - 双击切换", padding=8)
+        auth_frame = ttk.LabelFrame(tables, text="连接配置 - 双击切换", padding=8)
         auth_frame.pack(fill="both", expand=True, pady=(10, 0))
 
         auth_options = ttk.Frame(auth_frame)
         auth_options.pack(fill="x", pady=(0, 6))
-        ttk.Checkbutton(auth_options, text="自动负载", variable=self.auto_load_var, command=self._on_auto_load_toggled).pack(side="left")
+        self._auto_load_check = ttk.Checkbutton(
+            auth_options,
+            text="自动负载",
+            variable=self.auto_load_var,
+            command=self._on_auto_load_toggled,
+        )
+        self._auto_load_check.pack(side="left")
         quota_warmup_check = ttk.Checkbutton(
             auth_options,
             text="额度预热",
@@ -374,6 +401,7 @@ class ProxyWindow:
             command=self._on_quota_warmup_toggled,
         )
         quota_warmup_check.pack(side="left", padx=(8, 0))
+        self._quota_warmup_check = quota_warmup_check
         self._bind_widget_tooltip(quota_warmup_check, "优先使用5小时额度不低于99%的可用账号，使额度周期尽早开始")
         lock_model_check = ttk.Checkbutton(
             auth_options,
@@ -401,6 +429,8 @@ class ProxyWindow:
         self._correct_traffic_button.pack(side="right")
         self._clean_auth_button = ttk.Button(auth_options, text="清理授权", command=self.clean_auth_files)
         self._clean_auth_button.pack(side="right", padx=(0, 8))
+        self._add_relay_button = ttk.Button(auth_options, text="添加中转站", command=self._add_relay_config)
+        self._add_relay_button.pack(side="right", padx=(0, 8))
         self._update_auth_button = ttk.Button(auth_options, text="更新授权", command=self.update_auth)
         self._update_auth_button.pack(side="right", padx=(0, 8))
         low_price_button = ttk.Button(auth_options, text="低价购号", command=self.open_low_price_window)
@@ -430,6 +460,7 @@ class ProxyWindow:
         auth_columns = (
             "currentMark",
             "loadMark",
+            "sourceType",
             "loadStrategy",
             "accountId",
             "email",
@@ -441,6 +472,7 @@ class ProxyWindow:
         self.auth_tree = ttk.Treeview(auth_wrap, columns=auth_columns, show="headings", selectmode="browse", height=5)
         self.auth_tree.heading("currentMark", text="当前")
         self.auth_tree.heading("loadMark", text="负载")
+        self.auth_tree.heading("sourceType", text="来源")
         self.auth_tree.heading("loadStrategy", text="策略")
         self.auth_tree.heading("accountId", text="账户id")
         self.auth_tree.heading("email", text="邮箱")
@@ -450,6 +482,7 @@ class ProxyWindow:
         self.auth_tree.heading("planType", text="类型")
         self.auth_tree.column("currentMark", width=46, anchor="center", stretch=False)
         self.auth_tree.column("loadMark", width=46, anchor="center", stretch=False)
+        self.auth_tree.column("sourceType", width=76, anchor="center", stretch=False)
         self.auth_tree.column("loadStrategy", width=58, anchor="center", stretch=False)
         self.auth_tree.column("accountId", width=240, anchor="w", stretch=True)
         self.auth_tree.column("email", width=210, anchor="w", stretch=True)
@@ -467,6 +500,7 @@ class ProxyWindow:
         self._auth_menu.add_command(label="切换", command=self._activate_selected_auth_row)
         self._auth_menu.add_command(label="删除", command=self._delete_selected_auth_row)
         self._auth_menu.add_command(label="备注", command=self._edit_selected_auth_note)
+        self._auth_menu.add_command(label="编辑中转站", command=self._edit_selected_relay)
         self._auth_load_strategy_menu = tk.Menu(self._auth_menu, tearoff=0)
         self._auth_load_strategy_menu.add_radiobutton(
             label="正常",
@@ -755,6 +789,8 @@ class ProxyWindow:
         )
 
     def _on_auto_load_toggled(self) -> None:
+        if self._is_relay_active():
+            return
         enabled = self.auto_load_var.get()
         with self._auto_load_lock:
             self._auto_load_enabled = enabled
@@ -767,8 +803,23 @@ class ProxyWindow:
         self.refresh_auth_files(update_status=False)
 
     def _on_quota_warmup_toggled(self) -> None:
+        if self._is_relay_active():
+            return
         self._persist_config()
         self._recompute_auto_load_target()
+
+    def _is_relay_active(self) -> bool:
+        return self._active_credential_type == CREDENTIAL_TYPE_RELAY_API
+
+    def _refresh_credential_mode_state(self) -> None:
+        state = "disabled" if self._is_relay_active() else "normal"
+        if self._auto_load_check is not None:
+            self._auto_load_check.configure(state=state)
+        if self._quota_warmup_check is not None:
+            self._quota_warmup_check.configure(state=state)
+        if self._is_relay_active():
+            self._set_auto_load_target("", "")
+            self._clear_proxy_kill_pending()
 
     def _on_lock_model_toggled(self) -> None:
         if self.lock_model_var.get() and not self.load_model_var.get().strip():
@@ -783,6 +834,10 @@ class ProxyWindow:
         self._load_model_entry.configure(state=state)
 
     def _recompute_auto_load_target(self) -> None:
+        if self._is_relay_active():
+            self._set_auto_load_target("", "")
+            self._clear_proxy_kill_pending()
+            return
         with self._auto_load_lock:
             if not self._auto_load_enabled:
                 return
@@ -993,6 +1048,9 @@ class ProxyWindow:
                 quota_warmup=self.quota_warmup_var.get(),
                 lock_model_enabled=self.lock_model_var.get(),
                 load_model=self.load_model_var.get().strip(),
+                active_credential_type=self._active_credential_type,
+                active_credential_id=self._active_credential_id,
+                relay_previous_model_provider_line=self._relay_previous_model_provider_line,
                 cloud_s3_address=self.cloud_s3_address_var.get().strip(),
                 cloud_bucket_name=self.cloud_bucket_name_var.get().strip(),
                 cloud_account=self.cloud_account_var.get().strip(),
@@ -1706,6 +1764,13 @@ class ProxyWindow:
         self.cloud_account_var.set(loaded_config.cloud_account)
         self.cloud_password_var.set(loaded_config.cloud_password)
         self._auto_load_enabled = loaded_config.auto_load
+        self._active_credential_type = loaded_config.active_credential_type
+        self._active_credential_id = loaded_config.active_credential_id
+        self._relay_previous_model_provider_line = loaded_config.relay_previous_model_provider_line
+        if self._is_relay_active() and self.relay_config_service.get_relay(self._active_credential_id) is None:
+            self._active_credential_type = CREDENTIAL_TYPE_CODEX_AUTH
+            self._active_credential_id = ""
+        self._refresh_credential_mode_state()
         self._sync_proxy_config_cache()
         self._refresh_cloud_sync_config_fields()
 
@@ -1731,7 +1796,7 @@ class ProxyWindow:
 
     def _get_auto_load_target_refresh_token(self) -> str:
         with self._auto_load_lock:
-            return self._auto_load_target_refresh_token if self._auto_load_enabled else ""
+            return self._auto_load_target_refresh_token if self._auto_load_enabled and not self._is_relay_active() else ""
 
     def _get_auto_load_marks(self) -> tuple[str, str]:
         current_refresh_token = ""
@@ -1743,7 +1808,7 @@ class ProxyWindow:
 
     def _get_auto_load_target_access_token(self) -> str:
         with self._auto_load_lock:
-            return self._auto_load_target_access_token if self._auto_load_enabled else ""
+            return self._auto_load_target_access_token if self._auto_load_enabled and not self._is_relay_active() else ""
 
     def _effective_load_model(self) -> str:
         if not self.lock_model_var.get():
@@ -1751,6 +1816,21 @@ class ProxyWindow:
         return self.load_model_var.get().strip()
 
     def _get_auto_load_target_auth_payload(self) -> str:
+        if self._is_relay_active():
+            relay = self.relay_config_service.get_relay(self._active_credential_id)
+            if relay is None:
+                return json.dumps({"credential_type": CREDENTIAL_TYPE_CODEX_AUTH}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "credential_type": CREDENTIAL_TYPE_RELAY_API,
+                    "credential_id": relay.credential_id,
+                    "access_token": relay.api_key,
+                    "account_id": "",
+                    "base_url": relay.base_url,
+                    "load_model": relay.model or self._effective_load_model(),
+                },
+                ensure_ascii=False,
+            )
         with self._auto_load_lock:
             if not self._auto_load_enabled:
                 token = ""
@@ -1760,6 +1840,7 @@ class ProxyWindow:
                 account_id = self._auto_load_target_account_id
         return json.dumps(
             {
+                "credential_type": CREDENTIAL_TYPE_CODEX_AUTH,
                 "access_token": token,
                 "account_id": account_id,
                 "load_model": self._effective_load_model(),
@@ -3177,20 +3258,27 @@ del "%~f0" >nul 2>nul
 
     def refresh_auth_files(self, update_status: bool = True) -> int:
         selected_row = self._get_selected_auth_row()
-        selected_refresh_token = selected_row.refresh_token if selected_row is not None else ""
+        if isinstance(selected_row, RelayConfig):
+            selected_credential_id = selected_row.credential_id
+        elif isinstance(selected_row, AuthFileRow):
+            selected_credential_id = selected_row.refresh_token
+        else:
+            selected_credential_id = ""
         selected_item = ""
         for item in self.auth_tree.get_children():
             self.auth_tree.delete(item)
         self._auth_rows_by_item.clear()
-        rows = self.auth_sync_service.list_auth_rows()
+        auth_rows = self.auth_sync_service.list_auth_rows()
+        relay_rows = self.relay_config_service.list_relays()
         load_refresh_token = self._get_auto_load_target_refresh_token()
-        for row in rows:
+        for row in auth_rows:
             item = self.auth_tree.insert(
                 "",
                 "end",
                 values=(
-                    "★" if row.current else "",
+                    "★" if row.current and not self._is_relay_active() else "",
                     self._format_auth_load_mark(row, load_refresh_token),
+                    "Codex账号",
                     self._format_auth_load_strategy(row.load_strategy),
                     self._shorten_middle(row.account_id, 16, 10),
                     self._shorten_middle(row.email, 18, 12),
@@ -3201,7 +3289,27 @@ del "%~f0" >nul 2>nul
                 ),
             )
             self._auth_rows_by_item[item] = row
-            if row.refresh_token == selected_refresh_token:
+            if row.refresh_token == selected_credential_id:
+                selected_item = item
+        for row in relay_rows:
+            item = self.auth_tree.insert(
+                "",
+                "end",
+                values=(
+                    "★" if self._is_relay_active() and row.credential_id == self._active_credential_id else "",
+                    "",
+                    "中转API",
+                    "",
+                    self._shorten_middle(row.name, 16, 10),
+                    self._shorten_middle(row.base_url, 24, 14),
+                    "",
+                    "",
+                    "",
+                    "",
+                ),
+            )
+            self._auth_rows_by_item[item] = row
+            if row.credential_id == selected_credential_id:
                 selected_item = item
         if selected_item:
             self.auth_tree.selection_set(selected_item)
@@ -3220,13 +3328,29 @@ del "%~f0" >nul 2>nul
                 row.quota,
                 row.plan_type or "",
             )
-            for row in rows
+            for row in auth_rows
+        )
+        signature += tuple(
+            (
+                self._is_relay_active() and row.credential_id == self._active_credential_id,
+                False,
+                "relay_api",
+                False,
+                row.credential_id,
+                row.name,
+                row.base_url,
+                row.model,
+                row.note,
+                "",
+                "",
+            )
+            for row in relay_rows
         )
         if update_status and signature != self._last_auth_rows_signature:
-            print(f"已刷新 {len(rows)} 个文件")
+            print(f"已刷新 {len(auth_rows) + len(relay_rows)} 个连接配置")
         self._last_auth_rows_signature = signature
-        self._refresh_tray_icon_tooltip(rows)
-        return len(rows)
+        self._refresh_tray_icon_tooltip(auth_rows)
+        return len(auth_rows) + len(relay_rows)
 
     def _scan_codex_installs(self) -> list[CodexInstallRow]:
         rows: list[CodexInstallRow] = []
@@ -3519,7 +3643,18 @@ del "%~f0" >nul 2>nul
             return text
         return f"{text[:keep_prefix]}...{text[-keep_suffix:]}"
 
-    def _build_auth_tooltip(self, row: AuthFileRow) -> str:
+    def _build_auth_tooltip(self, row: AuthFileRow | RelayConfig) -> str:
+        if isinstance(row, RelayConfig):
+            return "\n".join(
+                [
+                    f"名称: {row.name}",
+                    "来源: 中转API",
+                    f"地址: {row.base_url}",
+                    f"模型: {row.model or '跟随请求'}",
+                    f"API Key: {self._redact_middle(row.api_key, 4, 4)}",
+                    f"备注: {row.note or ''}",
+                ]
+            )
         quota = row.quota or ""
         lines = [
             f"账户ID: {row.account_id or '-'}",
@@ -3600,7 +3735,12 @@ del "%~f0" >nul 2>nul
             return
         self.auth_tree.selection_set(row_id)
         self.auth_tree.focus(row_id)
-        self._auth_load_strategy_var.set(row.load_strategy)
+        is_relay = isinstance(row, RelayConfig)
+        self._auth_menu.entryconfigure(2, state="normal")
+        self._auth_menu.entryconfigure(3, state="normal" if is_relay else "disabled")
+        self._auth_menu.entryconfigure(4, state="disabled" if is_relay else "normal")
+        if not is_relay:
+            self._auth_load_strategy_var.set(row.load_strategy)
         try:
             self._auth_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -3622,12 +3762,15 @@ del "%~f0" >nul 2>nul
 
     def _set_selected_auth_load_strategy(self, load_strategy: str) -> None:
         row = self._get_selected_auth_row()
-        if row is not None:
+        if isinstance(row, AuthFileRow):
             self._set_auth_row_load_strategy(row, load_strategy)
 
     def _edit_selected_auth_note(self) -> None:
         row = self._get_selected_auth_row()
         if row is None:
+            return
+        if isinstance(row, RelayConfig):
+            self._edit_relay_config(row)
             return
         note = self._ask_auth_note(row.note)
         if note is None:
@@ -3693,22 +3836,174 @@ del "%~f0" >nul 2>nul
         y = root_y + max((root_height - height) // 2, 0)
         window.geometry(f"+{x}+{y}")
 
-    def _get_selected_auth_row(self) -> AuthFileRow | None:
+    def _get_selected_auth_row(self) -> AuthFileRow | RelayConfig | None:
         selection = self.auth_tree.selection()
         if not selection:
             return None
         return self._auth_rows_by_item.get(selection[0])
 
-    def _activate_auth_row(self, row: AuthFileRow) -> None:
+    def _activate_auth_row(self, row: AuthFileRow | RelayConfig) -> None:
+        if isinstance(row, RelayConfig):
+            if not messagebox.askyesno(
+                "切换中转站",
+                f"确认切换到该中转站吗？\n\n名称: {row.name}\n地址: {row.base_url}",
+            ):
+                return
+            try:
+                self.auth_sync_service.sync_now()
+            except Exception as exc:
+                messagebox.showerror("切换中转站失败", f"保存当前官方授权失败：{exc}")
+                return
+            ok, message, result = self.codex_local_config_service.activate_relay(
+                row,
+                previous_model_provider_line=self._relay_previous_model_provider_line,
+                already_relay=self._is_relay_active(),
+            )
+            if not ok or result is None:
+                messagebox.showerror("切换中转站失败", message)
+                return
+            self.auth_sync_service.invalidate_cached_state()
+            self._relay_previous_model_provider_line = result.previous_model_provider_line
+            self._active_credential_type = CREDENTIAL_TYPE_RELAY_API
+            self._active_credential_id = row.credential_id
+            self._set_auto_load_target("", "")
+            self._clear_proxy_kill_pending()
+            self._refresh_credential_mode_state()
+            self._persist_config()
+            self.refresh_auth_files()
+            self._ask_restart_codex_after_switch()
+            return
         if not messagebox.askyesno("切换授权文件", f"确认切换到该授权文件吗？\n\n账户ID: {row.account_id}\n刷新令牌: {row.refresh_token}"):
             return
         ok, message = self.auth_sync_service.activate_auth_file(row.refresh_token)
         if not ok:
             messagebox.showerror("切换失败", message)
             return
+        ok, message = self.codex_local_config_service.restore_official_config(
+            self._relay_previous_model_provider_line
+        )
+        if not ok:
+            current_relay = self.relay_config_service.get_relay(self._active_credential_id)
+            if current_relay is not None:
+                self.codex_local_config_service.activate_relay(
+                    current_relay,
+                    previous_model_provider_line=self._relay_previous_model_provider_line,
+                    already_relay=True,
+                )
+            messagebox.showerror("切换失败", f"恢复 Codex 官方配置失败：{message}")
+            return
+        self._active_credential_type = CREDENTIAL_TYPE_CODEX_AUTH
+        self._active_credential_id = row.refresh_token
+        self._relay_previous_model_provider_line = ""
+        self._refresh_credential_mode_state()
+        self._persist_config()
+        if self.auto_load_var.get():
+            self._recompute_auto_load_target()
         self.refresh_auth_files()
+        self._ask_restart_codex_after_switch()
 
-    def _delete_auth_row(self, row: AuthFileRow) -> None:
+    def _ask_restart_codex_after_switch(self) -> None:
+        if not messagebox.askyesno("重启 Codex", "切换已完成，是否结束当前 ChatGPT 进程并立即重启？"):
+            return
+        self._kill_process_by_image_name("chatgpt.exe")
+        rows = list(self._rows_by_item.values())
+        launch_row = next(
+            (row for row in rows if Path(row.path).name.lower() == "chatgpt.exe"),
+            None,
+        )
+        if launch_row is None:
+            launch_row = self._get_default_codex_launch_row()
+        if launch_row is None:
+            messagebox.showerror("重启失败", "未找到可启动的 Codex 安装。")
+            return
+        self._launch_codex(launch_row)
+
+    def _edit_selected_relay(self) -> None:
+        row = self._get_selected_auth_row()
+        if isinstance(row, RelayConfig):
+            self._edit_relay_config(row)
+
+    def _add_relay_config(self) -> None:
+        self._show_relay_dialog(None)
+
+    def _edit_relay_config(self, relay: RelayConfig) -> None:
+        self._show_relay_dialog(relay)
+
+    def _show_relay_dialog(self, relay: RelayConfig | None) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("编辑中转站" if relay is not None else "添加中转站")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill="both", expand=True)
+        fields = (
+            ("名称", relay.name if relay is not None else "", False),
+            ("中转地址", relay.base_url if relay is not None else "", False),
+            ("API Key（编辑时留空表示不修改）", "", True),
+            ("模型（可选）", relay.model if relay is not None else "", False),
+            ("备注（可选）", relay.note if relay is not None else "", False),
+        )
+        entries: list[ttk.Entry] = []
+        for index, (label, value, secret) in enumerate(fields):
+            ttk.Label(body, text=label).grid(row=index, column=0, sticky="w", pady=4)
+            entry = ttk.Entry(body, width=62, show="*" if secret else "")
+            entry.grid(row=index, column=1, sticky="ew", padx=(10, 0), pady=4)
+            if value:
+                entry.insert(0, value)
+            entries.append(entry)
+        buttons = ttk.Frame(body)
+        buttons.grid(row=len(fields), column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def save() -> None:
+            ok, message, saved = self.relay_config_service.save_relay(
+                relay.credential_id if relay is not None else "",
+                entries[0].get(),
+                entries[1].get(),
+                entries[2].get(),
+                entries[3].get(),
+                entries[4].get(),
+            )
+            if not ok or saved is None:
+                messagebox.showerror("保存中转站失败", message, parent=dialog)
+                return
+            if relay is not None and self._is_relay_active() and relay.credential_id == self._active_credential_id:
+                switched, switch_message, result = self.codex_local_config_service.activate_relay(
+                    saved,
+                    previous_model_provider_line=self._relay_previous_model_provider_line,
+                    already_relay=True,
+                )
+                if not switched or result is None:
+                    messagebox.showerror("更新当前中转站失败", switch_message, parent=dialog)
+                    return
+                self._relay_previous_model_provider_line = result.previous_model_provider_line
+                self.auth_sync_service.invalidate_cached_state()
+                self._persist_config()
+            dialog.destroy()
+            self.refresh_auth_files()
+
+        ttk.Button(buttons, text="保存", command=save).pack(side="right")
+        ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="right", padx=(0, 8))
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.update_idletasks()
+        self._center_child_window_to_content(dialog)
+        dialog.grab_set()
+        entries[0].focus_set()
+
+    def _delete_auth_row(self, row: AuthFileRow | RelayConfig) -> None:
+        if isinstance(row, RelayConfig):
+            message = f"确认删除该中转站吗？\n\n名称: {row.name}\n地址: {row.base_url}"
+            if row.credential_id == self._active_credential_id and self._is_relay_active():
+                messagebox.showinfo("无法删除", "该中转站当前正在使用，请先切换到一个官方账号。")
+                return
+            if not messagebox.askyesno("删除中转站", message):
+                return
+            ok, error = self.relay_config_service.delete_relay(row.credential_id)
+            if not ok:
+                messagebox.showerror("删除失败", error)
+                return
+            self.refresh_auth_files()
+            return
         if not messagebox.askyesno("删除授权文件", f"确认删除该授权文件吗？\n\n账户ID: {row.account_id}\n刷新令牌: {row.refresh_token}"):
             return
         ok, message = self.auth_sync_service.delete_auth_file(row.refresh_token)
@@ -3852,12 +4147,13 @@ del "%~f0" >nul 2>nul
         proxy_port = self.service.config.port
         env = os.environ.copy()
         proxy_url = f"http://127.0.0.1:{proxy_port}"
-        env["HTTP_PROXY"] = proxy_url
-        env["HTTPS_PROXY"] = proxy_url
-        env["ALL_PROXY"] = proxy_url
-        env["http_proxy"] = proxy_url
-        env["https_proxy"] = proxy_url
-        env["all_proxy"] = proxy_url
+        proxy_env_keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+        if self._is_relay_active():
+            for key in proxy_env_keys:
+                env.pop(key, None)
+        else:
+            for key in proxy_env_keys:
+                env[key] = proxy_url
         env["NO_PROXY"] = "localhost,127.0.0.1"
         env["no_proxy"] = "localhost,127.0.0.1"
         current_dir = str(exe.parent)
@@ -3872,12 +4168,15 @@ del "%~f0" >nul 2>nul
             return
         args = [str(exe)]
         if exe.name.lower() == "chatgpt.exe":
-            args.extend(
-                [
-                    f"--proxy-server={proxy_url}",
-                    "--proxy-bypass-list=localhost;127.0.0.1;<local>",
-                ]
-            )
+            if self._is_relay_active():
+                args.append("--no-proxy-server")
+            else:
+                args.extend(
+                    [
+                        f"--proxy-server={proxy_url}",
+                        "--proxy-bypass-list=localhost;127.0.0.1;<local>",
+                    ]
+                )
         subprocess.Popen(
             args,
             cwd=current_dir,

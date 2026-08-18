@@ -2,6 +2,21 @@ from dataclasses import dataclass
 from typing import List
 
 
+CREDENTIAL_TYPE_CODEX_AUTH = "codex_auth"
+CREDENTIAL_TYPE_RELAY_API = "relay_api"
+
+
+@dataclass
+class RelayConfig:
+    credential_id: str
+    name: str
+    base_url: str
+    api_key: str
+    model: str = ""
+    note: str = ""
+    file_name: str = ""
+
+
 @dataclass
 class UserProfile:
     user_id: str = "-"

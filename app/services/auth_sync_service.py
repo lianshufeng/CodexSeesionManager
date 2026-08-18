@@ -11,6 +11,7 @@ from threading import Event, Lock, Thread
 from typing import Callable
 
 from app.utils.path_utils import app_root
+from app.models import CREDENTIAL_TYPE_CODEX_AUTH
 
 
 _MANAGER_METADATA_KEY = "_codex_session_manager"
@@ -91,6 +92,9 @@ class AuthSyncService:
             self._source_state = None
             self._last_notified_source_signature = None
             self._access_token_to_refresh_token = {}
+
+    def sync_now(self) -> None:
+        self._sync_once()
 
     def update_usage_cache(
         self,
@@ -213,6 +217,7 @@ class AuthSyncService:
                 if isinstance(target_tokens, dict):
                     old_refresh_token = str(target_tokens.get("refresh_token") or "")
 
+        self._mark_as_codex_auth(data)
         self._write_auth_data(target_path, data)
         if legacy_path is not None and legacy_path != target_path:
             try:
@@ -263,6 +268,7 @@ class AuthSyncService:
         current_state = self._read_source_state(force=True)
         was_current = current_state is not None and current_state["refresh_token"] == old_refresh_token
 
+        self._mark_as_codex_auth(data)
         self._write_auth_data(target_path, data)
         if target_path != original_path and original_path.exists():
             original_path.unlink()
@@ -319,6 +325,15 @@ class AuthSyncService:
 
     def _auth_note(self, data: dict[str, object]) -> str:
         return " ".join(str(self._manager_metadata(data).get("note") or "").split())
+
+    def _credential_type(self, data: dict[str, object]) -> str:
+        value = str(self._manager_metadata(data).get("credential_type") or "").strip()
+        return value or CREDENTIAL_TYPE_CODEX_AUTH
+
+    def _mark_as_codex_auth(self, data: dict[str, object]) -> None:
+        metadata = dict(self._manager_metadata(data))
+        metadata["credential_type"] = CREDENTIAL_TYPE_CODEX_AUTH
+        data[_MANAGER_METADATA_KEY] = metadata
 
     def _strip_manager_metadata(self, data: dict[str, object]) -> dict[str, object]:
         cleaned = dict(data)
@@ -421,6 +436,7 @@ class AuthSyncService:
                     source_data[_MANAGER_METADATA_KEY] = target_metadata
                 else:
                     source_data.pop(_MANAGER_METADATA_KEY, None)
+                self._mark_as_codex_auth(source_data)
                 self._write_auth_data(target_path, source_data)
                 if legacy_path is not None and legacy_path != target_path:
                     try:
@@ -621,6 +637,8 @@ class AuthSyncService:
         for path in sorted(self.target_dir.glob("*.json"), key=lambda item: item.name):
             data = self._read_auth_data(path)
             if data is None:
+                continue
+            if self._credential_type(data) != CREDENTIAL_TYPE_CODEX_AUTH:
                 continue
 
             tokens = data.get("tokens")

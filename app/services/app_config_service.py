@@ -16,6 +16,9 @@ class AppConfig:
     quota_warmup: bool = False
     lock_model_enabled: bool = False
     load_model: str = "gpt-5.5"
+    active_credential_type: str = "codex_auth"
+    active_credential_id: str = ""
+    relay_previous_model_provider_line: str = ""
     cloud_s3_address: str = ""
     cloud_bucket_name: str = ""
     cloud_account: str = ""
@@ -47,6 +50,9 @@ class AppConfigService:
         auto_load = bool(data.get("auto_load", True))
         quota_warmup = bool(data.get("quota_warmup", False))
         load_model = str(data.get("load_model")).strip() if "load_model" in data else "gpt-5.5"
+        active_credential_type = str(data.get("active_credential_type") or "codex_auth")
+        if active_credential_type not in {"codex_auth", "relay_api"}:
+            active_credential_type = "codex_auth"
         if "lock_model_enabled" in data:
             lock_model_enabled = bool(data.get("lock_model_enabled", False))
         else:
@@ -62,6 +68,9 @@ class AppConfigService:
             quota_warmup=quota_warmup,
             lock_model_enabled=lock_model_enabled,
             load_model=load_model,
+            active_credential_type=active_credential_type,
+            active_credential_id=str(data.get("active_credential_id") or ""),
+            relay_previous_model_provider_line=str(data.get("relay_previous_model_provider_line") or ""),
             cloud_s3_address=str(cloud_storage.get("s3_address") or ""),
             cloud_bucket_name=str(cloud_storage.get("bucket_name") or ""),
             cloud_account=str(cloud_storage.get("account") or ""),
@@ -78,6 +87,9 @@ class AppConfigService:
             "quota_warmup": config.quota_warmup,
             "lock_model_enabled": config.lock_model_enabled,
             "load_model": config.load_model,
+            "active_credential_type": config.active_credential_type,
+            "active_credential_id": config.active_credential_id,
+            "relay_previous_model_provider_line": config.relay_previous_model_provider_line,
             "cloud_storage": {
                 "s3_address": config.cloud_s3_address,
                 "bucket_name": config.cloud_bucket_name,
