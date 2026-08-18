@@ -251,6 +251,7 @@ class ProxyWindow:
         self.auth_model_capability_service.set_change_callback(
             lambda: self._post_ui(lambda: self.refresh_auth_files(update_status=False))
         )
+        self.auth_sync_service.start()
         self.auth_usage_service.start()
         self.auth_model_capability_service.start()
         self._center_window(1040, 660)
