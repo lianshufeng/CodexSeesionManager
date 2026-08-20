@@ -16,6 +16,7 @@ _RESELECT_EVENT = "RESELECT"
 _IDLE_TIMEOUT_EVENT = "IDLE_TIMEOUT"
 _MIB_TCP_STATE_DELETE_TCB = 12
 _CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+_SELECTED_AUTH_METADATA_KEY = "codex_session_selected_auth_token"
 
 
 class _MibTcpRow(ctypes.Structure):
@@ -228,9 +229,9 @@ class ProxyLoggerAddon:
             str(auth.get("load_model") or "").strip(),
         )
 
-    def _rewrite_auth_headers(self, flow: http.HTTPFlow, access_token: str, account_id: str) -> None:
+    def _rewrite_auth_headers(self, flow: http.HTTPFlow, access_token: str, account_id: str) -> bool:
         if not access_token:
-            return
+            return False
         headers = flow.request.headers
         rewritten = False
         for key, value in list(headers.items()):
@@ -239,7 +240,7 @@ class ProxyLoggerAddon:
             headers[key] = f"Bearer {access_token}"
             rewritten = True
         if not account_id or not rewritten:
-            return
+            return rewritten
         account_header_found = False
         for key in list(headers.keys()):
             if key.lower() == "chatgpt-account-id":
@@ -247,6 +248,7 @@ class ProxyLoggerAddon:
                 account_header_found = True
         if not account_header_found:
             headers["ChatGPT-Account-ID"] = account_id
+        return rewritten
 
     def _extract_bearer_token(self, flow: http.HTTPFlow) -> str:
         for value in flow.request.headers.values():
@@ -362,6 +364,35 @@ class ProxyLoggerAddon:
         path = path.split("?", 1)[0].rstrip("/")
         return path.endswith("/responses") or "/responses/" in path
 
+    def _protect_selected_auth_unauthorized_response(self, flow: http.HTTPFlow) -> bool:
+        resp = flow.response
+        metadata = getattr(flow, "metadata", None)
+        if resp is None or resp.status_code != 401 or not isinstance(metadata, dict):
+            return False
+        selected_token = str(metadata.get(_SELECTED_AUTH_METADATA_KEY) or "").strip()
+        if not selected_token:
+            return False
+
+        payload = json.dumps(
+            {
+                "error": {
+                    "message": "负载账号认证失败，正在切换其他账号后重试。",
+                    "type": "server_error",
+                    "code": "autoload_account_auth_failed",
+                }
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        for header_name in ("www-authenticate", "content-encoding", "transfer-encoding"):
+            resp.headers.pop(header_name, None)
+        resp.status_code = 503
+        resp.headers["content-type"] = "application/json; charset=utf-8"
+        resp.headers["content-length"] = str(len(payload))
+        resp.raw_content = payload
+        _log("负载账号的 Responses 请求返回 401，已转换为 503，避免触发 Codex 登出")
+        return True
+
     def _estimate_http_bytes(self, headers, body) -> int:
         total = 0
         for key, value in headers.items():
@@ -472,8 +503,16 @@ class ProxyLoggerAddon:
         if load_model and use_selected_auth:
             self._strip_codex_responses_lite_header(flow)
             self._rewrite_http_model(flow, load_model)
+        selected_auth_replaced = False
         if selected_token and use_selected_auth:
-            self._rewrite_auth_headers(flow, selected_token, selected_account_id)
+            selected_auth_replaced = self._rewrite_auth_headers(
+                flow,
+                selected_token,
+                selected_account_id,
+            ) and selected_token != original_token
+        metadata = getattr(flow, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata[_SELECTED_AUTH_METADATA_KEY] = selected_token if selected_auth_replaced else ""
         usage_token = (selected_token or original_token) if use_selected_auth else original_token
         if usage_token:
             self._report_access_token_used(usage_token)
@@ -487,6 +526,7 @@ class ProxyLoggerAddon:
         resp = flow.response
         if resp is None:
             return
+        self._protect_selected_auth_unauthorized_response(flow)
         self._download_bytes += self._estimate_http_bytes(resp.headers, resp.raw_content)
         self._report_traffic()
 
