@@ -175,6 +175,7 @@ class ProxyWindow:
         self._update_auth_button: ttk.Button | None = None
         self._refresh_tokens_button: ttk.Button | None = None
         self._refresh_tokens_running = False
+        self._auth_switch_running = False
         self._low_price_window: tk.Toplevel | None = None
         self._low_price_tree: ttk.Treeview | None = None
         self._low_price_refresh_button: ttk.Button | None = None
@@ -3873,11 +3874,42 @@ del "%~f0" >nul 2>nul
             self.refresh_auth_files()
             self._ask_restart_codex_after_switch()
             return
+        if self._auth_switch_running:
+            return
         if not messagebox.askyesno("切换授权文件", f"确认切换到该授权文件吗？\n\n账户ID: {row.account_id}\n刷新令牌: {row.refresh_token}"):
             return
-        ok, message = self.auth_sync_service.activate_auth_file(row.refresh_token)
-        if not ok:
-            messagebox.showerror("切换失败", message)
+        if not self._refresh_config():
+            return
+        self._auth_switch_running = True
+        if self._auth_menu is not None:
+            self._auth_menu.entryconfig("切换", state="disabled")
+        proxy_url = self._upstream_proxy if self._use_upstream_proxy else ""
+        Thread(target=self._activate_auth_row_worker, args=(row, proxy_url), daemon=True).start()
+
+    def _activate_auth_row_worker(self, row: AuthFileRow, proxy_url: str) -> None:
+        refreshed_token = ""
+        error = ""
+        try:
+            refreshed_token = self.auth_token_refresh_service.refresh_one(row.refresh_token, proxy_url)
+            ok, message = self.auth_sync_service.activate_auth_file(refreshed_token)
+            if not ok:
+                raise RuntimeError(message)
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self._post_ui(
+                lambda token=refreshed_token, message=error: self._finish_activate_auth_row(row, token, message)
+            )
+        except tk.TclError:
+            pass
+
+    def _finish_activate_auth_row(self, row: AuthFileRow, refreshed_token: str, error: str) -> None:
+        self._auth_switch_running = False
+        if self._auth_menu is not None:
+            self._auth_menu.entryconfig("切换", state="normal")
+        if error:
+            messagebox.showerror("切换失败", f"刷新授权并切换失败：{error}\n\n该账号可能需要重新登录。")
+            self.refresh_auth_files()
             return
         ok, message = self.codex_local_config_service.restore_official_config(
             self._relay_previous_model_provider_line
@@ -3893,7 +3925,7 @@ del "%~f0" >nul 2>nul
             messagebox.showerror("切换失败", f"恢复 Codex 官方配置失败：{message}")
             return
         self._active_credential_type = CREDENTIAL_TYPE_CODEX_AUTH
-        self._active_credential_id = row.refresh_token
+        self._active_credential_id = refreshed_token
         self._relay_previous_model_provider_line = ""
         self._refresh_credential_mode_state()
         self._persist_config()

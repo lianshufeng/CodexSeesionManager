@@ -504,7 +504,7 @@ class ProxyLoggerAddon:
             self._strip_codex_responses_lite_header(flow)
             self._rewrite_http_model(flow, load_model)
         selected_auth_replaced = False
-        if selected_token and use_selected_auth:
+        if selected_token:
             selected_auth_replaced = self._rewrite_auth_headers(
                 flow,
                 selected_token,
@@ -513,7 +513,7 @@ class ProxyLoggerAddon:
         metadata = getattr(flow, "metadata", None)
         if isinstance(metadata, dict):
             metadata[_SELECTED_AUTH_METADATA_KEY] = selected_token if selected_auth_replaced else ""
-        usage_token = (selected_token or original_token) if use_selected_auth else original_token
+        usage_token = selected_token if selected_auth_replaced else original_token
         if usage_token:
             self._report_access_token_used(usage_token)
         self._upload_bytes += self._estimate_http_bytes(flow.request.headers, flow.request.raw_content)
