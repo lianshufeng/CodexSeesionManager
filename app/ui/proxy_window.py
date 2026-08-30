@@ -207,6 +207,7 @@ class ProxyWindow:
         self._port_entry: ttk.Entry | None = None
         self._upstream_entry: ttk.Entry | None = None
         self._traffic_status_var = tk.StringVar(value="上行: 0  下行: 0")
+        self._service_status_var = tk.StringVar(value="正在准备代理服务…")
         self._version_var = tk.StringVar(value=f"版本: {APP_VERSION}")
         self._update_status_var = tk.StringVar(value="")
         self._check_update_button: ttk.Button | None = None
@@ -308,6 +309,9 @@ class ProxyWindow:
         ).pack(side="left")
         self._upstream_entry = ttk.Entry(upstream_row, textvariable=self.upstream_proxy_var, width=28)
         self._upstream_entry.pack(side="left", padx=(8, 0))
+        # 二级代理地址修改后，在输入完成时立即应用到运行中的代理。
+        self._upstream_entry.bind("<FocusOut>", self._on_upstream_proxy_edited)
+        self._upstream_entry.bind("<Return>", self._on_upstream_proxy_edited)
 
         actions = ttk.Frame(top)
         actions.pack(side="right", anchor="e")
@@ -333,6 +337,8 @@ class ProxyWindow:
 
         table_frame = ttk.LabelFrame(tables, text="安装项", padding=8)
         table_frame.pack(fill="x")
+
+        ttk.Label(table_frame, textvariable=self._service_status_var).pack(anchor="w")
 
         install_actions = ttk.Frame(table_frame)
         install_actions.pack(fill="x")
@@ -385,6 +391,9 @@ class ProxyWindow:
 
         auth_frame = ttk.LabelFrame(tables, text="连接配置 - 双击切换", padding=8)
         auth_frame.pack(fill="both", expand=True, pady=(10, 0))
+
+        self._auth_hint_var = tk.StringVar(value="")
+        ttk.Label(auth_frame, textvariable=self._auth_hint_var).pack(anchor="w", pady=(0, 4))
 
         auth_options = ttk.Frame(auth_frame)
         auth_options.pack(fill="x", pady=(0, 6))
@@ -902,13 +911,32 @@ class ProxyWindow:
 
     def _restart_proxy_server_worker(self) -> None:
         try:
+            self._post_ui(lambda: self._service_status_var.set("正在应用二级代理配置…"))
+        except tk.TclError:
+            pass
+        try:
             self.service.stop()
             time.sleep(0.3)
             ok, message = self.service.run()
             if not ok:
                 print(f"[ProxyWindow] 代理重启失败: {message}", flush=True)
+                try:
+                    self._post_ui(lambda text=message: self._service_status_var.set(f"代理重启失败：{text}"))
+                except tk.TclError:
+                    pass
+            else:
+                try:
+                    self._post_ui(
+                        lambda: self._service_status_var.set(f"代理运行中：127.0.0.1:{self.service.config.port}")
+                    )
+                except tk.TclError:
+                    pass
         except Exception as exc:
             print(f"[ProxyWindow] 代理重启异常: {exc}", flush=True)
+            try:
+                self._post_ui(lambda text=str(exc): self._service_status_var.set(f"代理重启失败：{text}"))
+            except tk.TclError:
+                pass
         finally:
             with self._proxy_restart_lock:
                 self._proxy_restart_pending = False
@@ -1795,6 +1823,15 @@ class ProxyWindow:
             print("[ProxyWindow] 二级代理配置已变更，正在重启代理使配置立即生效", flush=True)
             self._restart_proxy_server_async()
 
+    def _on_upstream_proxy_edited(self, _event: tk.Event | None = None) -> str:
+        """输入框修改完成后刷新配置，并在代理运行时重启使其立即生效。"""
+        if not self._refresh_config():
+            return "break"
+        if self.service.process and self.service.process.poll() is None:
+            print("[ProxyWindow] 二级代理地址已变更，正在重启代理使配置立即生效", flush=True)
+            self._restart_proxy_server_async()
+        return "break"
+
     def _get_auto_load_target_refresh_token(self) -> str:
         with self._auto_load_lock:
             return self._auto_load_target_refresh_token if self._auto_load_enabled and not self._is_relay_active() else ""
@@ -1979,6 +2016,7 @@ class ProxyWindow:
 
     def start_server(self) -> None:
         print("启动中...")
+        self._service_status_var.set("正在启动代理服务…")
         if not self._refresh_config():
             print("代理未启动")
             self._set_busy(False)
@@ -2006,20 +2044,27 @@ class ProxyWindow:
 
     def _start_failed(self, message: str) -> None:
         print("代理未启动")
+        self._service_status_var.set(f"代理启动失败：{message}")
         self._update_toggle_button()
         self._set_busy(False)
         messagebox.showerror("启动失败", message)
 
     def _start_succeeded(self) -> None:
         print(f"代理已启动: {self.service.config.host}:{self.service.config.port}")
+        self._service_status_var.set(f"代理运行中：127.0.0.1:{self.service.config.port}")
         self._update_toggle_button()
         self._set_busy(False)
-        self._set_config_editable(False)
+        # 监听端口保持锁定；二级代理地址允许在运行中修改，失焦/回车时会自动重启代理。
+        if self._port_entry is not None:
+            self._port_entry.config(state="disabled")
+        if self._upstream_entry is not None:
+            self._upstream_entry.config(state="normal")
         self.refresh_installs()
 
     def stop_server(self) -> None:
         self.service.stop()
         print("代理已停止")
+        self._service_status_var.set("代理已停止，点击“启动服务器”后才能启动 Codex")
         self._update_toggle_button()
         self._set_busy(False)
         self._set_config_editable(True)
@@ -3247,6 +3292,8 @@ del "%~f0" >nul 2>nul
             self.tree.delete(item)
         self._rows_by_item.clear()
         rows = self._scan_codex_installs()
+        if not rows:
+            self._service_status_var.set("未检测到 Codex 安装，请先安装 Codex 后点击“刷新”")
         for row in rows:
             item = self.tree.insert("", "end", values=(row.name, row.display_path, row.size, row.version, ""))
             self._rows_by_item[item] = row
@@ -3271,6 +3318,11 @@ del "%~f0" >nul 2>nul
         self._auth_rows_by_item.clear()
         auth_rows = self.auth_sync_service.list_auth_rows()
         relay_rows = self.relay_config_service.list_relays()
+        if hasattr(self, "_auth_hint_var"):
+            if auth_rows or relay_rows:
+                self._auth_hint_var.set("双击账号可切换；右键可设置备注、删除或调整负载策略")
+            else:
+                self._auth_hint_var.set("尚未添加账号，请点击“更新授权”登录第一个 Codex 账号")
         load_refresh_token = self._get_auto_load_target_refresh_token()
         for row in auth_rows:
             item = self.auth_tree.insert(
@@ -4171,6 +4223,10 @@ del "%~f0" >nul 2>nul
         exe = Path(row.path)
         if not exe.exists():
             messagebox.showerror("启动失败", f"找不到文件 {row.path}")
+            return
+        if not (self.service.process and self.service.process.poll() is None):
+            self._service_status_var.set("代理尚未启动，请先点击“启动服务器”")
+            messagebox.showwarning("代理未启动", "请先点击“启动服务器”，等待代理运行后再启动 Codex。")
             return
         ok, message = self.service.ensure_launch_permissions(exe)
         if not ok:
