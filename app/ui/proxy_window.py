@@ -102,7 +102,6 @@ class ProxyWindow:
         self.auth_model_capability_service = AuthModelCapabilityService(self.auth_sync_service)
         self.relay_config_service = RelayConfigService()
         self.codex_local_config_service = CodexLocalConfigService()
-        self.codex_local_config_service.set_proxy_environment(None)
         self.low_price_account_service = LowPriceAccountService()
         self.root.title("Codex 账户管理工具")
         self.root.minsize(1040, 660)
@@ -2058,6 +2057,12 @@ class ProxyWindow:
 
     def _start_succeeded(self) -> None:
         print(f"代理已启动: {self.service.config.host}:{self.service.config.port}")
+        if not self._is_relay_active():
+            proxy_url = f"http://127.0.0.1:{self.service.config.port}"
+            ok, message = self.codex_local_config_service.set_proxy_environment(proxy_url)
+            if not ok:
+                print(f"[ProxyWindow] 写入 Codex 代理环境失败: {message}", flush=True)
+                messagebox.showerror("负载代理配置失败", message)
         self._service_status_var.set(f"代理运行中：127.0.0.1:{self.service.config.port}")
         self._update_toggle_button()
         self._set_busy(False)
@@ -4278,6 +4283,19 @@ del "%~f0" >nul 2>nul
             if not ok:
                 messagebox.showerror("启动失败", message)
                 return
+            if not self._is_relay_active():
+                for process in psutil.process_iter(["name", "cmdline"]):
+                    try:
+                        if process.info["name"] != "codex.exe" or "app-server" not in (process.info["cmdline"] or []):
+                            continue
+                        if process.environ().get("HTTPS_PROXY") != proxy_url:
+                            messagebox.showwarning(
+                                "Codex 未接入负载代理",
+                                "Codex 已在运行，现有进程没有使用负载代理。请完全退出 Codex 后再点击启动。",
+                            )
+                            return
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
             try:
                 activate_packaged_app(app_id, args[1:])
             except OSError as exc:
