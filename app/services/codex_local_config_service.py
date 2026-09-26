@@ -12,6 +12,8 @@ from app.models import RelayConfig
 _PROVIDER_ID = "codex_session_relay"
 _MANAGED_BEGIN = "# BEGIN CodexSessionManager relay"
 _MANAGED_END = "# END CodexSessionManager relay"
+_PROXY_ENV_BEGIN = "# BEGIN CodexSessionManager proxy"
+_PROXY_ENV_END = "# END CodexSessionManager proxy"
 _MODEL_PROVIDER_RE = re.compile(r"^\s*model_provider\s*=.*$")
 
 
@@ -26,6 +28,44 @@ class CodexLocalConfigService:
         self.codex_home = codex_home or Path(user_profile) / ".codex"
         self.config_path = self.codex_home / "config.toml"
         self.auth_path = self.codex_home / "auth.json"
+        self.env_path = self.codex_home / ".env"
+
+    def set_proxy_environment(self, proxy_url: str | None) -> tuple[bool, str]:
+        if not proxy_url and not self.env_path.exists():
+            return True, ""
+        try:
+            original = self._read_text(self.env_path)
+            if not proxy_url and _PROXY_ENV_BEGIN not in original:
+                return True, ""
+            lines: list[str] = []
+            in_managed_block = False
+            for line in original.splitlines():
+                if line == _PROXY_ENV_BEGIN:
+                    in_managed_block = True
+                elif line == _PROXY_ENV_END and in_managed_block:
+                    in_managed_block = False
+                elif not in_managed_block:
+                    lines.append(line)
+            if in_managed_block:
+                return False, "Codex .env 中的代理配置标记不完整"
+            cleaned = "\n".join(lines).rstrip()
+            if proxy_url:
+                proxy_lines = [
+                    _PROXY_ENV_BEGIN,
+                    *(f'{key}={json.dumps(proxy_url)}' for key in (
+                        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                        "http_proxy", "https_proxy", "all_proxy",
+                    )),
+                    'NO_PROXY="localhost,127.0.0.1"',
+                    'no_proxy="localhost,127.0.0.1"',
+                    _PROXY_ENV_END,
+                ]
+                cleaned = f"{cleaned}\n\n" if cleaned else ""
+                cleaned += "\n".join(proxy_lines)
+            self._write_text(self.env_path, cleaned + ("\n" if cleaned else ""))
+        except (OSError, UnicodeError) as exc:
+            return False, str(exc)
+        return True, ""
 
     def activate_relay(
         self,

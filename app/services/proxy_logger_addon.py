@@ -110,10 +110,13 @@ class ProxyLoggerAddon:
         killed, _tracked, _reset = self._kill_active_flows_with_stats()
         return killed
 
-    def _kill_active_flows_with_stats(self) -> tuple[int, int, int]:
+    def _kill_active_flows_with_stats(self, websocket_only: bool = False) -> tuple[int, int, int]:
         self._cleanup_flows()
         with self._flow_lock:
-            flows = list(self._live_flows.values())
+            flows = [
+                flow for flow in self._live_flows.values()
+                if not websocket_only or getattr(flow, "websocket", None) is not None
+            ]
         killed = 0
         reset = 0
         for flow in flows:
@@ -364,6 +367,10 @@ class ProxyLoggerAddon:
         path = path.split("?", 1)[0].rstrip("/")
         return path.endswith("/responses") or "/responses/" in path
 
+    def _is_workspace_discovery(self, flow: http.HTTPFlow) -> bool:
+        path = str(getattr(flow.request, "path", "") or "").lower()
+        return path.split("?", 1)[0].rstrip("/").endswith("/accounts/check")
+
     def _protect_selected_auth_unauthorized_response(self, flow: http.HTTPFlow) -> bool:
         resp = flow.response
         metadata = getattr(flow, "metadata", None)
@@ -376,8 +383,8 @@ class ProxyLoggerAddon:
         payload = json.dumps(
             {
                 "error": {
-                    "message": "负载账号认证失败，正在切换其他账号后重试。",
-                    "type": "server_error",
+                    "message": "负载账号请求返回 401，请检查该账号或稍后重试。",
+                    "type": "invalid_request_error",
                     "code": "autoload_account_auth_failed",
                 }
             },
@@ -386,11 +393,11 @@ class ProxyLoggerAddon:
         ).encode("utf-8")
         for header_name in ("www-authenticate", "content-encoding", "transfer-encoding"):
             resp.headers.pop(header_name, None)
-        resp.status_code = 503
+        resp.status_code = 400
         resp.headers["content-type"] = "application/json; charset=utf-8"
         resp.headers["content-length"] = str(len(payload))
         resp.raw_content = payload
-        _log("负载账号的 Responses 请求返回 401，已转换为 503，避免触发 Codex 登出")
+        _log("负载账号的 Responses 请求返回 401，已转换为不可自动重试的 400，避免触发 Codex 登出")
         return True
 
     def _estimate_http_bytes(self, headers, body) -> int:
@@ -406,7 +413,7 @@ class ProxyLoggerAddon:
     def _report_traffic(self) -> None:
         self._report_control_event(f"TRAFFIC {self._upload_bytes} {self._download_bytes}")
 
-    def _report_access_token_used(self, access_token: str) -> None:
+    def _report_access_token_used(self, access_token: str, workspace_discovery: bool = False) -> None:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
         if not port_text:
             return
@@ -416,7 +423,8 @@ class ProxyLoggerAddon:
             return
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2) as conn:
-                conn.sendall(f"USED {access_token}\n".encode("utf-8"))
+                suffix = " DISCOVERY" if workspace_discovery else ""
+                conn.sendall(f"USED {access_token}{suffix}\n".encode("utf-8"))
         except OSError:
             return
 
@@ -447,7 +455,7 @@ class ProxyLoggerAddon:
 
     def handle_ping_pong_log(self) -> None:
         if self._should_disconnect_on_pingpong():
-            killed = self._kill_active_flows()
+            killed, _tracked, _reset = self._kill_active_flows_with_stats(websocket_only=True)
             self._report_control_event(f"KILL_RESULT {killed}")
             if killed > 0:
                 _log(f"ping/pong 命中，已断开 {killed} 个代理连接")
@@ -504,7 +512,7 @@ class ProxyLoggerAddon:
             self._strip_codex_responses_lite_header(flow)
             self._rewrite_http_model(flow, load_model)
         selected_auth_replaced = False
-        if selected_token:
+        if selected_token and not self._is_workspace_discovery(flow):
             selected_auth_replaced = self._rewrite_auth_headers(
                 flow,
                 selected_token,
@@ -515,7 +523,7 @@ class ProxyLoggerAddon:
             metadata[_SELECTED_AUTH_METADATA_KEY] = selected_token if selected_auth_replaced else ""
         usage_token = selected_token if selected_auth_replaced else original_token
         if usage_token:
-            self._report_access_token_used(usage_token)
+            self._report_access_token_used(usage_token, self._is_workspace_discovery(flow))
         self._upload_bytes += self._estimate_http_bytes(flow.request.headers, flow.request.raw_content)
         self._report_traffic()
 

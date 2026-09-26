@@ -102,6 +102,7 @@ class ProxyWindow:
         self.auth_model_capability_service = AuthModelCapabilityService(self.auth_sync_service)
         self.relay_config_service = RelayConfigService()
         self.codex_local_config_service = CodexLocalConfigService()
+        self.codex_local_config_service.set_proxy_environment(None)
         self.low_price_account_service = LowPriceAccountService()
         self.root.title("Codex 账户管理工具")
         self.root.minsize(1040, 660)
@@ -782,8 +783,9 @@ class ProxyWindow:
         if quota_drop_message:
             print(quota_drop_message, flush=True)
 
-    def _on_auto_load_access_token_used(self, access_token: str) -> None:
-        self._update_proxy_kill_pending_for_used_token(access_token)
+    def _on_auto_load_access_token_used(self, access_token: str, workspace_discovery: bool = False) -> None:
+        if not workspace_discovery:
+            self._update_proxy_kill_pending_for_used_token(access_token)
         if not self.auth_sync_service.increment_traffic_by_access_token(access_token):
             return
         self._schedule_refresh_traffic()
@@ -1917,7 +1919,11 @@ class ProxyWindow:
                         parts = payload.split()
                         token = parts[1] if len(parts) >= 2 else ""
                         if token:
-                            self._post_ui(lambda value=token: self._on_auto_load_access_token_used(value))
+                            discovery = len(parts) >= 3 and parts[2] == "DISCOVERY"
+                            self._post_ui(
+                                lambda value=token, is_discovery=discovery:
+                                self._on_auto_load_access_token_used(value, is_discovery)
+                            )
                         continue
                     if payload.startswith("KILL_RESULT "):
                         parts = payload.split()
@@ -2064,6 +2070,7 @@ class ProxyWindow:
 
     def stop_server(self) -> None:
         self.service.stop()
+        self.codex_local_config_service.set_proxy_environment(None)
         print("代理已停止")
         self._service_status_var.set("代理已停止，点击“启动服务器”后才能启动 Codex")
         self._update_toggle_button()
@@ -3935,32 +3942,29 @@ del "%~f0" >nul 2>nul
         self._auth_switch_running = True
         if self._auth_menu is not None:
             self._auth_menu.entryconfig("切换", state="disabled")
-        proxy_url = self._upstream_proxy if self._use_upstream_proxy else ""
-        Thread(target=self._activate_auth_row_worker, args=(row, proxy_url), daemon=True).start()
+        Thread(target=self._activate_auth_row_worker, args=(row,), daemon=True).start()
 
-    def _activate_auth_row_worker(self, row: AuthFileRow, proxy_url: str) -> None:
-        refreshed_token = ""
+    def _activate_auth_row_worker(self, row: AuthFileRow) -> None:
         error = ""
         try:
-            refreshed_token = self.auth_token_refresh_service.refresh_one(row.refresh_token, proxy_url)
-            ok, message = self.auth_sync_service.activate_auth_file(refreshed_token)
+            ok, message = self.auth_sync_service.activate_auth_file(row.refresh_token)
             if not ok:
                 raise RuntimeError(message)
         except Exception as exc:
             error = str(exc)
         try:
             self._post_ui(
-                lambda token=refreshed_token, message=error: self._finish_activate_auth_row(row, token, message)
+                lambda message=error: self._finish_activate_auth_row(row, message)
             )
         except tk.TclError:
             pass
 
-    def _finish_activate_auth_row(self, row: AuthFileRow, refreshed_token: str, error: str) -> None:
+    def _finish_activate_auth_row(self, row: AuthFileRow, error: str) -> None:
         self._auth_switch_running = False
         if self._auth_menu is not None:
             self._auth_menu.entryconfig("切换", state="normal")
         if error:
-            messagebox.showerror("切换失败", f"刷新授权并切换失败：{error}\n\n该账号可能需要重新登录。")
+            messagebox.showerror("切换失败", f"切换授权失败：{error}")
             self.refresh_auth_files()
             return
         ok, message = self.codex_local_config_service.restore_official_config(
@@ -3977,7 +3981,7 @@ del "%~f0" >nul 2>nul
             messagebox.showerror("切换失败", f"恢复 Codex 官方配置失败：{message}")
             return
         self._active_credential_type = CREDENTIAL_TYPE_CODEX_AUTH
-        self._active_credential_id = refreshed_token
+        self._active_credential_id = row.refresh_token
         self._relay_previous_model_provider_line = ""
         self._refresh_credential_mode_state()
         self._persist_config()
@@ -4268,9 +4272,16 @@ del "%~f0" >nul 2>nul
                     ]
                 )
         if app_id:
+            ok, message = self.codex_local_config_service.set_proxy_environment(
+                None if self._is_relay_active() else proxy_url
+            )
+            if not ok:
+                messagebox.showerror("启动失败", message)
+                return
             try:
                 activate_packaged_app(app_id, args[1:])
             except OSError as exc:
+                self.codex_local_config_service.set_proxy_environment(None)
                 messagebox.showerror("启动失败", str(exc))
             return
         subprocess.Popen(
@@ -4469,6 +4480,7 @@ del "%~f0" >nul 2>nul
         self.auth_sync_service.stop()
         self._low_price_seller_info_executor.shutdown(wait=False, cancel_futures=True)
         self.service.stop()
+        self.codex_local_config_service.set_proxy_environment(None)
         self._auto_load_control_stop.set()
         if self._auto_load_control_socket is not None:
             try:
