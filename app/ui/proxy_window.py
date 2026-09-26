@@ -45,6 +45,7 @@ from app.services.low_price_account_service import (
 from app.models import CREDENTIAL_TYPE_CODEX_AUTH, CREDENTIAL_TYPE_RELAY_API, RelayConfig
 from app.services.relay_config_service import RelayConfigService
 from app.services.codex_local_config_service import CodexLocalConfigService
+from app.services.packaged_app_launch_service import activate_packaged_app, packaged_app_id
 from app.utils.path_utils import app_root
 from tkinter import messagebox, ttk
 
@@ -3150,7 +3151,7 @@ del "%~f0" >nul 2>nul
         if not rows:
             return None
         for row in rows:
-            if row.path.replace("/", "\\").endswith("\\app\\Codex.exe"):
+            if row.path.replace("/", "\\").endswith("\\app\\ChatGPT.exe"):
                 return row
         return rows[0]
 
@@ -3414,8 +3415,7 @@ del "%~f0" >nul 2>nul
     def _is_supported_codex_executable(self, path: str) -> bool:
         normalized_path = path.replace("/", "\\")
         return (
-            normalized_path.endswith("\\app\\Codex.exe")
-            or normalized_path.endswith("\\app\\ChatGPT.exe")
+            normalized_path.endswith("\\app\\ChatGPT.exe")
             or normalized_path.endswith("\\codex\\codex.exe")
             or normalized_path.endswith("\\Code.exe")
             or normalized_path.endswith("\\code.exe")
@@ -4221,6 +4221,7 @@ del "%~f0" >nul 2>nul
 
     def _launch_codex(self, row: CodexInstallRow) -> None:
         exe = Path(row.path)
+        app_id = packaged_app_id(exe)
         if not exe.exists():
             messagebox.showerror("启动失败", f"找不到文件 {row.path}")
             return
@@ -4228,10 +4229,11 @@ del "%~f0" >nul 2>nul
             self._service_status_var.set("代理尚未启动，请先点击“启动服务器”")
             messagebox.showwarning("代理未启动", "请先点击“启动服务器”，等待代理运行后再启动 Codex。")
             return
-        ok, message = self.service.ensure_launch_permissions(exe)
-        if not ok:
-            messagebox.showerror("启动失败", message)
-            return
+        if not app_id:
+            ok, message = self.service.ensure_launch_permissions(exe)
+            if not ok:
+                messagebox.showerror("启动失败", message)
+                return
         proxy_port = self.service.config.port
         env = os.environ.copy()
         proxy_url = f"http://127.0.0.1:{proxy_port}"
@@ -4265,6 +4267,12 @@ del "%~f0" >nul 2>nul
                         "--proxy-bypass-list=localhost;127.0.0.1;<local>",
                     ]
                 )
+        if app_id:
+            try:
+                activate_packaged_app(app_id, args[1:])
+            except OSError as exc:
+                messagebox.showerror("启动失败", str(exc))
+            return
         subprocess.Popen(
             args,
             cwd=current_dir,
