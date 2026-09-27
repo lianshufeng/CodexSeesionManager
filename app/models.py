@@ -44,3 +44,24 @@ class SessionViewData:
 class SessionFetchResult:
     view_data: SessionViewData
     message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ResetCredit:
+    credit_id: str
+    granted_at: float
+    expires_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResetCreditInfo:
+    available_count: int
+    expiry_times: tuple[str, ...] = ()
+    expiry_timestamps: tuple[float, ...] = ()
+    credits: tuple[ResetCredit, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ResetCreditState:
+    info: ResetCreditInfo | None = None
+    failed: bool = False

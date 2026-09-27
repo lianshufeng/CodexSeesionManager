@@ -14,8 +14,6 @@ class AppConfig:
     use_upstream_proxy: bool = True
     auto_load: bool = True
     quota_warmup: bool = False
-    lock_model_enabled: bool = False
-    load_model: str = "gpt-5.5"
     active_credential_type: str = "codex_auth"
     active_credential_id: str = ""
     relay_previous_model_provider_line: str = ""
@@ -49,14 +47,9 @@ class AppConfigService:
         use_upstream_proxy = bool(data.get("use_upstream_proxy", True))
         auto_load = bool(data.get("auto_load", True))
         quota_warmup = bool(data.get("quota_warmup", False))
-        load_model = str(data.get("load_model")).strip() if "load_model" in data else "gpt-5.5"
         active_credential_type = str(data.get("active_credential_type") or "codex_auth")
         if active_credential_type not in {"codex_auth", "relay_api"}:
             active_credential_type = "codex_auth"
-        if "lock_model_enabled" in data:
-            lock_model_enabled = bool(data.get("lock_model_enabled", False))
-        else:
-            lock_model_enabled = False
         cloud_storage = data.get("cloud_storage")
         if not isinstance(cloud_storage, dict):
             cloud_storage = {}
@@ -66,8 +59,6 @@ class AppConfigService:
             use_upstream_proxy=use_upstream_proxy,
             auto_load=auto_load,
             quota_warmup=quota_warmup,
-            lock_model_enabled=lock_model_enabled,
-            load_model=load_model,
             active_credential_type=active_credential_type,
             active_credential_id=str(data.get("active_credential_id") or ""),
             relay_previous_model_provider_line=str(data.get("relay_previous_model_provider_line") or ""),
@@ -85,8 +76,6 @@ class AppConfigService:
             "use_upstream_proxy": config.use_upstream_proxy,
             "auto_load": config.auto_load,
             "quota_warmup": config.quota_warmup,
-            "lock_model_enabled": config.lock_model_enabled,
-            "load_model": config.load_model,
             "active_credential_type": config.active_credential_type,
             "active_credential_id": config.active_credential_id,
             "relay_previous_model_provider_line": config.relay_previous_model_provider_line,

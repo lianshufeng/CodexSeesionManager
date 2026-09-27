@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import time
+from uuid import uuid4
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
@@ -31,9 +32,9 @@ from app.version import APP_VERSION
 from app.services.auth_login_service import AuthLoginResult, AuthLoginService
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
-from app.services.auth_model_capability_service import AuthModelCapabilityService
 from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
 from app.services.auth_usage_service import QUOTA_REFRESH_FAILED, AuthQuotaItem, AuthUsageService
+from app.services.auth_reset_credit_service import AuthResetCreditService
 from app.services.cloud_sync_service import CloudSyncConfig, CloudSyncFile, CloudSyncService, CloudSyncVersion
 from app.services.low_price_account_service import (
     LowPriceAccount,
@@ -99,7 +100,8 @@ class ProxyWindow:
         self.auth_login_service = AuthLoginService(self.auth_sync_service)
         self.auth_token_refresh_service = AuthTokenRefreshService(self.auth_sync_service)
         self.auth_usage_service = AuthUsageService(self.auth_sync_service)
-        self.auth_model_capability_service = AuthModelCapabilityService(self.auth_sync_service)
+        self.auth_reset_credit_service = AuthResetCreditService(self.auth_sync_service)
+        self._reset_credit_busy = False
         self.relay_config_service = RelayConfigService()
         self.codex_local_config_service = CodexLocalConfigService()
         self.low_price_account_service = LowPriceAccountService()
@@ -150,11 +152,6 @@ class ProxyWindow:
             self._active_credential_id = ""
         self._auto_load_check: ttk.Checkbutton | None = None
         self._quota_warmup_check: ttk.Checkbutton | None = None
-        lock_model_enabled = loaded_config.lock_model_enabled if loaded_config is not None else False
-        self.lock_model_var = tk.BooleanVar(value=lock_model_enabled)
-        load_model = loaded_config.load_model if loaded_config is not None else "gpt-5.5"
-        self.load_model_var = tk.StringVar(value=load_model)
-        self._load_model_entry: ttk.Entry | None = None
         self._auto_load_enabled = auto_load_enabled
         self._use_upstream_proxy = self.service.config.use_upstream_proxy
         self._upstream_proxy = self.service.config.upstream_proxy
@@ -257,10 +254,7 @@ class ProxyWindow:
         except Exception as exc:
             print(f"[AuthLogin] 登录回调监听启动失败: {exc}", flush=True)
         self.auth_sync_service.set_change_callback(
-            lambda: (
-                self._post_ui(self._schedule_refresh_auth_files),
-                self.auth_model_capability_service.request_refresh(),
-            )
+            lambda: self._post_ui(self._schedule_refresh_auth_files)
         )
         self.auth_usage_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
         self.auth_usage_service.set_quota_change_callback(
@@ -270,18 +264,19 @@ class ProxyWindow:
             )
         )
         self.auth_usage_service.set_proxy_provider(self._get_proxy_for_usage_request)
-        self.auth_model_capability_service.set_proxy_provider(self._get_proxy_for_usage_request)
-        self.auth_model_capability_service.set_change_callback(
-            lambda: self._post_ui(lambda: self.refresh_auth_files(update_status=False))
+        self.auth_reset_credit_service.set_proxy_provider(self._get_proxy_for_usage_request)
+        self.auth_reset_credit_service.set_change_callback(
+            lambda: self._post_ui(self._refresh_reset_credit_display)
         )
         self.auth_sync_service.start()
         self.auth_usage_service.start()
-        self.auth_model_capability_service.start()
+        self.auth_reset_credit_service.start()
         self._center_window(1040, 660)
         self._load_or_probe_initial_config(loaded_config is not None)
         self._sync_proxy_config_cache()
         self._set_config_editable(True)
         self.refresh_all()
+        self.root.after(1000, self._tick_reset_credit_countdown)
         self._refresh_credential_mode_state()
         self._recompute_auto_load_target()
         self._add_tray_icon()
@@ -414,28 +409,6 @@ class ProxyWindow:
         quota_warmup_check.pack(side="left", padx=(8, 0))
         self._quota_warmup_check = quota_warmup_check
         self._bind_widget_tooltip(quota_warmup_check, "优先使用5小时额度不低于99%的可用账号，使额度周期尽早开始")
-        lock_model_check = ttk.Checkbutton(
-            auth_options,
-            text="锁定模型",
-            variable=self.lock_model_var,
-            command=self._on_lock_model_toggled,
-        )
-        lock_model_check.pack(side="left", padx=(12, 4))
-        load_model_entry = ttk.Entry(auth_options, textvariable=self.load_model_var, width=14)
-        self._load_model_entry = load_model_entry
-        load_model_entry.pack(side="left")
-        load_model_entry.bind("<FocusOut>", lambda _event: self._persist_config())
-        load_model_entry.bind("<Return>", lambda _event: self._persist_config())
-        self._bind_widget_tooltip(
-            lock_model_check,
-            "勾选后代理会把 Codex 请求中的 model 改写为输入框里的模型，例如 gpt-5.5；"
-            "锁定状态下输入框不可编辑，取消勾选后可编辑但不生效。",
-        )
-        self._bind_widget_tooltip(
-            load_model_entry,
-            "锁定模型名称，默认不锁定；勾选后代理会把 Codex 请求中的 model 改写为输入框里的模型。",
-        )
-        self._refresh_lock_model_state()
         self._correct_traffic_button = ttk.Button(auth_options, text="矫正流量", command=self.correct_traffic)
         self._correct_traffic_button.pack(side="right")
         self._clean_auth_button = ttk.Button(auth_options, text="清理授权", command=self.clean_auth_files)
@@ -473,34 +446,34 @@ class ProxyWindow:
             "loadMark",
             "sourceType",
             "loadStrategy",
-            "accountId",
             "email",
             "tokenRefreshTime",
             "quotaRefreshTime",
             "quota",
             "planType",
+            "resetCreditExpiry",
         )
         self.auth_tree = ttk.Treeview(auth_wrap, columns=auth_columns, show="headings", selectmode="browse", height=5)
         self.auth_tree.heading("currentMark", text="当前")
         self.auth_tree.heading("loadMark", text="负载")
         self.auth_tree.heading("sourceType", text="来源")
         self.auth_tree.heading("loadStrategy", text="策略")
-        self.auth_tree.heading("accountId", text="账户id")
         self.auth_tree.heading("email", text="邮箱")
         self.auth_tree.heading("tokenRefreshTime", text="令牌刷新时间")
         self.auth_tree.heading("quotaRefreshTime", text="额度刷新时间")
         self.auth_tree.heading("quota", text="额度(5h/7d)")
         self.auth_tree.heading("planType", text="类型")
+        self.auth_tree.heading("resetCreditExpiry", text="重置卡到期")
         self.auth_tree.column("currentMark", width=46, anchor="center", stretch=False)
         self.auth_tree.column("loadMark", width=46, anchor="center", stretch=False)
         self.auth_tree.column("sourceType", width=76, anchor="center", stretch=False)
         self.auth_tree.column("loadStrategy", width=58, anchor="center", stretch=False)
-        self.auth_tree.column("accountId", width=240, anchor="w", stretch=True)
-        self.auth_tree.column("email", width=210, anchor="w", stretch=True)
+        self.auth_tree.column("email", width=170, anchor="w", stretch=True)
         self.auth_tree.column("tokenRefreshTime", width=132, anchor="center", stretch=False)
         self.auth_tree.column("quotaRefreshTime", width=132, anchor="center", stretch=False)
-        self.auth_tree.column("quota", width=126, anchor="center", stretch=False)
-        self.auth_tree.column("planType", width=86, anchor="center", stretch=False)
+        self.auth_tree.column("quota", width=106, anchor="center", stretch=False)
+        self.auth_tree.column("planType", width=54, anchor="center", stretch=False)
+        self.auth_tree.column("resetCreditExpiry", width=125, anchor="center", stretch=False)
         self.auth_tree.bind("<Double-1>", self._on_auth_tree_double_click)
         self.auth_tree.bind("<Button-3>", self._on_auth_tree_right_click)
         self.auth_tree.bind("<Delete>", self._on_auth_tree_delete_key)
@@ -532,6 +505,7 @@ class ProxyWindow:
             command=lambda: self._set_selected_auth_load_strategy("disabled"),
         )
         self._auth_menu.add_cascade(label="负载策略", menu=self._auth_load_strategy_menu)
+        self._auth_menu.add_command(label="使用重置卡", command=self._use_selected_reset_credit)
 
         auth_scroll = ttk.Scrollbar(auth_wrap, orient="vertical", command=self.auth_tree.yview)
         self.auth_tree.configure(yscrollcommand=auth_scroll.set)
@@ -833,18 +807,6 @@ class ProxyWindow:
             self._set_auto_load_target("", "")
             self._clear_proxy_kill_pending()
 
-    def _on_lock_model_toggled(self) -> None:
-        if self.lock_model_var.get() and not self.load_model_var.get().strip():
-            self.load_model_var.set("gpt-5.5")
-        self._refresh_lock_model_state()
-        self._persist_config()
-
-    def _refresh_lock_model_state(self) -> None:
-        if self._load_model_entry is None:
-            return
-        state = "disabled" if self.lock_model_var.get() else "normal"
-        self._load_model_entry.configure(state=state)
-
     def _recompute_auto_load_target(self) -> None:
         if self._is_relay_active():
             self._set_auto_load_target("", "")
@@ -1077,8 +1039,6 @@ class ProxyWindow:
                 use_upstream_proxy=self.use_upstream_proxy_var.get(),
                 auto_load=self.auto_load_var.get(),
                 quota_warmup=self.quota_warmup_var.get(),
-                lock_model_enabled=self.lock_model_var.get(),
-                load_model=self.load_model_var.get().strip(),
                 active_credential_type=self._active_credential_type,
                 active_credential_id=self._active_credential_id,
                 relay_previous_model_provider_line=self._relay_previous_model_provider_line,
@@ -1787,9 +1747,6 @@ class ProxyWindow:
         self.use_upstream_proxy_var.set(loaded_config.use_upstream_proxy)
         self.auto_load_var.set(loaded_config.auto_load)
         self.quota_warmup_var.set(loaded_config.quota_warmup)
-        self.lock_model_var.set(loaded_config.lock_model_enabled)
-        self.load_model_var.set(loaded_config.load_model)
-        self._refresh_lock_model_state()
         self.cloud_s3_address_var.set(loaded_config.cloud_s3_address)
         self.cloud_bucket_name_var.set(loaded_config.cloud_bucket_name)
         self.cloud_account_var.set(loaded_config.cloud_account)
@@ -1850,11 +1807,6 @@ class ProxyWindow:
         with self._auto_load_lock:
             return self._auto_load_target_access_token if self._auto_load_enabled and not self._is_relay_active() else ""
 
-    def _effective_load_model(self) -> str:
-        if not self.lock_model_var.get():
-            return ""
-        return self.load_model_var.get().strip()
-
     def _get_auto_load_target_auth_payload(self) -> str:
         if self._is_relay_active():
             relay = self.relay_config_service.get_relay(self._active_credential_id)
@@ -1867,7 +1819,7 @@ class ProxyWindow:
                     "access_token": relay.api_key,
                     "account_id": "",
                     "base_url": relay.base_url,
-                    "load_model": relay.model or self._effective_load_model(),
+                    "relay_model": relay.model,
                 },
                 ensure_ascii=False,
             )
@@ -1883,7 +1835,6 @@ class ProxyWindow:
                 "credential_type": CREDENTIAL_TYPE_CODEX_AUTH,
                 "access_token": token,
                 "account_id": account_id,
-                "load_model": self._effective_load_model(),
             },
             ensure_ascii=False,
         )
@@ -3346,12 +3297,12 @@ del "%~f0" >nul 2>nul
                     self._format_auth_load_mark(row, load_refresh_token),
                     "Codex账号",
                     self._format_auth_load_strategy(row.load_strategy),
-                    self._shorten_middle(row.account_id, 16, 10),
-                    self._shorten_middle(row.email, 18, 12),
+                    self._shorten_middle(row.email, 16, 11),
                     self._format_last_refresh(row.last_refresh),
                     self._format_last_refresh(row.quota_refresh_time_5h),
                     row.quota,
                     row.plan_type or "",
+                    self._format_reset_credit_countdown(row.refresh_token),
                 ),
             )
             self._auth_rows_by_item[item] = row
@@ -3366,8 +3317,8 @@ del "%~f0" >nul 2>nul
                     "",
                     "中转API",
                     "",
-                    self._shorten_middle(row.name, 16, 10),
-                    self._shorten_middle(row.base_url, 24, 14),
+                    self._shorten_middle(row.name, 20, 14),
+                    "",
                     "",
                     "",
                     "",
@@ -3735,14 +3686,7 @@ del "%~f0" >nul 2>nul
             f"类型: {row.plan_type or ''}",
             f"负载策略: {self._format_auth_load_strategy(row.load_strategy)}",
         ]
-        model_item = self.auth_model_capability_service.item_for(row.refresh_token)
-        if model_item is None:
-            lines.append("模型能力: 等待自动刷新")
-        elif model_item.status == "ok":
-            model_names = "  ".join(model.slug for model in model_item.models)
-            lines.append(f"支持模型: {model_names}")
-        else:
-            lines.append(f"模型能力: 失败，{model_item.message}")
+        lines.append(self._reset_credit_tooltip(row.refresh_token))
         return "\n".join(lines)
 
     def _on_tree_motion(self, event: tk.Event) -> None:
@@ -3791,6 +3735,125 @@ del "%~f0" >nul 2>nul
             return
         self._activate_auth_row(row)
 
+    def _format_reset_credit_countdown(self, refresh_token: str) -> str:
+        state = self.auth_reset_credit_service.item_for(refresh_token)
+        if state is None or state.info is None or state.info.available_count <= 0:
+            return ""
+        now = time.time()
+        expires_at = next((instant for instant in state.info.expiry_timestamps if instant > now), None)
+        if expires_at is None:
+            return ""
+        remaining = max(0, int(expires_at - now + 0.999))
+        days, remainder = divmod(remaining, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{days:02d}:{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _refresh_reset_credit_display(self) -> None:
+        self._refresh_reset_credit_menu()
+        self._update_reset_credit_countdowns()
+
+    def _update_reset_credit_countdowns(self) -> None:
+        for item, row in self._auth_rows_by_item.items():
+            if isinstance(row, RelayConfig):
+                continue
+            value = self._format_reset_credit_countdown(row.refresh_token)
+            if self.auth_tree.set(item, "resetCreditExpiry") != value:
+                self.auth_tree.set(item, "resetCreditExpiry", value)
+
+    def _tick_reset_credit_countdown(self) -> None:
+        if self._closing:
+            return
+        self._update_reset_credit_countdowns()
+        self.root.after(1000, self._tick_reset_credit_countdown)
+
+    def _refresh_reset_credit_menu(self) -> None:
+        if self._auth_menu is None:
+            return
+        row = self._get_selected_auth_row()
+        enabled = isinstance(row, AuthFileRow) and not self._reset_credit_busy
+        self._auth_menu.entryconfigure("使用重置卡", state="normal" if enabled else "disabled")
+
+    def _reset_credit_tooltip(self, refresh_token: str) -> str:
+        state = self.auth_reset_credit_service.item_for(refresh_token)
+        if state is None:
+            return "重置卡：查询中"
+        if state.info is None:
+            return "重置卡：查询失败"
+        label = f"重置卡：({state.info.available_count})"
+        if state.info.expiry_times:
+            label += " " + ", ".join(state.info.expiry_times)
+        if state.failed:
+            label += "（刷新失败，上次结果）"
+        return label
+
+    def _use_selected_reset_credit(self) -> None:
+        row = self._get_selected_auth_row()
+        if not isinstance(row, AuthFileRow) or self._reset_credit_busy:
+            return
+        self._reset_credit_busy = True
+        self._refresh_reset_credit_menu()
+        self._hide_tooltip()
+
+        def prepare() -> None:
+            try:
+                credit = self.auth_reset_credit_service.prepare_use(row)
+            except Exception as exc:
+                self._post_ui(lambda message=str(exc): self._finish_reset_credit_use("", message))
+                return
+            self._post_ui(lambda: self._confirm_reset_credit_use(row, credit))
+
+        Thread(target=prepare, daemon=True, name="prepare-reset-credit").start()
+
+    def _confirm_reset_credit_use(self, row, credit) -> None:
+        if credit.expires_at is None:
+            expiry = "无过期时间"
+        else:
+            remaining = max(0, int(credit.expires_at - time.time()))
+            if remaining <= 0:
+                self._finish_reset_credit_use("", "该重置卡已到期，请重新查询")
+                return
+            days, remainder = divmod(remaining, 86400)
+            hours, remainder = divmod(remainder, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            expiry_at = datetime.fromtimestamp(credit.expires_at, _CHINA_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+            expiry = f"约 {days}天 {hours}小时 {minutes}分 {seconds}秒后到期\n过期时间：{expiry_at}（北京时间）"
+        confirmed = messagebox.askyesno(
+            "使用重置卡",
+            f"账户：{row.email or row.account_id}\n将使用最新发放的一张重置卡。\n{expiry}\n\n确认使用吗？",
+            parent=self.root, default="no",
+        )
+        if not confirmed:
+            self._reset_credit_busy = False
+            self._refresh_reset_credit_menu()
+            return
+        redeem_request_id = str(uuid4())
+
+        def consume() -> None:
+            try:
+                code = self.auth_reset_credit_service.use_credit(row, credit.credit_id, redeem_request_id)
+                error = ""
+            except Exception as exc:
+                code, error = "", f"请求未能确认成功，请查看最新重置卡数量和额度后再操作。\n{exc}"
+            self._post_ui(lambda value=code, message=error: self._finish_reset_credit_use(value, message))
+
+        Thread(target=consume, daemon=True, name="consume-reset-credit").start()
+
+    def _finish_reset_credit_use(self, code: str, error: str = "") -> None:
+        self._reset_credit_busy = False
+        self._refresh_reset_credit_display()
+        self.auth_usage_service.request_refresh()
+        if error:
+            messagebox.showerror("使用重置卡失败", error, parent=self.root)
+            return
+        messages = {
+            "reset": "重置卡已使用，正在刷新额度。",
+            "already_redeemed": "本次使用请求已完成，正在刷新额度。",
+            "nothing_to_reset": "当前没有可重置的额度窗口。",
+            "no_credit": "该账户已没有可用重置卡。",
+        }
+        messagebox.showinfo("使用重置卡", messages.get(code, "使用结果未知，请刷新后查看。"), parent=self.root)
+
     def _on_auth_tree_right_click(self, event: tk.Event) -> None:
         row_id = self.auth_tree.identify_row(event.y)
         if not row_id:
@@ -3800,6 +3863,7 @@ del "%~f0" >nul 2>nul
             return
         self.auth_tree.selection_set(row_id)
         self.auth_tree.focus(row_id)
+        self._refresh_reset_credit_menu()
         is_relay = isinstance(row, RelayConfig)
         self._auth_menu.entryconfigure(2, state="normal")
         self._auth_menu.entryconfigure(3, state="normal" if is_relay else "disabled")
@@ -4493,7 +4557,7 @@ del "%~f0" >nul 2>nul
         self._closing = True
         self._remove_tray_icon()
         self._persist_config()
-        self.auth_model_capability_service.stop()
+        self.auth_reset_credit_service.stop()
         self.auth_usage_service.stop()
         self.auth_sync_service.stop()
         self._low_price_seller_info_executor.shutdown(wait=False, cancel_futures=True)
