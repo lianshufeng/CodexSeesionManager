@@ -3299,7 +3299,7 @@ del "%~f0" >nul 2>nul
                     self._format_auth_load_strategy(row.load_strategy),
                     self._shorten_middle(row.email, 16, 11),
                     self._format_last_refresh(row.last_refresh),
-                    self._format_last_refresh(row.quota_refresh_time_5h),
+                    self._format_quota_refresh_countdown(row.quota_refresh_time_5h),
                     row.quota,
                     row.plan_type or "",
                     self._format_reset_credit_countdown(row.refresh_token),
@@ -3743,7 +3743,24 @@ del "%~f0" >nul 2>nul
         expires_at = next((instant for instant in state.info.expiry_timestamps if instant > now), None)
         if expires_at is None:
             return ""
-        remaining = max(0, int(expires_at - now + 0.999))
+        return self._format_countdown(expires_at, now)
+
+    def _format_quota_refresh_countdown(self, refresh_time: str) -> str:
+        if not refresh_time:
+            return ""
+        try:
+            reset_at = datetime.fromisoformat(refresh_time.replace("Z", "+00:00"))
+            if reset_at.tzinfo is None:
+                reset_at = reset_at.replace(tzinfo=_CHINA_TIMEZONE)
+            return self._format_countdown(reset_at.timestamp())
+        except (ValueError, OverflowError):
+            return ""
+
+    @staticmethod
+    def _format_countdown(target_at: float, now: float | None = None) -> str:
+        if now is None:
+            now = time.time()
+        remaining = max(0, int(target_at - now + 0.999))
         days, remainder = divmod(remaining, 86400)
         hours, remainder = divmod(remainder, 3600)
         minutes, seconds = divmod(remainder, 60)
@@ -3757,6 +3774,9 @@ del "%~f0" >nul 2>nul
         for item, row in self._auth_rows_by_item.items():
             if isinstance(row, RelayConfig):
                 continue
+            quota_value = self._format_quota_refresh_countdown(row.quota_refresh_time_5h)
+            if self.auth_tree.set(item, "quotaRefreshTime") != quota_value:
+                self.auth_tree.set(item, "quotaRefreshTime", quota_value)
             value = self._format_reset_credit_countdown(row.refresh_token)
             if self.auth_tree.set(item, "resetCreditExpiry") != value:
                 self.auth_tree.set(item, "resetCreditExpiry", value)
