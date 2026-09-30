@@ -44,13 +44,16 @@ class AuthResetCreditService:
             return self._items.get(refresh_token)
 
     @staticmethod
-    def latest_credit(info: ResetCreditInfo) -> ResetCredit | None:
+    def earliest_expiring_credit(info: ResetCreditInfo) -> ResetCredit | None:
         if info.available_count <= 0:
             return None
         now = time.time()
-        return max(
+        return min(
             (credit for credit in info.credits if credit.expires_at is None or credit.expires_at > now),
-            key=lambda credit: (credit.granted_at, credit.credit_id), default=None,
+            key=lambda credit: (
+                credit.expires_at if credit.expires_at is not None else float("inf"),
+                credit.granted_at, credit.credit_id,
+            ), default=None,
         )
 
     def _request_lock_for(self, row: AuthFileRow) -> Lock:
@@ -75,7 +78,7 @@ class AuthResetCreditService:
     def prepare_use(self, row: AuthFileRow) -> ResetCredit:
         with self._request_lock_for(row):
             current = self._current_row(row)
-            credit = self.latest_credit(self._fetch_current(current))
+            credit = self.earliest_expiring_credit(self._fetch_current(current))
             if credit is None:
                 raise ValueError("该账户没有可用的重置卡")
             return credit
@@ -83,9 +86,9 @@ class AuthResetCreditService:
     def use_credit(self, row: AuthFileRow, credit_id: str, redeem_request_id: str) -> str:
         with self._request_lock_for(row):
             current = self._current_row(row)
-            latest = self.latest_credit(self._fetch_current(current))
-            if latest is None or latest.credit_id != credit_id:
-                raise ValueError("最新重置卡已变化或失效，请重新点击并确认")
+            credit = self.earliest_expiring_credit(self._fetch_current(current))
+            if credit is None or credit.credit_id != credit_id:
+                raise ValueError("最早到期的重置卡已变化或失效，请重新点击并确认")
             proxy_url = self._proxy_provider() if self._proxy_provider else ""
             try:
                 return self.fetcher.consume(current.access_token, current.account_id, proxy_url,

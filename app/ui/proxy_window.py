@@ -3840,7 +3840,7 @@ del "%~f0" >nul 2>nul
             expiry = f"约 {days}天 {hours}小时 {minutes}分 {seconds}秒后到期\n过期时间：{expiry_at}（北京时间）"
         confirmed = messagebox.askyesno(
             "使用重置卡",
-            f"账户：{row.email or row.account_id}\n将使用最新发放的一张重置卡。\n{expiry}\n\n确认使用吗？",
+            f"账户：{row.email or row.account_id}\n将优先使用最早到期的一张有效重置卡。\n{expiry}\n\n确认使用吗？",
             parent=self.root, default="no",
         )
         if not confirmed:
