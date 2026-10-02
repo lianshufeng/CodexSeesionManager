@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import json
-import hashlib
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 import re
@@ -211,8 +210,7 @@ class ProxyWindow:
         self._traffic_status_var = tk.StringVar(value="上行: 0  下行: 0")
         self._token_speed_var = tk.StringVar(value="0.0 token/s")
         self._token_speed_updated_at = 0.0
-        self._token_stats_by_credential: dict[str, dict] = {}
-        self._token_history_service = TokenHistoryService(app_root() / "data" / "token_speed.sqlite3")
+        self._token_history_service = TokenHistoryService(app_root() / "data" / "token_speed.sqlite3", metric="response_content_tokens_v1")
         self._token_history_window: TokenHistoryWindow | None = None
         self._token_speed_value = 0.0
         self._service_status_var = tk.StringVar(value="正在准备代理服务…")
@@ -3693,7 +3691,7 @@ del "%~f0" >nul 2>nul
                     f"API Key: {self._redact_middle(row.api_key, 4, 4)}",
                     f"备注: {row.note or ''}",
                 ]
-            ) + self._token_stats_tooltip(row.credential_id)
+            )
         quota = row.quota or ""
         lines = [
             f"账户ID: {row.account_id or '-'}",
@@ -3710,7 +3708,7 @@ del "%~f0" >nul 2>nul
             f"负载策略: {self._format_auth_load_strategy(row.load_strategy)}",
         ]
         lines.append(self._reset_credit_tooltip(row.refresh_token))
-        return "\n".join(lines) + self._token_stats_tooltip(row.refresh_token)
+        return "\n".join(lines)
 
     def _update_token_speed(self, data: dict) -> None:
         if "speed" in data:
@@ -3719,14 +3717,6 @@ del "%~f0" >nul 2>nul
             self._token_speed_var.set(f"{output_speed:.1f} token/s")
             self._token_speed_updated_at = time.monotonic()
             self._refresh_tray_icon_tooltip()
-        elif "token" in data:
-            for row in self._auth_rows_by_item.values():
-                token = row.api_key if isinstance(row, RelayConfig) else row.access_token
-                account_match = not isinstance(row, RelayConfig) and data.get("account_id") and row.account_id == data["account_id"]
-                if hashlib.sha256(token.encode()).hexdigest() == data["token"] or account_match:
-                    key = row.credential_id if isinstance(row, RelayConfig) else row.refresh_token
-                    self._token_stats_by_credential[key] = data
-                    break
 
     def _tick_token_speed(self) -> None:
         if self._closing:
@@ -3745,15 +3735,6 @@ del "%~f0" >nul 2>nul
             self._token_history_window.show()
             return
         self._token_history_window = TokenHistoryWindow(self.root, self._token_history_service)
-
-    def _token_stats_tooltip(self, key: str) -> str:
-        data = self._token_stats_by_credential.get(key)
-        if not data:
-            return ""
-        prefix = "≈" if data.get("estimated") else ""
-        return (f"\n最近响应输出: {prefix}{data['output_tokens']} token"
-                f"\n请求耗时: {data['seconds']:.2f} 秒"
-                f"\n平均速度: {prefix}{data['average']:.1f} token/s（含等待；接口用量可能含推理）")
 
     def _on_tree_motion(self, event: tk.Event) -> None:
         row_id = self.tree.identify_row(event.y)

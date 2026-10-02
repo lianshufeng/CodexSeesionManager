@@ -14,8 +14,9 @@ from threading import Event, Lock, Thread
 class TokenHistoryService:
     """单独线程读写 SQLite；UI 仅提交采样、读取近期内存。"""
 
-    def __init__(self, path: Path, flush_seconds: float = 10, retention_days: int = 7) -> None:
+    def __init__(self, path: Path, flush_seconds: float = 10, retention_days: int = 7, metric: str | None = None) -> None:
         self.path = path
+        self._metric = metric
         self._flush_seconds = flush_seconds
         self._retention_seconds = retention_days * 86400
         self._queue: Queue = Queue(maxsize=8192)
@@ -77,6 +78,13 @@ class TokenHistoryService:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("CREATE TABLE IF NOT EXISTS samples (timestamp INTEGER PRIMARY KEY, speed REAL NOT NULL)")
+            if self._metric is not None:
+                connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                previous = connection.execute("SELECT value FROM metadata WHERE key = 'metric'").fetchone()
+                if previous != (self._metric,):
+                    # 统计口径变化时重置旧采样，避免历史曲线混用两种单位。
+                    connection.execute("DELETE FROM samples")
+                    connection.execute("INSERT OR REPLACE INTO metadata VALUES ('metric', ?)", (self._metric,))
             connection.commit()
             while not self._stop.is_set() or not self._queue.empty():
                 try:

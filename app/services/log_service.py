@@ -166,7 +166,7 @@ class LogService:
     def _should_persist_line(self, stream_name: str, line: str) -> bool:
         if stream_name == "stderr":
             return True
-        if line.startswith(("[ProxyService]", "[AuthUsage]", "[AuthSync]", "[AutoLoad]", "[ProxyWindow]")):
+        if line.startswith(("[ProxyService]", "[AuthUsage]", "[AuthSync]", "[AutoLoad]", "[ProxyWindow]", "[TokenSpeed]")):
             return True
         if line.startswith("[ProxyFlow]"):
             noisy_markers = ("请求头", "请求体", "响应头", "响应体", "流量:")
