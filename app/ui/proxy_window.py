@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 import re
@@ -51,6 +52,7 @@ from app.utils.path_utils import app_root
 from tkinter import messagebox, ttk
 
 from app.services.proxy_service import ProxyConfig, ProxyService
+from app.services.tray_service import RecoverableTrayIcon
 
 
 _AUTO_LOAD_MISMATCH_WINDOW_SECONDS = 60.0
@@ -59,7 +61,7 @@ _QUOTA_DROP_GRACE_SECONDS = 10.0
 _TRAY_ICON_TIP = "Codex 账户管理"
 _TRAY_ICON_MAX_ROWS = 4
 _TRAY_ICON_MAX_TIP_LENGTH = 120
-_TRAY_WATCHDOG_INTERVAL_MS = 5000
+_TRAY_WATCHDOG_INTERVAL_MS = 10000
 _CHINA_TIMEZONE = timezone(timedelta(hours=8))
 _LATEST_RELEASE_API_URL = "https://api.github.com/repos/lianshufeng/CodexSeesionManager/releases/latest"
 _RELEASES_URL = "https://github.com/lianshufeng/CodexSeesionManager/releases"
@@ -205,6 +207,9 @@ class ProxyWindow:
         self._port_entry: ttk.Entry | None = None
         self._upstream_entry: ttk.Entry | None = None
         self._traffic_status_var = tk.StringVar(value="上行: 0  下行: 0")
+        self._token_speed_var = tk.StringVar(value="输出: ≈0.0 token/s")
+        self._token_speed_updated_at = 0.0
+        self._token_stats_by_credential: dict[str, dict] = {}
         self._service_status_var = tk.StringVar(value="正在准备代理服务…")
         self._version_var = tk.StringVar(value=f"版本: {APP_VERSION}")
         self._update_status_var = tk.StringVar(value="")
@@ -244,6 +249,7 @@ class ProxyWindow:
         self._cleanup_old_update_files()
         self.root.after(50, self._drain_ui_queue)
         self.root.after(_TRAY_WATCHDOG_INTERVAL_MS, self._tray_icon_watchdog)
+        self.root.after(1000, self._tick_token_speed)
         self.auth_login_service.set_result_callback(
             lambda result, error: self._post_ui(
                 lambda value=result, message=error: self._finish_update_auth(value, message)
@@ -519,6 +525,7 @@ class ProxyWindow:
         ttk.Label(traffic_frame, textvariable=self._version_var).pack(side="left")
         ttk.Label(traffic_frame, textvariable=self._update_status_var).pack(side="left", padx=(12, 0))
         ttk.Label(traffic_frame, textvariable=self._traffic_status_var).pack(side="right")
+        ttk.Label(traffic_frame, textvariable=self._token_speed_var).pack(side="right", padx=(12, 12))
 
     def _center_window(self, width: int, height: int) -> None:
         self.root.update_idletasks()
@@ -1900,6 +1907,14 @@ class ProxyWindow:
                                 reset_count,
                             )
                         )
+                        continue
+                    if payload.startswith("TOKEN_SPEED "):
+                        try:
+                            data = json.loads(payload.removeprefix("TOKEN_SPEED "))
+                        except ValueError:
+                            continue
+                        if isinstance(data, dict):
+                            self._post_ui(lambda value=data: self._update_token_speed(value))
                         continue
                     if payload.startswith("TRAFFIC "):
                         parts = payload.split()
@@ -3670,7 +3685,7 @@ del "%~f0" >nul 2>nul
                     f"API Key: {self._redact_middle(row.api_key, 4, 4)}",
                     f"备注: {row.note or ''}",
                 ]
-            )
+            ) + self._token_stats_tooltip(row.credential_id)
         quota = row.quota or ""
         lines = [
             f"账户ID: {row.account_id or '-'}",
@@ -3687,7 +3702,36 @@ del "%~f0" >nul 2>nul
             f"负载策略: {self._format_auth_load_strategy(row.load_strategy)}",
         ]
         lines.append(self._reset_credit_tooltip(row.refresh_token))
-        return "\n".join(lines)
+        return "\n".join(lines) + self._token_stats_tooltip(row.refresh_token)
+
+    def _update_token_speed(self, data: dict) -> None:
+        if "speed" in data:
+            self._token_speed_var.set("输出: 统计繁忙" if data['speed'] is None else f"输出: ≈{float(data['speed']):.1f} token/s")
+            self._token_speed_updated_at = time.monotonic()
+        elif "token" in data:
+            for row in self._auth_rows_by_item.values():
+                token = row.api_key if isinstance(row, RelayConfig) else row.access_token
+                account_match = not isinstance(row, RelayConfig) and data.get("account_id") and row.account_id == data["account_id"]
+                if hashlib.sha256(token.encode()).hexdigest() == data["token"] or account_match:
+                    key = row.credential_id if isinstance(row, RelayConfig) else row.refresh_token
+                    self._token_stats_by_credential[key] = data
+                    break
+
+    def _tick_token_speed(self) -> None:
+        if self._closing:
+            return
+        if time.monotonic() - self._token_speed_updated_at > 3:
+            self._token_speed_var.set("输出: ≈0.0 token/s")
+        self.root.after(1000, self._tick_token_speed)
+
+    def _token_stats_tooltip(self, key: str) -> str:
+        data = self._token_stats_by_credential.get(key)
+        if not data:
+            return ""
+        prefix = "≈" if data.get("estimated") else ""
+        return (f"\n最近响应输出: {prefix}{data['output_tokens']} token"
+                f"\n请求耗时: {data['seconds']:.2f} 秒"
+                f"\n平均速度: {prefix}{data['average']:.1f} token/s（含等待；接口用量可能含推理）")
 
     def _on_tree_motion(self, event: tk.Event) -> None:
         row_id = self.tree.identify_row(event.y)
@@ -4439,13 +4483,18 @@ del "%~f0" >nul 2>nul
     def _tray_icon_watchdog(self) -> None:
         if self._closing:
             return
-        self._recover_tray_icon_if_needed()
-        self.root.after(_TRAY_WATCHDOG_INTERVAL_MS, self._tray_icon_watchdog)
+        try:
+            self._recover_tray_icon_if_needed()
+        except Exception as exc:
+            print(f"[Tray] 托盘恢复检查失败，将稍后重试: {exc}", flush=True)
+        finally:
+            if not self._closing:
+                self.root.after(_TRAY_WATCHDOG_INTERVAL_MS, self._tray_icon_watchdog)
 
     def _recover_tray_icon_if_needed(self) -> None:
-        if self._closing or self.root.state() != "withdrawn":
+        if self._closing:
             return
-        if self._tray_icon is None or not getattr(self._tray_icon, "visible", False):
+        if self._tray_icon is None or not self._tray_icon.ensure_registered():
             if self._tray_icon is not None:
                 try:
                     self._tray_icon.stop()
@@ -4454,6 +4503,7 @@ del "%~f0" >nul 2>nul
                 self._tray_icon = None
             self._tray_icon_visible = False
             self._add_tray_icon()
+            print("[Tray] 已重新创建托盘图标", flush=True)
 
     def _hide_to_tray(self) -> None:
         self._add_tray_icon()
@@ -4488,7 +4538,7 @@ del "%~f0" >nul 2>nul
             pystray.MenuItem("显示", self._on_tray_show, default=True),
             pystray.MenuItem("退出", self._on_tray_exit),
         )
-        self._tray_icon = pystray.Icon(_TRAY_ICON_TIP, self._load_tray_icon(), self._build_tray_icon_tip(), menu)
+        self._tray_icon = RecoverableTrayIcon(_TRAY_ICON_TIP, self._load_tray_icon(), self._build_tray_icon_tip(), menu)
         self._tray_icon.run_detached()
         self._tray_icon_visible = True
 

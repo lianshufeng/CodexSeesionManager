@@ -7,9 +7,18 @@ import os
 import socket
 import sys
 import time
+import zlib
+import brotli
+import zstandard
 from threading import Event, Lock, Thread
 
 from mitmproxy import http
+try:
+    from app.services.token_speed_service import TokenSpeedService
+except ModuleNotFoundError as exc:
+    if exc.name != "app":
+        raise
+    from token_speed_service import TokenSpeedService
 
 
 _RESELECT_EVENT = "RESELECT"
@@ -65,9 +74,11 @@ class ProxyLoggerAddon:
         self._download_bytes = 0
         self._live_flows: dict[str, object] = {}
         self._last_relay_model_rewrite_log = ""
+        self._token_speed = TokenSpeedService(self._report_token_speed)
 
     def load(self, loader) -> None:
         _log("日志插件已加载")
+        self._token_speed.start()
         self._log_handler = _PingPongLogHandler(self)
         # WebSocket ping/pong 的实际日志由 proxy.server 输出。
         self._websocket_logger = logging.getLogger("mitmproxy.proxy.server")
@@ -413,6 +424,47 @@ class ProxyLoggerAddon:
     def _report_traffic(self) -> None:
         self._report_control_event(f"TRAFFIC {self._upload_bytes} {self._download_bytes}")
 
+    def _report_token_speed(self, data: dict) -> None:
+        self._report_control_event("TOKEN_SPEED " + json.dumps(data, separators=(",", ":")))
+
+    def _start_token_measurement(self, flow, body) -> None:
+        model = ""
+        try:
+            payload = json.loads(body)
+            model = str(payload.get("model") or "")
+        except (ValueError, UnicodeDecodeError, AttributeError, TypeError):
+            pass
+        self._token_speed.submit("start", flow.id, (self._extract_bearer_token(flow), model, flow.request.headers.get("chatgpt-account-id", "")))
+
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        resp = flow.response
+        if resp is None or not self._should_use_selected_auth(flow) or resp.status_code != 200:
+            return
+        if "text/event-stream" not in resp.headers.get("content-type", ""):
+            return
+        encoding = resp.headers.get("content-encoding", "").lower()
+        if encoding not in ("", "identity", "gzip", "deflate", "br", "zstd"):
+            return
+        decoder = zlib.decompressobj(31 if encoding == "gzip" else 15) if encoding in ("gzip", "deflate") else None
+        if encoding == "br":
+            decoder = brotli.Decompressor()
+        elif encoding == "zstd":
+            decoder = zstandard.ZstdDecompressor().decompressobj()
+        flow.metadata["token_speed_stream"] = True
+
+        def observe(chunk):
+            if chunk:
+                self._mark_activity()
+                self._download_bytes += len(chunk)
+                try:
+                    decoded = decoder.process(chunk) if encoding == "br" else decoder.decompress(chunk) if decoder is not None else chunk
+                    self._token_speed.submit("sse", flow.id, decoded)
+                except (zlib.error, brotli.error, zstandard.ZstdError):
+                    self._token_speed.submit("end", flow.id)
+            return chunk
+
+        resp.stream = observe
+
     def _report_access_token_used(self, access_token: str, workspace_discovery: bool = False) -> None:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
         if not port_text:
@@ -522,6 +574,8 @@ class ProxyLoggerAddon:
         if isinstance(metadata, dict):
             metadata[_SELECTED_AUTH_METADATA_KEY] = selected_token if selected_auth_replaced else ""
         usage_token = selected_token if selected_auth_replaced else original_token
+        if use_selected_auth:
+            self._start_token_measurement(flow, flow.request.content or b"")
         if usage_token:
             self._report_access_token_used(usage_token, self._is_workspace_discovery(flow))
         self._upload_bytes += self._estimate_http_bytes(flow.request.headers, flow.request.raw_content)
@@ -535,6 +589,10 @@ class ProxyLoggerAddon:
         if resp is None:
             return
         self._protect_selected_auth_unauthorized_response(flow)
+        if self._should_use_selected_auth(flow) and not flow.metadata.get("token_speed_stream") and resp.status_code != 101:
+            self._token_speed.submit("json", flow.id, resp.content or b"")
+        if resp.status_code != 101:
+            self._token_speed.submit("end", flow.id)
         self._download_bytes += self._estimate_http_bytes(resp.headers, resp.raw_content)
         self._report_traffic()
 
@@ -542,11 +600,18 @@ class ProxyLoggerAddon:
         self._mark_activity()
         self._track_flow(flow)
         _selected_token, _selected_account_id, relay_model = self._get_selected_auth()
-        if relay_model:
+        if relay_model and flow.websocket and flow.websocket.messages and flow.websocket.messages[-1].from_client:
             self._rewrite_relay_websocket_model(flow, relay_model)
+        if self._should_use_selected_auth(flow) and flow.websocket and flow.websocket.messages:
+            message = flow.websocket.messages[-1]
+            if message.from_client:
+                self._token_speed.submit("ws_start", flow.id, (self._extract_bearer_token(flow), message.content, flow.request.headers.get("chatgpt-account-id", "")))
+            else:
+                self._token_speed.submit("ws_json", flow.id, message.content)
         return None
 
     def websocket_start(self, flow: http.HTTPFlow) -> None:
+        self._token_speed.submit("end", flow.id)
         self._mark_activity()
         self._track_flow(flow)
         _selected_token, _selected_account_id, relay_model = self._get_selected_auth()
@@ -555,15 +620,19 @@ class ProxyLoggerAddon:
         return None
 
     def error(self, flow: http.HTTPFlow) -> None:
+        self._token_speed.submit("end", flow.id)
+        self._token_speed.submit("ws_end", flow.id)
         self._track_flow(flow)
         self._cleanup_flows()
         _log(f"错误: {flow.error}")
 
     def websocket_end(self, flow: http.HTTPFlow) -> None:
+        self._token_speed.submit("ws_end", flow.id)
         self._cleanup_flows()
 
     def done(self) -> None:
         self._stop_event.set()
+        self._token_speed.stop()
         if self._websocket_logger is not None and self._log_handler is not None:
             try:
                 self._websocket_logger.removeHandler(self._log_handler)

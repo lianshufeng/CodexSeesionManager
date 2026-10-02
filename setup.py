@@ -6,7 +6,17 @@ from cx_Freeze import setup, Executable
 
 project_root = Path(__file__).resolve().parent
 site_packages_dir = Path(sys.prefix) / "Lib" / "site-packages"
+import tiktoken
+from app.services.token_speed_service import prepare_tokenizer_cache
+
+tokenizer_cache = project_root / "app" / "services" / "tokenizer_cache"
+prepare_tokenizer_cache(tokenizer_cache)
+for encoding_name in ("o200k_base", "cl100k_base"):
+    tiktoken.get_encoding(encoding_name)
 include_files = [
+    (str(tokenizer_cache), "lib/app/services/tokenizer_cache"),
+    ("app/services/token_speed_service.py", "token_speed_service.py"),
+    (str(tokenizer_cache), "tokenizer_cache"),
     ("app/services/proxy_logger_addon.py", "proxy_logger_addon.py"),
     ("icon/icon.ico", "icon/icon.ico"),
     ("icon/tray_icon.ico", "icon/tray_icon.ico"),
@@ -35,7 +45,7 @@ setup(
             "build_exe": os.environ.get("BUILD_EXE_DIR", str(project_root / "build" / "exe.win-amd64-3.11")),
             "include_files": include_files,
             "include_msvcr": True,
-            "packages": ["mitmproxy", "mitmproxy_rs", "mitmproxy_windows", "psutil", "websocket", "pystray", "PIL"],
+            "packages": ["mitmproxy", "mitmproxy_rs", "mitmproxy_windows", "psutil", "websocket", "pystray", "PIL", "app", "tiktoken", "tiktoken_ext"],
             "excludes": []  # 不需要的库可以排除掉
         }
     }
