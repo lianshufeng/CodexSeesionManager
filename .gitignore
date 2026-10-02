@@ -6,6 +6,7 @@
 /codex_session.egg-info
 /build
 /auth
+/data/token_speed.sqlite3*
 /.idea
 
 *.log

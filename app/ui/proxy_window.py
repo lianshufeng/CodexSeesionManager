@@ -53,6 +53,8 @@ from tkinter import messagebox, ttk
 
 from app.services.proxy_service import ProxyConfig, ProxyService
 from app.services.tray_service import RecoverableTrayIcon
+from app.services.token_history_service import TokenHistoryService
+from app.ui.token_history_window import TokenHistoryWindow
 
 
 _AUTO_LOAD_MISMATCH_WINDOW_SECONDS = 60.0
@@ -210,6 +212,9 @@ class ProxyWindow:
         self._token_speed_var = tk.StringVar(value="0.0 token/s")
         self._token_speed_updated_at = 0.0
         self._token_stats_by_credential: dict[str, dict] = {}
+        self._token_history_service = TokenHistoryService(app_root() / "data" / "token_speed.sqlite3")
+        self._token_history_window: TokenHistoryWindow | None = None
+        self._token_speed_value = 0.0
         self._service_status_var = tk.StringVar(value="正在准备代理服务…")
         self._version_var = tk.StringVar(value=f"版本: {APP_VERSION}")
         self._update_status_var = tk.StringVar(value="")
@@ -525,7 +530,10 @@ class ProxyWindow:
         ttk.Label(traffic_frame, textvariable=self._version_var).pack(side="left")
         ttk.Label(traffic_frame, textvariable=self._update_status_var).pack(side="left", padx=(12, 0))
         ttk.Label(traffic_frame, textvariable=self._traffic_status_var).pack(side="right")
-        ttk.Label(traffic_frame, textvariable=self._token_speed_var).pack(side="right", padx=(12, 12))
+        speed_label = ttk.Label(traffic_frame, textvariable=self._token_speed_var, cursor="hand2")
+        speed_label.pack(side="right", padx=(12, 12))
+        speed_label.bind("<Button-1>", lambda _: self._show_token_history())
+        self._bind_widget_tooltip(speed_label, "点击查看输出速度历史")
 
     def _center_window(self, width: int, height: int) -> None:
         self.root.update_idletasks()
@@ -3707,6 +3715,7 @@ del "%~f0" >nul 2>nul
     def _update_token_speed(self, data: dict) -> None:
         if "speed" in data:
             output_speed = float(data.get("speed") or 0)
+            self._token_speed_value = output_speed
             self._token_speed_var.set(f"{output_speed:.1f} token/s")
             self._token_speed_updated_at = time.monotonic()
             self._refresh_tray_icon_tooltip()
@@ -3723,10 +3732,19 @@ del "%~f0" >nul 2>nul
         if self._closing:
             return
         if time.monotonic() - self._token_speed_updated_at > 3:
+            self._token_speed_value = 0.0
             if self._token_speed_var.get() != "0.0 token/s":
                 self._token_speed_var.set("0.0 token/s")
                 self._refresh_tray_icon_tooltip()
+        self._token_history_service.record(self._token_speed_value)
         self.root.after(1000, self._tick_token_speed)
+
+    def _show_token_history(self) -> None:
+        self._hide_tooltip()
+        if self._token_history_window is not None and self._token_history_window.window.winfo_exists():
+            self._token_history_window.show()
+            return
+        self._token_history_window = TokenHistoryWindow(self.root, self._token_history_service)
 
     def _token_stats_tooltip(self, key: str) -> str:
         data = self._token_stats_by_credential.get(key)
@@ -4630,6 +4648,9 @@ del "%~f0" >nul 2>nul
 
     def _shutdown_app(self) -> None:
         self._closing = True
+        if self._token_history_window is not None and self._token_history_window.window.winfo_exists():
+            self._token_history_window.close()
+        self._token_history_service.stop()
         self._remove_tray_icon()
         self._persist_config()
         self.auth_reset_credit_service.stop()
