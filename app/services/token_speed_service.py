@@ -109,14 +109,17 @@ class TokenSpeedService:
                 print(f"[TokenSpeed] 统计失败: {exc}", flush=True)
             now = time.monotonic()
             if now >= next_tick:
-                while self._samples and self._samples[0][0] <= now - 3:
-                    self._samples.popleft()
-                self._report({"speed": max(0, sum(n for _, n in self._samples) / 3)})
+                self._report(self._speeds(now))
                 for key, state in list(self._states.items()):
                     if now - state["last"] > 300:
                         self._states.pop(key, None)
                 next_tick = now + 1
         self._report({"speed": 0})
+
+    def _speeds(self, now: float) -> dict:
+        while self._samples and self._samples[0][0] <= now - 3:
+            self._samples.popleft()
+        return {"speed": max(0, sum(n for _, n in self._samples) / 3)}
 
     def _handle(self, kind, key, data, now) -> None:
         if kind == "ws_start":
@@ -127,7 +130,8 @@ class TokenSpeedService:
             if not isinstance(payload, dict) or payload.get("type") != "response.create":
                 return
             pending = self._ws_pending.setdefault(key, deque(maxlen=128))
-            pending.append((data[0], str(payload.get("model") or ""), now, data[2] if len(data) > 2 else ""))
+            model = str(payload.get("model") or "")
+            pending.append((data[0], model, now, data[2] if len(data) > 2 else ""))
             return
         if kind == "ws_end":
             self._ws_pending.pop(key, None)
@@ -165,7 +169,7 @@ class TokenSpeedService:
             self._states[key] = {"token": hashlib.sha256(token.encode()).hexdigest(),
                                  "account_id": data[2] if len(data) > 2 else "",
                                  "model": model, "start": now, "last": now,
-                                 "buffer": b"", "parts": {}, "count": 0}
+                                 "buffer": b"", "parts": {}, "aliases": {}, "count": 0}
             return
         state = self._states.get(key)
         if state is None:
@@ -189,6 +193,62 @@ class TokenSpeedService:
         elif kind == "json":
             self._payload(key, state, data, now)
 
+    def _part_id(self, state, event, item=None):
+        item = item or {}
+        aliases = []
+        if "output_index" in event:
+            aliases.append(("index", event["output_index"]))
+        for name, value in (("item", event.get("item_id")), ("item", item.get("id")),
+                            ("call", event.get("call_id")), ("call", item.get("call_id"))):
+            if value:
+                aliases.append((name, value))
+        canonical = next((state["aliases"][alias] for alias in aliases if alias in state["aliases"]),
+                         aliases[0] if aliases else ("index", 0))
+        for alias in aliases:
+            state["aliases"][alias] = canonical
+        return canonical
+
+    def _count_part(self, state, part, text, now, complete=False):
+        if not isinstance(text, str):
+            return
+        previous = state["parts"].get(part, {"tail": "", "tail_count": 0, "total": 0, "done": False})
+        if previous["done"]:
+            return
+        encoding = self._encoding(state["model"])
+        if complete:
+            total = len(encoding.encode(text, disallowed_special=()))
+            change = total - previous["total"]
+            state["parts"][part] = {"tail": "", "tail_count": 0, "total": total, "done": True}
+        else:
+            joined = previous["tail"] + text
+            change = len(encoding.encode(joined, disallowed_special=())) - previous["tail_count"]
+            tail = joined[-256:]
+            state["parts"][part] = {"tail": tail, "tail_count": len(encoding.encode(tail, disallowed_special=())),
+                                    "total": previous["total"] + change, "done": False}
+        state["count"] += change
+        if change:
+            self._samples.append((now, change))
+
+    def _complete_item(self, state, event, item, now):
+        if not isinstance(item, dict):
+            return
+        identity = self._part_id(state, event, item)
+        kind = item.get("type")
+        if kind == "message":
+            for index, content in enumerate(item.get("content") or []):
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") == "output_text":
+                    self._count_part(state, ("response.output_text", identity, index), content.get("text"), now, True)
+                elif content.get("type") == "refusal":
+                    self._count_part(state, ("response.refusal", identity, index), content.get("refusal"), now, True)
+        elif kind in ("function_call", "custom_tool_call"):
+            name, field = ("response.function_call_arguments", "arguments") if kind == "function_call" else ("response.custom_tool_call_input", "input")
+            self._count_part(state, (name, identity, 0), item.get(field), now, True)
+        elif kind == "local_shell_call" and isinstance(item.get("action"), dict):
+            text = json.dumps(item["action"], ensure_ascii=False, separators=(",", ":"))
+            self._count_part(state, ("local_shell_call", identity, 0), text, now, True)
+
     def _payload(self, key, state, raw, now) -> None:
         try:
             event = json.loads(raw)
@@ -196,27 +256,27 @@ class TokenSpeedService:
             return
         if not isinstance(event, dict):
             return
+        state["last"] = now
         event_type = event.get("type", "")
         response = event.get("response", event)
         if not isinstance(response, dict):
             return
         if response.get("model"):
             state["model"] = response["model"]
-        if event_type in ("response.output_text.delta", "response.function_call_arguments.delta"):
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                part = (event_type, event.get("item_id", event.get("output_index", 0)), event.get("content_index", 0))
-                # 保留尾部重新分词，避免每个网络分片单独分词造成明显高估。
-                tail, old_count = state["parts"].get(part, ("", 0))
-                text = tail + delta
-                encoding = self._encoding(state["model"])
-                count = len(encoding.encode(text, disallowed_special=()))
-                change = count - old_count
-                tail = text[-256:]
-                state["parts"][part] = (tail, len(encoding.encode(tail, disallowed_special=())))
-                state["count"] += change
-                self._samples.append((now, change))
+        text_events = ("response.output_text", "response.function_call_arguments", "response.custom_tool_call_input", "response.refusal")
+        name, _, suffix = event_type.rpartition(".")
+        if name in text_events and suffix in ("delta", "done"):
+            part = (name, self._part_id(state, event), event.get("content_index", 0))
+            field = "delta" if suffix == "delta" else {"response.output_text": "text", "response.function_call_arguments": "arguments",
+                                                       "response.custom_tool_call_input": "input", "response.refusal": "refusal"}[name]
+            self._count_part(state, part, event.get(field), now, suffix == "done")
+        if event_type == "response.output_item.added" and isinstance(event.get("item"), dict):
+            self._part_id(state, event, event["item"])
+        elif event_type == "response.output_item.done":
+            self._complete_item(state, event, event.get("item"), now)
         if event_type in ("response.completed", "response.incomplete", "response.failed") or response.get("object") == "response" and response.get("status") in ("completed", "incomplete", "failed"):
+            for index, item in enumerate(response.get("output") or []):
+                self._complete_item(state, {"output_index": index}, item, now)
             usage = response.get("usage") or {}
             count = usage.get("output_tokens")
             elapsed = max(0.001, now - state["start"])

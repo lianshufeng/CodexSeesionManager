@@ -207,7 +207,7 @@ class ProxyWindow:
         self._port_entry: ttk.Entry | None = None
         self._upstream_entry: ttk.Entry | None = None
         self._traffic_status_var = tk.StringVar(value="上行: 0  下行: 0")
-        self._token_speed_var = tk.StringVar(value="输出: ≈0.0 token/s")
+        self._token_speed_var = tk.StringVar(value="0.0 token/s")
         self._token_speed_updated_at = 0.0
         self._token_stats_by_credential: dict[str, dict] = {}
         self._service_status_var = tk.StringVar(value="正在准备代理服务…")
@@ -3706,8 +3706,10 @@ del "%~f0" >nul 2>nul
 
     def _update_token_speed(self, data: dict) -> None:
         if "speed" in data:
-            self._token_speed_var.set("输出: 统计繁忙" if data['speed'] is None else f"输出: ≈{float(data['speed']):.1f} token/s")
+            output_speed = float(data.get("speed") or 0)
+            self._token_speed_var.set(f"{output_speed:.1f} token/s")
             self._token_speed_updated_at = time.monotonic()
+            self._refresh_tray_icon_tooltip()
         elif "token" in data:
             for row in self._auth_rows_by_item.values():
                 token = row.api_key if isinstance(row, RelayConfig) else row.access_token
@@ -3721,7 +3723,9 @@ del "%~f0" >nul 2>nul
         if self._closing:
             return
         if time.monotonic() - self._token_speed_updated_at > 3:
-            self._token_speed_var.set("输出: ≈0.0 token/s")
+            if self._token_speed_var.get() != "0.0 token/s":
+                self._token_speed_var.set("0.0 token/s")
+                self._refresh_tray_icon_tooltip()
         self.root.after(1000, self._tick_token_speed)
 
     def _token_stats_tooltip(self, key: str) -> str:
@@ -4563,10 +4567,11 @@ del "%~f0" >nul 2>nul
 
     def _build_tray_icon_tip(self, rows: list[AuthFileRow] | None = None) -> str:
         auth_rows = rows if rows is not None else self.auth_sync_service.list_auth_rows()
+        heading = f"{_TRAY_ICON_TIP}\n{self._token_speed_var.get()}"
         if not auth_rows:
-            return _TRAY_ICON_TIP
+            return heading
         current_refresh_token, load_refresh_token = self._get_auto_load_marks()
-        lines = [_TRAY_ICON_TIP]
+        lines = [heading]
         for row in auth_rows[:_TRAY_ICON_MAX_ROWS]:
             marks = []
             if row.refresh_token == current_refresh_token:
