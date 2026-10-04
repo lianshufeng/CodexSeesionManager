@@ -14,6 +14,7 @@ class AppConfig:
     use_upstream_proxy: bool = True
     auto_load: bool = True
     quota_warmup: bool = False
+    auto_reset_credit: bool = False
     active_credential_type: str = "codex_auth"
     active_credential_id: str = ""
     relay_previous_model_provider_line: str = ""
@@ -59,6 +60,7 @@ class AppConfigService:
             use_upstream_proxy=use_upstream_proxy,
             auto_load=auto_load,
             quota_warmup=quota_warmup,
+            auto_reset_credit=bool(data.get("auto_reset_credit", False)),
             active_credential_type=active_credential_type,
             active_credential_id=str(data.get("active_credential_id") or ""),
             relay_previous_model_provider_line=str(data.get("relay_previous_model_provider_line") or ""),
@@ -76,6 +78,7 @@ class AppConfigService:
             "use_upstream_proxy": config.use_upstream_proxy,
             "auto_load": config.auto_load,
             "quota_warmup": config.quota_warmup,
+            "auto_reset_credit": config.auto_reset_credit,
             "active_credential_type": config.active_credential_type,
             "active_credential_id": config.active_credential_id,
             "relay_previous_model_provider_line": config.relay_previous_model_provider_line,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
 from typing import Callable
@@ -22,6 +23,18 @@ class AuthResetCreditService:
         self._request_locks: dict[str, Lock] = {}
         self._proxy_provider: Callable[[], str] | None = None
         self._on_change: Callable[[], None] | None = None
+        self._auto_use_enabled = Event()
+        self._auto_attempted: dict[tuple[str, str], float] = {}
+        self._on_auto_use: Callable[[], None] | None = None
+
+    def set_auto_use_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._auto_use_enabled.set()
+        else:
+            self._auto_use_enabled.clear()
+
+    def set_auto_use_callback(self, callback: Callable[[], None]) -> None:
+        self._on_auto_use = callback
 
     def set_proxy_provider(self, provider: Callable[[], str]) -> None:
         self._proxy_provider = provider
@@ -119,6 +132,8 @@ class AuthResetCreditService:
         tokens = {row.refresh_token for row in rows}
         with self._lock:
             self._items = {key: value for key, value in self._items.items() if key in tokens}
+            self._auto_attempted = {key: expiry for key, expiry in self._auto_attempted.items()
+                                    if expiry > time.time()}
         proxy_url = self._proxy_provider() if self._proxy_provider else ""
         if rows:
             with ThreadPoolExecutor(max_workers=min(4, len(rows)), thread_name_prefix="reset-credit") as executor:
@@ -142,3 +157,50 @@ class AuthResetCreditService:
             state = ResetCreditState(previous.info if previous else None, failed=True)
         with self._lock:
             self._items[row.refresh_token] = state
+        if state.info is not None and not state.failed:
+            for _ in state.info.credits:
+                if not self._auto_use_expiring_credit(row, state.info):
+                    break
+
+    def _auto_use_expiring_credit(self, row: AuthFileRow, info: ResetCreditInfo) -> bool:
+        if not self._auto_use_enabled.is_set() or self._stop_event.is_set():
+            return False
+        now = time.time()
+        account = row.account_id or row.refresh_token
+        with self._lock:
+            credit = min((credit for credit in info.credits
+                          if info.available_count > 0 and credit.expires_at is not None
+                          and 0 < credit.expires_at - now <= 180
+                          and (account, credit.credit_id) not in self._auto_attempted),
+                         key=lambda credit: (credit.expires_at, credit.granted_at, credit.credit_id),
+                         default=None)
+        if credit is None:
+            return False
+        key = (account, credit.credit_id)
+        try:
+            current = self._current_row(row)
+            if not self._auto_use_enabled.is_set() or self._stop_event.is_set():
+                return False
+            if credit.expires_at <= time.time():
+                return False
+            with self._lock:
+                self._auto_attempted[key] = credit.expires_at
+            # 固定请求标识保证重启后仍使用同一幂等键；结果未知时不自动重试。
+            request_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"reset-credit:{key[0]}:{key[1]}"))
+            proxy_url = self._proxy_provider() if self._proxy_provider else ""
+            code = self.fetcher.consume(current.access_token, current.account_id, proxy_url,
+                                        credit.credit_id, request_id)
+            print(f"[ResetCredits] 到期自动用卡结果: {code}", flush=True)
+        except Exception as exc:
+            print(f"[ResetCredits] 到期自动用卡失败: {type(exc).__name__}", flush=True)
+        finally:
+            try:
+                self._fetch_current(row)
+            except Exception:
+                with self._lock:
+                    previous = self._items.get(row.refresh_token)
+                    self._items[row.refresh_token] = ResetCreditState(
+                        previous.info if previous else None, failed=True)
+            if self._on_auto_use:
+                self._on_auto_use()
+        return True

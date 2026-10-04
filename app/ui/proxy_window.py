@@ -140,6 +140,9 @@ class ProxyWindow:
         self.auto_load_var = tk.BooleanVar(value=auto_load_enabled)
         quota_warmup_enabled = loaded_config.quota_warmup if loaded_config is not None else False
         self.quota_warmup_var = tk.BooleanVar(value=quota_warmup_enabled)
+        self.auto_reset_credit_var = tk.BooleanVar(
+            value=loaded_config.auto_reset_credit if loaded_config is not None else False)
+        self.auth_reset_credit_service.set_auto_use_enabled(self.auto_reset_credit_var.get())
         self._active_credential_type = (
             loaded_config.active_credential_type if loaded_config is not None else CREDENTIAL_TYPE_CODEX_AUTH
         )
@@ -274,6 +277,7 @@ class ProxyWindow:
         )
         self.auth_usage_service.set_proxy_provider(self._get_proxy_for_usage_request)
         self.auth_reset_credit_service.set_proxy_provider(self._get_proxy_for_usage_request)
+        self.auth_reset_credit_service.set_auto_use_callback(self.auth_usage_service.request_refresh)
         self.auth_reset_credit_service.set_change_callback(
             lambda: self._post_ui(self._refresh_reset_credit_display)
         )
@@ -418,6 +422,13 @@ class ProxyWindow:
         quota_warmup_check.pack(side="left", padx=(8, 0))
         self._quota_warmup_check = quota_warmup_check
         self._bind_widget_tooltip(quota_warmup_check, "优先使用5小时额度不低于99%的可用账号，使额度周期尽早开始")
+        auto_reset_credit_check = ttk.Checkbutton(
+            auth_options, text="到期自动用卡", variable=self.auto_reset_credit_var,
+            command=self._on_auto_reset_credit_toggled)
+        auto_reset_credit_check.pack(side="left", padx=(8, 0))
+        self._bind_widget_tooltip(
+            auto_reset_credit_check,
+            "到期前3分钟内自动用卡。")
         self._correct_traffic_button = ttk.Button(auth_options, text="矫正流量", command=self.correct_traffic)
         self._correct_traffic_button.pack(side="right")
         self._clean_auth_button = ttk.Button(auth_options, text="清理授权", command=self.clean_auth_files)
@@ -1037,6 +1048,10 @@ class ProxyWindow:
         self._proxy_kill_next_allowed_at = next_allowed_at
         self._proxy_kill_attempt_in_flight = False
 
+    def _on_auto_reset_credit_toggled(self) -> None:
+        self.auth_reset_credit_service.set_auto_use_enabled(self.auto_reset_credit_var.get())
+        self._persist_config()
+
     def _persist_config(self) -> None:
         try:
             port = int(self.port_var.get().strip())
@@ -1052,6 +1067,7 @@ class ProxyWindow:
                 use_upstream_proxy=self.use_upstream_proxy_var.get(),
                 auto_load=self.auto_load_var.get(),
                 quota_warmup=self.quota_warmup_var.get(),
+                auto_reset_credit=self.auto_reset_credit_var.get(),
                 active_credential_type=self._active_credential_type,
                 active_credential_id=self._active_credential_id,
                 relay_previous_model_provider_line=self._relay_previous_model_provider_line,
@@ -1760,6 +1776,8 @@ class ProxyWindow:
         self.use_upstream_proxy_var.set(loaded_config.use_upstream_proxy)
         self.auto_load_var.set(loaded_config.auto_load)
         self.quota_warmup_var.set(loaded_config.quota_warmup)
+        self.auto_reset_credit_var.set(loaded_config.auto_reset_credit)
+        self.auth_reset_credit_service.set_auto_use_enabled(loaded_config.auto_reset_credit)
         self.cloud_s3_address_var.set(loaded_config.cloud_s3_address)
         self.cloud_bucket_name_var.set(loaded_config.cloud_bucket_name)
         self.cloud_account_var.set(loaded_config.cloud_account)

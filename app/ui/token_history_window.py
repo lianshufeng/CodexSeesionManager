@@ -41,7 +41,7 @@ class TokenHistoryWindow:
         self.service = service
         self.window = tk.Toplevel(root)
         self.window.title("输出速度历史")
-        self.window.geometry("820x420")
+        self.window.geometry("1000x520")
         self.window.minsize(560, 320)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self._closed = False
@@ -67,7 +67,6 @@ class TokenHistoryWindow:
         self.canvas.bind("<Configure>", lambda _: self._draw())
         self._summary = tk.StringVar(self.window, value="累计输出（估算）：正在读取…")
         ttk.Label(self.window, textvariable=self._summary, padding=(12, 8, 12, 0)).pack(anchor="w")
-        ttk.Label(self.window, text="平均值包含空闲 · 未运行时间显示断档", padding=12).pack(anchor="w")
         self._load()
         self._tick()
 
