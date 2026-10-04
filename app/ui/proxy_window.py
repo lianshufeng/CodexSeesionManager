@@ -43,7 +43,9 @@ from app.services.low_price_account_service import (
     LowPriceProductVariant,
     LowPriceSellerInfo,
 )
-from app.models import CREDENTIAL_TYPE_CODEX_AUTH, CREDENTIAL_TYPE_RELAY_API, RelayConfig
+from app.models import (CREDENTIAL_TYPE_CODEX_AUTH, CREDENTIAL_TYPE_RELAY_API, RelayConfig,
+                        LoadStrategy, CloudSyncAction, ProxyKillReason, ResetCreditResult,
+                        ProxyControlMessage, PROXY_ACK_OK, PROXY_ACK_YES, PROXY_ACK_NO)
 from app.services.relay_config_service import RelayConfigService
 from app.services.codex_local_config_service import CodexLocalConfigService
 from app.services.packaged_app_launch_service import activate_packaged_app, packaged_app_id
@@ -71,6 +73,7 @@ _UPDATES_DIR_NAME = ".updates"
 _UPDATE_EXTRACT_DIR_NAME = "extracted"
 _UPDATE_SCRIPT_NAME = "apply_update.bat"
 _LOW_PRICE_FETCH_PAGE_COUNT = 8
+_IDLE_TOKEN_SPEED_TEXT = "0.0 token/s"
 
 
 @dataclass
@@ -133,7 +136,7 @@ class ProxyWindow:
         self._tooltip_label: ttk.Label | None = None
         self._auth_menu: tk.Menu | None = None
         self._auth_load_strategy_menu: tk.Menu | None = None
-        self._auth_load_strategy_var = tk.StringVar(value="normal")
+        self._auth_load_strategy_var = tk.StringVar(value=LoadStrategy.NORMAL)
         self._auto_load_lock = Lock()
         self._proxy_lock = Lock()
         auto_load_enabled = loaded_config.auto_load if loaded_config is not None else True
@@ -168,7 +171,7 @@ class ProxyWindow:
         self._proxy_kill_pending = False
         self._proxy_kill_pending_access_token = ""
         self._proxy_kill_pending_used_access_token = ""
-        self._proxy_kill_pending_reason = ""
+        self._proxy_kill_pending_reason = ProxyKillReason.NONE
         self._proxy_kill_next_allowed_at = 0.0
         self._proxy_kill_attempt_in_flight = False
         self._manual_proxy_kill_pending = False
@@ -211,10 +214,9 @@ class ProxyWindow:
         self._port_entry: ttk.Entry | None = None
         self._upstream_entry: ttk.Entry | None = None
         self._traffic_status_var = tk.StringVar(value="上行: 0  下行: 0")
-        self._token_speed_var = tk.StringVar(value="0.0 token/s")
+        self._token_speed_var = tk.StringVar(value=_IDLE_TOKEN_SPEED_TEXT)
         self._token_speed_updated_at = 0.0
         self._token_history_service = TokenHistoryService(app_root() / "data" / "token_speed.sqlite3", metric="response_content_tokens_v1")
-        self._token_statistics_note = ""
         self._token_history_window: TokenHistoryWindow | None = None
         self._token_speed_value = 0.0
         self._service_status_var = tk.StringVar(value="正在准备代理服务…")
@@ -510,20 +512,20 @@ class ProxyWindow:
         self._auth_load_strategy_menu.add_radiobutton(
             label="正常",
             variable=self._auth_load_strategy_var,
-            value="normal",
-            command=lambda: self._set_selected_auth_load_strategy("normal"),
+            value=LoadStrategy.NORMAL,
+            command=lambda: self._set_selected_auth_load_strategy(LoadStrategy.NORMAL),
         )
         self._auth_load_strategy_menu.add_radiobutton(
             label="优先",
             variable=self._auth_load_strategy_var,
-            value="priority",
-            command=lambda: self._set_selected_auth_load_strategy("priority"),
+            value=LoadStrategy.PRIORITY,
+            command=lambda: self._set_selected_auth_load_strategy(LoadStrategy.PRIORITY),
         )
         self._auth_load_strategy_menu.add_radiobutton(
             label="禁用",
             variable=self._auth_load_strategy_var,
-            value="disabled",
-            command=lambda: self._set_selected_auth_load_strategy("disabled"),
+            value=LoadStrategy.DISABLED,
+            command=lambda: self._set_selected_auth_load_strategy(LoadStrategy.DISABLED),
         )
         self._auth_menu.add_cascade(label="负载策略", menu=self._auth_load_strategy_menu)
         self._auth_menu.add_command(label="使用重置卡", command=self._use_selected_reset_credit)
@@ -750,7 +752,7 @@ class ProxyWindow:
 
             for refresh_token, previous, current, quota in dropped_items:
                 if refresh_token == target_refresh_token:
-                    if self._proxy_kill_pending_reason == "quota_drop":
+                    if self._proxy_kill_pending_reason == ProxyKillReason.QUOTA_DROP:
                         self._clear_proxy_kill_pending_locked()
                         target_drop_message = (
                             "[AutoLoad] 当前选举 token 已出现额度下降，取消因额度未命中的断连等待"
@@ -759,12 +761,12 @@ class ProxyWindow:
 
                 state_changed = (
                     not self._proxy_kill_pending
-                    or self._proxy_kill_pending_reason != "quota_drop"
+                    or self._proxy_kill_pending_reason != ProxyKillReason.QUOTA_DROP
                     or self._proxy_kill_pending_used_access_token != refresh_token
                     or self._proxy_kill_pending_access_token != target_refresh_token
                 )
                 self._proxy_kill_pending = True
-                self._proxy_kill_pending_reason = "quota_drop"
+                self._proxy_kill_pending_reason = ProxyKillReason.QUOTA_DROP
                 self._proxy_kill_pending_access_token = target_refresh_token
                 self._proxy_kill_pending_used_access_token = refresh_token
                 if state_changed:
@@ -823,18 +825,15 @@ class ProxyWindow:
         return self._active_credential_type == CREDENTIAL_TYPE_RELAY_API
 
     def _refresh_credential_mode_state(self) -> None:
-        state = "disabled" if self._is_relay_active() else "normal"
+        state = tk.DISABLED if self._is_relay_active() else tk.NORMAL
         if self._auto_load_check is not None:
             self._auto_load_check.configure(state=state)
         if self._quota_warmup_check is not None:
             self._quota_warmup_check.configure(state=state)
         if self._is_relay_active():
-            self._token_statistics_note = "（中转直连未覆盖）"
-            self._token_speed_var.set("0.0 token/s" + self._token_statistics_note)
+            self._token_speed_var.set(_IDLE_TOKEN_SPEED_TEXT)
             self._set_auto_load_target("", "")
             self._clear_proxy_kill_pending()
-        elif getattr(self, "_token_statistics_note", "") == "（中转直连未覆盖）":
-            self._token_statistics_note = ""
 
     def _recompute_auto_load_target(self) -> None:
         if self._is_relay_active():
@@ -862,7 +861,7 @@ class ProxyWindow:
         priority_rows = [
             row
             for row in rows
-            if row.load_strategy == "priority"
+            if row.load_strategy == LoadStrategy.PRIORITY
         ]
         if priority_rows and not using_warmup:
             rows = priority_rows
@@ -889,7 +888,7 @@ class ProxyWindow:
             self._auto_load_target_account_id = account_id
             if target_changed:
                 self._auto_load_target_selected_at = time.monotonic()
-                if self._proxy_kill_pending_reason == "quota_drop":
+                if self._proxy_kill_pending_reason == ProxyKillReason.QUOTA_DROP:
                     self._clear_proxy_kill_pending_locked()
 
     def _restart_proxy_server_async(self) -> bool:
@@ -954,7 +953,7 @@ class ProxyWindow:
                 self._clear_proxy_kill_pending_locked()
                 return
             if used_access_token == target_access_token:
-                if self._proxy_kill_pending_reason != "quota_drop":
+                if self._proxy_kill_pending_reason != ProxyKillReason.QUOTA_DROP:
                     mismatch_resolved = self._proxy_kill_pending
                     self._clear_proxy_kill_pending_locked()
             else:
@@ -964,7 +963,7 @@ class ProxyWindow:
                     or self._proxy_kill_pending_used_access_token != used_access_token
                 )
                 self._proxy_kill_pending = True
-                self._proxy_kill_pending_reason = "token_mismatch"
+                self._proxy_kill_pending_reason = ProxyKillReason.TOKEN_MISMATCH
                 self._proxy_kill_pending_access_token = target_access_token
                 self._proxy_kill_pending_used_access_token = used_access_token
                 if state_changed:
@@ -985,7 +984,7 @@ class ProxyWindow:
                 self._clear_proxy_kill_pending_locked()
                 return
             if (
-                self._proxy_kill_pending_reason != "quota_drop"
+                self._proxy_kill_pending_reason != ProxyKillReason.QUOTA_DROP
                 and self._last_used_access_token
                 and self._last_used_access_token == target_access_token
             ):
@@ -1049,7 +1048,7 @@ class ProxyWindow:
         self._proxy_kill_pending = False
         self._proxy_kill_pending_access_token = ""
         self._proxy_kill_pending_used_access_token = ""
-        self._proxy_kill_pending_reason = ""
+        self._proxy_kill_pending_reason = ProxyKillReason.NONE
         self._proxy_kill_next_allowed_at = next_allowed_at
         self._proxy_kill_attempt_in_flight = False
 
@@ -1167,25 +1166,25 @@ class ProxyWindow:
         self._cloud_sync_refresh_button = ttk.Button(
             button_row,
             text="刷新",
-            command=lambda: self._run_cloud_sync_action("refresh"),
+            command=lambda: self._run_cloud_sync_action(CloudSyncAction.REFRESH),
         )
         self._cloud_sync_refresh_button.pack(side="right")
         self._cloud_sync_upload_button = ttk.Button(
             button_row,
             text="同步",
-            command=lambda: self._run_cloud_sync_action("upload"),
+            command=lambda: self._run_cloud_sync_action(CloudSyncAction.UPLOAD),
         )
         self._cloud_sync_upload_button.pack(side="right", padx=(0, 8))
         self._cloud_sync_pull_button = ttk.Button(
             button_row,
             text="拉取",
-            command=lambda: self._run_cloud_sync_action("pull"),
+            command=lambda: self._run_cloud_sync_action(CloudSyncAction.PULL),
         )
         self._cloud_sync_pull_button.pack(side="right", padx=(0, 8))
         self._cloud_sync_delete_button = ttk.Button(
             button_row,
             text="删除",
-            command=lambda: self._run_cloud_sync_action("delete"),
+            command=lambda: self._run_cloud_sync_action(CloudSyncAction.DELETE),
         )
         self._cloud_sync_delete_button.pack(side="right", padx=(0, 8))
         s3_entry.focus_set()
@@ -1218,13 +1217,13 @@ class ProxyWindow:
             return
 
         selected_version = self._get_selected_cloud_sync_version()
-        if action in {"pull", "delete"} and selected_version is None:
+        if action in {CloudSyncAction.PULL, CloudSyncAction.DELETE} and selected_version is None:
             messagebox.showwarning("云同步", "请先选择一个云端版本。", parent=self._cloud_storage_window)
             return
-        if action == "delete" and selected_version is not None:
+        if action == CloudSyncAction.DELETE and selected_version is not None:
             if not messagebox.askyesno("云同步", f"确认删除云端版本 {selected_version.name} 吗？", parent=self._cloud_storage_window):
                 return
-        if action == "pull" and selected_version is not None:
+        if action == CloudSyncAction.PULL and selected_version is not None:
             message = f"确认拉取云端版本 {selected_version.name} 并替换本地对应数据吗？"
             if not messagebox.askyesno("云同步", message, parent=self._cloud_storage_window):
                 return
@@ -1308,7 +1307,7 @@ class ProxyWindow:
         refresh_button: ttk.Button | None = None
 
         def set_buttons_state() -> None:
-            state = "disabled" if running else "normal"
+            state = tk.DISABLED if running else tk.NORMAL
             for button in (delete_button, refresh_button):
                 if button is not None:
                     button.config(state=state)
@@ -1525,16 +1524,16 @@ class ProxyWindow:
         message = ""
         error = ""
         try:
-            if action == "refresh":
+            if action == CloudSyncAction.REFRESH:
                 versions = service.list_versions()
-            elif action == "upload":
+            elif action == CloudSyncAction.UPLOAD:
                 service.sync_auth()
                 versions = service.list_versions()
-            elif action == "pull":
+            elif action == CloudSyncAction.PULL:
                 assert selected_version is not None
                 service.pull_version(selected_version.prefix)
                 versions = service.list_versions()
-            elif action == "delete":
+            elif action == CloudSyncAction.DELETE:
                 assert selected_version is not None
                 service.delete_version(selected_version.prefix)
                 versions = service.list_versions()
@@ -1555,12 +1554,12 @@ class ProxyWindow:
             messagebox.showerror("云同步失败", error, parent=self._cloud_storage_window)
             return
         self._render_cloud_sync_versions(versions)
-        if action == "pull":
+        if action == CloudSyncAction.PULL:
             self._reload_config_from_disk()
             self.auth_sync_service.invalidate_cached_state()
             self.refresh_auth_files(update_status=False)
             messagebox.showinfo("云同步", "拉取完成，已替换本地对应数据。", parent=self._cloud_storage_window)
-        elif action == "upload":
+        elif action == CloudSyncAction.UPLOAD:
             messagebox.showinfo("云同步", "同步完成。", parent=self._cloud_storage_window)
 
     def _render_cloud_sync_versions(self, versions: list[CloudSyncVersion]) -> None:
@@ -1589,7 +1588,7 @@ class ProxyWindow:
             self._cloud_sync_pull_button,
             self._cloud_sync_delete_button,
         )
-        state = "disabled" if self._cloud_sync_running else "normal"
+        state = tk.DISABLED if self._cloud_sync_running else tk.NORMAL
         for button in buttons:
             if button is not None:
                 button.config(state=state)
@@ -1756,7 +1755,7 @@ class ProxyWindow:
         self._render_cloud_sync_versions(versions)
 
     def _set_cloud_file_buttons_state(self) -> None:
-        state = "disabled" if self._cloud_file_running else "normal"
+        state = tk.DISABLED if self._cloud_file_running else tk.NORMAL
         for button in (self._cloud_file_delete_button, self._cloud_file_refresh_button):
             if button is not None:
                 button.config(state=state)
@@ -1907,17 +1906,17 @@ class ProxyWindow:
                         payload = chunks.decode("utf-8", errors="strict").strip()
                     except socket.timeout:
                         payload = ""
-                    if payload.startswith("USED "):
+                    if payload.startswith(ProxyControlMessage.USED + " "):
                         parts = payload.split()
                         token = parts[1] if len(parts) >= 2 else ""
                         if token:
-                            discovery = len(parts) >= 3 and parts[2] == "DISCOVERY"
+                            discovery = len(parts) >= 3 and parts[2] == ProxyControlMessage.DISCOVERY
                             self._post_ui(
                                 lambda value=token, is_discovery=discovery:
                                 self._on_auto_load_access_token_used(value, is_discovery)
                             )
                         continue
-                    if payload.startswith("KILL_RESULT "):
+                    if payload.startswith(ProxyControlMessage.KILL_RESULT + " "):
                         parts = payload.split()
                         try:
                             killed = int(parts[1]) if len(parts) >= 2 else 0
@@ -1925,7 +1924,7 @@ class ProxyWindow:
                             killed = 0
                         self._post_ui(lambda value=killed: self._record_proxy_kill_result(value))
                         continue
-                    if payload.startswith("MANUAL_KILL_RESULT "):
+                    if payload.startswith(ProxyControlMessage.MANUAL_KILL_RESULT + " "):
                         parts = payload.split()
                         try:
                             killed = int(parts[1]) if len(parts) >= 2 else 0
@@ -1943,9 +1942,9 @@ class ProxyWindow:
                             )
                         )
                         continue
-                    if payload.startswith("TOKEN_SPEED "):
+                    if payload.startswith(ProxyControlMessage.TOKEN_SPEED + " "):
                         try:
-                            data = json.loads(payload.removeprefix("TOKEN_SPEED "))
+                            data = json.loads(payload.removeprefix(ProxyControlMessage.TOKEN_SPEED + " "))
                         except ValueError:
                             continue
                         if isinstance(data, dict):
@@ -1956,7 +1955,7 @@ class ProxyWindow:
                             conn.sendall(b"OK\n")
                             self._post_ui(lambda value=data: self._update_token_speed(value))
                         continue
-                    if payload.startswith("TRAFFIC "):
+                    if payload.startswith(ProxyControlMessage.TRAFFIC + " "):
                         parts = payload.split()
                         if len(parts) == 3:
                             try:
@@ -1966,18 +1965,18 @@ class ProxyWindow:
                                 continue
                             self._post_ui(lambda up=up_bytes, down=down_bytes: self._on_proxy_traffic_update(up, down))
                         continue
-                    if payload == "RESELECT":
+                    if payload == ProxyControlMessage.RESELECT:
                         self._post_ui(self._recompute_auto_load_target)
                         continue
-                    if payload == "PINGPONG":
-                        conn.sendall(("1\n" if self._consume_proxy_kill_pending() else "0\n").encode("utf-8"))
+                    if payload == ProxyControlMessage.PINGPONG:
+                        conn.sendall(((PROXY_ACK_YES + "\n") if self._consume_proxy_kill_pending() else (PROXY_ACK_NO + "\n")).encode("utf-8"))
                         continue
-                    if payload == "MANUAL_KILL":
-                        conn.sendall(("1\n" if self._consume_manual_proxy_kill_pending() else "0\n").encode("utf-8"))
+                    if payload == ProxyControlMessage.MANUAL_KILL:
+                        conn.sendall(((PROXY_ACK_YES + "\n") if self._consume_manual_proxy_kill_pending() else (PROXY_ACK_NO + "\n")).encode("utf-8"))
                         continue
-                    if payload == "IDLE_TIMEOUT":
+                    if payload == ProxyControlMessage.IDLE_TIMEOUT:
                         continue
-                    if payload == "AUTH":
+                    if payload == ProxyControlMessage.AUTH:
                         conn.sendall((self._get_auto_load_target_auth_payload() + "\n").encode("utf-8"))
                         continue
                     token = self._get_auto_load_target_access_token()
@@ -2002,13 +2001,13 @@ class ProxyWindow:
             pass
 
     def _set_busy(self, busy: bool) -> None:
-        self.toggle_button.config(state="disabled" if busy else "normal")
+        self.toggle_button.config(state=tk.DISABLED if busy else tk.NORMAL)
         if busy:
             self.toggle_button.config(text="启动中...")
         self._set_config_editable(not busy)
 
     def _set_config_editable(self, enabled: bool) -> None:
-        state = "normal" if enabled else "disabled"
+        state = tk.NORMAL if enabled else tk.DISABLED
         if self._port_entry is not None:
             self._port_entry.config(state=state)
         if self._upstream_entry is not None:
@@ -2074,9 +2073,9 @@ class ProxyWindow:
         self._set_busy(False)
         # 监听端口保持锁定；二级代理地址允许在运行中修改，失焦/回车时会自动重启代理。
         if self._port_entry is not None:
-            self._port_entry.config(state="disabled")
+            self._port_entry.config(state=tk.DISABLED)
         if self._upstream_entry is not None:
-            self._upstream_entry.config(state="normal")
+            self._upstream_entry.config(state=tk.NORMAL)
         self.refresh_installs()
 
     def stop_server(self) -> None:
@@ -2432,11 +2431,11 @@ del "%~f0" >nul 2>nul
 
     def _set_update_button_busy(self, text: str) -> None:
         if self._check_update_button is not None:
-            self._check_update_button.config(text=text, state="disabled")
+            self._check_update_button.config(text=text, state=tk.DISABLED)
 
     def _set_update_button_idle(self) -> None:
         if self._check_update_button is not None:
-            self._check_update_button.config(text="↻", state="normal")
+            self._check_update_button.config(text="↻", state=tk.NORMAL)
 
     def refresh_all(self) -> None:
         install_count = self.refresh_installs(update_status=False)
@@ -2468,7 +2467,7 @@ del "%~f0" >nul 2>nul
             return
         self._correct_traffic_refreshing = True
         if self._correct_traffic_button is not None:
-            self._correct_traffic_button.config(text="刷新额度中", state="disabled")
+            self._correct_traffic_button.config(text="刷新额度中", state=tk.DISABLED)
         Thread(target=self._refresh_quota_before_correct_traffic_worker, daemon=True).start()
 
     def _refresh_quota_before_correct_traffic_worker(self) -> None:
@@ -2496,7 +2495,7 @@ del "%~f0" >nul 2>nul
             return
         self._clean_auth_refreshing = True
         if self._clean_auth_button is not None:
-            self._clean_auth_button.config(text="刷新额度中", state="disabled")
+            self._clean_auth_button.config(text="刷新额度中", state=tk.DISABLED)
         Thread(target=self._clean_auth_files_worker, daemon=True).start()
 
     def _clean_auth_files_worker(self) -> None:
@@ -2514,7 +2513,7 @@ del "%~f0" >nul 2>nul
     def _finish_clean_auth_refresh(self, refreshed_items: list[AuthQuotaItem], error: str) -> None:
         self._clean_auth_refreshing = False
         if self._clean_auth_button is not None:
-            self._clean_auth_button.config(text="清理授权", state="normal")
+            self._clean_auth_button.config(text="清理授权", state=tk.NORMAL)
         if error:
             messagebox.showerror("清理授权失败", f"刷新额度失败: {error}")
             return
@@ -2548,7 +2547,7 @@ del "%~f0" >nul 2>nul
             return
         self._refresh_tokens_running = True
         if self._refresh_tokens_button is not None:
-            self._refresh_tokens_button.config(text="刷新中", state="disabled")
+            self._refresh_tokens_button.config(text="刷新中", state=tk.DISABLED)
         proxy_url = self._upstream_proxy if self._use_upstream_proxy else ""
         Thread(target=self._refresh_all_tokens_worker, args=(proxy_url,), daemon=True).start()
 
@@ -2567,7 +2566,7 @@ del "%~f0" >nul 2>nul
     def _finish_refresh_all_tokens(self, result: AuthTokenRefreshResult, error: str) -> None:
         self._refresh_tokens_running = False
         if self._refresh_tokens_button is not None:
-            self._refresh_tokens_button.config(text="一键刷新令牌", state="normal")
+            self._refresh_tokens_button.config(text="一键刷新令牌", state=tk.NORMAL)
         if error:
             messagebox.showerror("刷新令牌失败", error)
             return
@@ -2741,9 +2740,9 @@ del "%~f0" >nul 2>nul
         if self._low_price_refresh_button is None:
             return
         if not self._low_price_refreshing:
-            self._low_price_refresh_button.config(text="刷新", state="normal")
+            self._low_price_refresh_button.config(text="刷新", state=tk.NORMAL)
             return
-        self._low_price_refresh_button.config(text="刷新中", state="disabled")
+        self._low_price_refresh_button.config(text="刷新中", state=tk.DISABLED)
 
     def _clear_low_price_detail_cache(self) -> None:
         self._low_price_seller_info_by_product_id.clear()
@@ -3141,10 +3140,10 @@ del "%~f0" >nul 2>nul
         if self._correct_traffic_button is None:
             return
         if seconds <= 0:
-            self._correct_traffic_button.config(text="矫正流量", state="normal")
+            self._correct_traffic_button.config(text="矫正流量", state=tk.NORMAL)
             self._correct_traffic_after_id = None
             return
-        self._correct_traffic_button.config(text=f"重置中 {seconds}", state="disabled")
+        self._correct_traffic_button.config(text=f"重置中 {seconds}", state=tk.DISABLED)
         self._correct_traffic_after_id = self.root.after(
             1000,
             lambda: self._update_correct_traffic_countdown(seconds - 1),
@@ -3252,7 +3251,7 @@ del "%~f0" >nul 2>nul
         end_button = ttk.Button(button_row, text="结束选中进程", command=kill_selected)
         end_button.grid(row=0, column=1)
         if not all_items:
-            end_button.config(state="disabled")
+            end_button.config(state=tk.DISABLED)
 
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         dialog.wait_window()
@@ -3406,7 +3405,7 @@ del "%~f0" >nul 2>nul
             (
                 self._is_relay_active() and row.credential_id == self._active_credential_id,
                 False,
-                "relay_api",
+                CREDENTIAL_TYPE_RELAY_API,
                 False,
                 row.credential_id,
                 row.name,
@@ -3561,9 +3560,9 @@ del "%~f0" >nul 2>nul
         return ""
 
     def _format_auth_load_strategy(self, load_strategy: str) -> str:
-        if load_strategy == "priority":
+        if load_strategy == LoadStrategy.PRIORITY:
             return "优先"
-        if load_strategy == "disabled":
+        if load_strategy == LoadStrategy.DISABLED:
             return "禁用"
         return "正常"
 
@@ -3745,12 +3744,10 @@ del "%~f0" >nul 2>nul
         return "\n".join(lines)
 
     def _update_token_speed(self, data: dict) -> None:
-        if data.get("incomplete"):
-            self._token_statistics_note = "（统计不完整）"
         if "speed" in data:
             output_speed = float(data.get("speed") or 0)
             self._token_speed_value = output_speed
-            self._token_speed_var.set(f"{output_speed:.1f} token/s{getattr(self, '_token_statistics_note', '')}")
+            self._token_speed_var.set(f"{output_speed:.1f} token/s")
             self._token_speed_updated_at = time.monotonic()
             self._refresh_tray_icon_tooltip()
 
@@ -3759,8 +3756,8 @@ del "%~f0" >nul 2>nul
             return
         if time.monotonic() - self._token_speed_updated_at > 3:
             self._token_speed_value = 0.0
-            if self._token_speed_var.get() != "0.0 token/s":
-                self._token_speed_var.set("0.0 token/s" + getattr(self, "_token_statistics_note", ""))
+            if self._token_speed_var.get() != _IDLE_TOKEN_SPEED_TEXT:
+                self._token_speed_var.set(_IDLE_TOKEN_SPEED_TEXT)
                 self._refresh_tray_icon_tooltip()
         self._token_history_service.record(self._token_speed_value)
         self.root.after(1000, self._tick_token_speed)
@@ -3875,7 +3872,7 @@ del "%~f0" >nul 2>nul
             return
         row = self._get_selected_auth_row()
         enabled = isinstance(row, AuthFileRow) and not self._reset_credit_busy
-        self._auth_menu.entryconfigure("使用重置卡", state="normal" if enabled else "disabled")
+        self._auth_menu.entryconfigure("使用重置卡", state=tk.NORMAL if enabled else tk.DISABLED)
 
     def _reset_credit_tooltip(self, refresh_token: str) -> str:
         state = self.auth_reset_credit_service.item_for(refresh_token)
@@ -3950,10 +3947,10 @@ del "%~f0" >nul 2>nul
             messagebox.showerror("使用重置卡失败", error, parent=self.root)
             return
         messages = {
-            "reset": "重置卡已使用，正在刷新额度。",
-            "already_redeemed": "本次使用请求已完成，正在刷新额度。",
-            "nothing_to_reset": "当前没有可重置的额度窗口。",
-            "no_credit": "该账户已没有可用重置卡。",
+            ResetCreditResult.RESET: "重置卡已使用，正在刷新额度。",
+            ResetCreditResult.ALREADY_REDEEMED: "本次使用请求已完成，正在刷新额度。",
+            ResetCreditResult.NOTHING_TO_RESET: "当前没有可重置的额度窗口。",
+            ResetCreditResult.NO_CREDIT: "该账户已没有可用重置卡。",
         }
         messagebox.showinfo("使用重置卡", messages.get(code, "使用结果未知，请刷新后查看。"), parent=self.root)
 
@@ -3968,9 +3965,9 @@ del "%~f0" >nul 2>nul
         self.auth_tree.focus(row_id)
         self._refresh_reset_credit_menu()
         is_relay = isinstance(row, RelayConfig)
-        self._auth_menu.entryconfigure(2, state="normal")
-        self._auth_menu.entryconfigure(3, state="normal" if is_relay else "disabled")
-        self._auth_menu.entryconfigure(4, state="disabled" if is_relay else "normal")
+        self._auth_menu.entryconfigure(2, state=tk.NORMAL)
+        self._auth_menu.entryconfigure(3, state=tk.NORMAL if is_relay else tk.DISABLED)
+        self._auth_menu.entryconfigure(4, state=tk.DISABLED if is_relay else tk.NORMAL)
         if not is_relay:
             self._auth_load_strategy_var.set(row.load_strategy)
         try:
@@ -4113,7 +4110,7 @@ del "%~f0" >nul 2>nul
             return
         self._auth_switch_running = True
         if self._auth_menu is not None:
-            self._auth_menu.entryconfig("切换", state="disabled")
+            self._auth_menu.entryconfig("切换", state=tk.DISABLED)
         Thread(target=self._activate_auth_row_worker, args=(row,), daemon=True).start()
 
     def _activate_auth_row_worker(self, row: AuthFileRow) -> None:
@@ -4134,7 +4131,7 @@ del "%~f0" >nul 2>nul
     def _finish_activate_auth_row(self, row: AuthFileRow, error: str) -> None:
         self._auth_switch_running = False
         if self._auth_menu is not None:
-            self._auth_menu.entryconfig("切换", state="normal")
+            self._auth_menu.entryconfig("切换", state=tk.NORMAL)
         if error:
             messagebox.showerror("切换失败", f"切换授权失败：{error}")
             self.refresh_auth_files()
@@ -4281,7 +4278,7 @@ del "%~f0" >nul 2>nul
         if not ok:
             messagebox.showerror("更新负载策略失败", message)
             return
-        if load_strategy == "disabled" and row.refresh_token == self._get_auto_load_target_refresh_token():
+        if load_strategy == LoadStrategy.DISABLED and row.refresh_token == self._get_auto_load_target_refresh_token():
             self._set_auto_load_target("", "")
             self._clear_proxy_kill_pending()
         if self.auto_load_var.get():
@@ -4649,7 +4646,7 @@ del "%~f0" >nul 2>nul
             if not isinstance(child, tk.Toplevel):
                 continue
             try:
-                if child.winfo_exists() and child.state() != "withdrawn":
+                if child.winfo_exists() and child.state() != tk.WITHDRAWN:
                     return
             except tk.TclError:
                 continue

@@ -1,9 +1,60 @@
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import List
 
 
-CREDENTIAL_TYPE_CODEX_AUTH = "codex_auth"
-CREDENTIAL_TYPE_RELAY_API = "relay_api"
+class CredentialType(StrEnum):
+    CODEX_AUTH = "codex_auth"
+    RELAY_API = "relay_api"
+
+
+class LoadStrategy(StrEnum):
+    NORMAL = "normal"
+    PRIORITY = "priority"
+    DISABLED = "disabled"
+
+
+class CloudSyncAction(StrEnum):
+    REFRESH = "refresh"
+    UPLOAD = "upload"
+    PULL = "pull"
+    DELETE = "delete"
+
+
+class ProxyKillReason(StrEnum):
+    NONE = ""
+    QUOTA_DROP = "quota_drop"
+    TOKEN_MISMATCH = "token_mismatch"
+
+
+class ProxyControlMessage(StrEnum):
+    AUTH = "AUTH"
+    USED = "USED"
+    DISCOVERY = "DISCOVERY"
+    RESELECT = "RESELECT"
+    PINGPONG = "PINGPONG"
+    MANUAL_KILL = "MANUAL_KILL"
+    IDLE_TIMEOUT = "IDLE_TIMEOUT"
+    KILL_RESULT = "KILL_RESULT"
+    MANUAL_KILL_RESULT = "MANUAL_KILL_RESULT"
+    TRAFFIC = "TRAFFIC"
+    TOKEN_SPEED = "TOKEN_SPEED"
+
+
+PROXY_ACK_OK = "OK"
+PROXY_ACK_YES = "1"
+PROXY_ACK_NO = "0"
+
+
+class ResetCreditResult(StrEnum):
+    RESET = "reset"
+    NOTHING_TO_RESET = "nothing_to_reset"
+    NO_CREDIT = "no_credit"
+    ALREADY_REDEEMED = "already_redeemed"
+
+
+CREDENTIAL_TYPE_CODEX_AUTH = CredentialType.CODEX_AUTH
+CREDENTIAL_TYPE_RELAY_API = CredentialType.RELAY_API
 
 
 @dataclass

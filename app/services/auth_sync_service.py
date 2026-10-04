@@ -11,13 +11,13 @@ from threading import Event, Lock, Thread
 from typing import Callable
 
 from app.utils.path_utils import app_root
-from app.models import CREDENTIAL_TYPE_CODEX_AUTH
+from app.models import CREDENTIAL_TYPE_CODEX_AUTH, LoadStrategy
 
 
 _MANAGER_METADATA_KEY = "_codex_session_manager"
-_LOAD_STRATEGY_NORMAL = "normal"
-_LOAD_STRATEGY_PRIORITY = "priority"
-_LOAD_STRATEGY_DISABLED = "disabled"
+_LOAD_STRATEGY_NORMAL = LoadStrategy.NORMAL
+_LOAD_STRATEGY_PRIORITY = LoadStrategy.PRIORITY
+_LOAD_STRATEGY_DISABLED = LoadStrategy.DISABLED
 _LOAD_STRATEGIES = {
     _LOAD_STRATEGY_NORMAL,
     _LOAD_STRATEGY_PRIORITY,

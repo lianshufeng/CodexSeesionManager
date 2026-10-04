@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enum import StrEnum
+
 import atexit
 import io
 import sys
@@ -7,6 +9,11 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
+
+
+class LogStream(StrEnum):
+    STDOUT = "stdout"
+    STDERR = "stderr"
 
 
 class _NullStream(io.TextIOBase):
@@ -104,8 +111,8 @@ class LogService:
             self._stderr_original = sys.stderr if sys.stderr is not None else sys.__stderr__
             stdout_target: io.TextIOBase | None = self._stdout_original or _NullStream()
             stderr_target: io.TextIOBase | None = self._stderr_original or _NullStream()
-            self._stdout_proxy = _TeeStream(self, stdout_target, "stdout")
-            self._stderr_proxy = _TeeStream(self, stderr_target, "stderr")
+            self._stdout_proxy = _TeeStream(self, stdout_target, LogStream.STDOUT)
+            self._stderr_proxy = _TeeStream(self, stderr_target, LogStream.STDERR)
             sys.stdout = self._stdout_proxy
             sys.stderr = self._stderr_proxy
             self._log_root.mkdir(parents=True, exist_ok=True)
@@ -134,7 +141,7 @@ class LogService:
             return
 
         with self._lock:
-            buffer = self._stdout_buffer if stream_name == "stdout" else self._stderr_buffer
+            buffer = self._stdout_buffer if stream_name == LogStream.STDOUT else self._stderr_buffer
             buffer += text
             parts = buffer.splitlines(keepends=True)
             pending = ""
@@ -147,7 +154,7 @@ class LogService:
                         self._emit_ui_callback(line)
                 else:
                     pending = part
-            if stream_name == "stdout":
+            if stream_name == LogStream.STDOUT:
                 self._stdout_buffer = pending
             else:
                 self._stderr_buffer = pending
@@ -164,7 +171,7 @@ class LogService:
             handle.write(line + "\n")
 
     def _should_persist_line(self, stream_name: str, line: str) -> bool:
-        if stream_name == "stderr":
+        if stream_name == LogStream.STDERR:
             return True
         if line.startswith(("[ProxyService]", "[AuthUsage]", "[AuthSync]", "[AutoLoad]", "[ProxyWindow]", "[TokenSpeed]")):
             return True

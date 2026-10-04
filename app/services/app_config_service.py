@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.utils.path_utils import app_root
+from app.models import CredentialType
 
 
 @dataclass
@@ -15,7 +16,7 @@ class AppConfig:
     auto_load: bool = True
     quota_warmup: bool = False
     auto_reset_credit: bool = False
-    active_credential_type: str = "codex_auth"
+    active_credential_type: str = CredentialType.CODEX_AUTH
     active_credential_id: str = ""
     relay_previous_model_provider_line: str = ""
     cloud_s3_address: str = ""
@@ -48,9 +49,10 @@ class AppConfigService:
         use_upstream_proxy = bool(data.get("use_upstream_proxy", True))
         auto_load = bool(data.get("auto_load", True))
         quota_warmup = bool(data.get("quota_warmup", False))
-        active_credential_type = str(data.get("active_credential_type") or "codex_auth")
-        if active_credential_type not in {"codex_auth", "relay_api"}:
-            active_credential_type = "codex_auth"
+        try:
+            active_credential_type = CredentialType(data.get("active_credential_type") or CredentialType.CODEX_AUTH)
+        except (TypeError, ValueError):
+            active_credential_type = CredentialType.CODEX_AUTH
         cloud_storage = data.get("cloud_storage")
         if not isinstance(cloud_storage, dict):
             cloud_storage = {}

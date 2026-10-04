@@ -4,10 +4,11 @@ import json
 from datetime import datetime, timedelta, timezone
 from urllib.request import ProxyHandler, Request, build_opener
 
-from app.models import ResetCredit, ResetCreditInfo
+from app.models import ResetCredit, ResetCreditInfo, ResetCreditResult
 
 
 _CHINA_TIMEZONE = timezone(timedelta(hours=8))
+_CREDIT_STATUS_AVAILABLE = "available"
 
 
 class ChatGPTResetCreditFetcher:
@@ -25,7 +26,7 @@ class ChatGPTResetCreditFetcher:
             "redeem_request_id": redeem_request_id,
         })
         code = payload.get("code") if isinstance(payload, dict) else None
-        if code not in {"reset", "nothing_to_reset", "no_credit", "already_redeemed"}:
+        if not isinstance(code, str) or code not in set(ResetCreditResult):
             raise ValueError("重置卡使用结果未知，请刷新后查看")
         return code
 
@@ -70,7 +71,7 @@ class ChatGPTResetCreditFetcher:
         for credit in credits:
             if not isinstance(credit, dict):
                 raise ValueError("重置卡数据格式异常")
-            if credit.get("status") != "available":
+            if credit.get("status") != _CREDIT_STATUS_AVAILABLE:
                 continue
             credit_id = credit.get("id")
             if not isinstance(credit_id, str) or not credit_id:
@@ -96,5 +97,6 @@ class ChatGPTResetCreditFetcher:
             except (AttributeError, ValueError, OverflowError):
                 raise ValueError("重置卡过期时间格式异常") from None
         expiry_times.sort()
-        timestamps = tuple(instant.timestamp() for instant, label in expiry_times if label != "无过期时间")
+        timestamps = tuple(credit.expires_at for credit in available_credits if credit.expires_at is not None)
+        timestamps = tuple(sorted(timestamps))
         return ResetCreditInfo(count, tuple(label for _, label in expiry_times), timestamps, tuple(available_credits))

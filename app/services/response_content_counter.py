@@ -2,6 +2,44 @@ from __future__ import annotations
 
 import json
 from collections import deque
+from enum import StrEnum
+
+
+_RAW_RESPONSE_COMPLETED_METHOD = 'rawResponse/completed'
+_RAW_RESPONSE_ITEM_COMPLETED_METHOD = 'rawResponseItem/completed'
+_TURN_COMPLETED_METHOD = 'turn/completed'
+_ITEM_COMPLETED_METHOD = 'item/completed'
+_RAW_RESPONSE_COMPLETED_EVENT = 'raw_response_completed'
+_RAW_RESPONSE_ITEM_EVENT = 'raw_response_item'
+_AGENT_MESSAGE_EVENT = 'agent_message'
+_AUDIO_TRANSCRIPT_DELTA_EVENT = 'response.output_audio_transcript.delta'
+_AUDIO_TRANSCRIPT_DONE_EVENT = 'response.output_audio_transcript.done'
+_OUTPUT_ITEM_ADDED_EVENT = 'response.output_item.added'
+_OUTPUT_ITEM_DONE_EVENT = 'response.output_item.done'
+_CONTENT_PART_DONE_EVENT = 'response.content_part.done'
+_RESPONSE_COMPLETED_EVENT = 'response.completed'
+_RESPONSE_INCOMPLETE_EVENT = 'response.incomplete'
+_RESPONSE_FAILED_EVENT = 'response.failed'
+_RESPONSE_DONE_EVENT = 'response.done'
+_ANONYMOUS_RESPONSE = 'anonymous'
+
+
+class ResponseItemType(StrEnum):
+    MESSAGE = "message"
+    REASONING = "reasoning"
+    FUNCTION_CALL = "function_call"
+    CUSTOM_TOOL_CALL = "custom_tool_call"
+    LOCAL_SHELL_CALL = "local_shell_call"
+    TOOL_SEARCH_CALL = "tool_search_call"
+    WEB_SEARCH_CALL = "web_search_call"
+    AGENT_MESSAGE = "agentMessage"
+    PLAN = "plan"
+
+
+class ResponseStatus(StrEnum):
+    COMPLETED = "completed"
+    INCOMPLETE = "incomplete"
+    FAILED = "failed"
 
 
 class ResponseContentCounter:
@@ -10,19 +48,19 @@ class ResponseContentCounter:
     _fields = {"output_text": "text", "refusal": "refusal", "function_call_arguments": "arguments",
                "custom_tool_call_input": "input", "reasoning_text": "text", "reasoning_summary_text": "text"}
 
-    def __init__(self, encoding, sample, ledger=None, scope="anonymous", incomplete=None) -> None:
+    def __init__(self, encoding, sample, ledger=None, scope=_ANONYMOUS_RESPONSE, incomplete=None) -> None:
         self._encoding = encoding
         self._sample = sample
         self._responses = {}
         self._finished = deque(maxlen=16)
-        self._current = "anonymous"
+        self._current = _ANONYMOUS_RESPONSE
         self._ledger = ledger
         self._scope = scope
         self._incomplete = incomplete or (lambda reason: None)
         self._generation = 0
 
     def _response_key(self):
-        if self._current == "anonymous":
+        if self._current == _ANONYMOUS_RESPONSE:
             return f"{self._scope}:anonymous:{self._generation}"
         return str(self._current)
 
@@ -100,24 +138,24 @@ class ResponseContentCounter:
             return
         identity = self._identity(state, event, item)
         kind = item.get("type")
-        if kind in ("message", "reasoning"):
+        if kind in (ResponseItemType.MESSAGE, ResponseItemType.REASONING):
             for field in ("content", "summary"):
                 for index, content in enumerate(item.get(field) or []):
                     if not isinstance(content, dict):
                         continue
                     name = content.get("type")
                     name = "reasoning_summary_text" if name == "summary_text" else name
-                    if kind == "reasoning" and name == "text":
+                    if kind == ResponseItemType.REASONING and name == "text":
                         name = "reasoning_text"
                     if name in self._fields:
                         self._part(state, (name, identity, index), content.get(self._fields[name]), now, True)
-        elif kind in ("function_call", "custom_tool_call"):
-            name = "function_call_arguments" if kind == "function_call" else "custom_tool_call_input"
+        elif kind in (ResponseItemType.FUNCTION_CALL, ResponseItemType.CUSTOM_TOOL_CALL):
+            name = "function_call_arguments" if kind == ResponseItemType.FUNCTION_CALL else "custom_tool_call_input"
             self._part(state, (name, identity, 0), item.get(self._fields[name]), now, True)
-        elif kind == "local_shell_call" and isinstance(item.get("action"), dict):
+        elif kind == ResponseItemType.LOCAL_SHELL_CALL and isinstance(item.get("action"), dict):
             self._part(state, (kind, identity, 0), json.dumps(item["action"], ensure_ascii=False), now, True)
-        elif kind in ("tool_search_call", "web_search_call"):
-            value = item.get("arguments" if kind == "tool_search_call" else "action")
+        elif kind in (ResponseItemType.TOOL_SEARCH_CALL, ResponseItemType.WEB_SEARCH_CALL):
+            value = item.get("arguments" if kind == ResponseItemType.TOOL_SEARCH_CALL else "action")
             if value is not None:
                 self._part(state, (kind, identity, 0), json.dumps(value, ensure_ascii=False), now, True)
 
@@ -146,27 +184,27 @@ class ResponseContentCounter:
             response_id = str(params.get("threadId", "")) + ":" + str(params.get("turnId", ""))
             common = {"response_id": response_id, "item_id": params.get("itemId"),
                       "summary_index": params.get("summaryIndex", params.get("contentIndex", 0))}
-            if method == "rawResponse/completed":
+            if method == _RAW_RESPONSE_COMPLETED_METHOD:
                 identity = params.get("responseId")
                 if identity and self._ledger:
                     accepted = self._ledger.usage(identity, params.get("tokenUsage"), now)
                     if params.get("threadId") and params.get("turnId") and accepted:
                         self._ledger.cover_estimate(response_id, now)
                 return
-            if method == "rawResponseItem/completed":
-                self.observe({**common, "type": "response.output_item.done", "item": params.get("item")}, now)
+            if method == _RAW_RESPONSE_ITEM_COMPLETED_METHOD:
+                self.observe({**common, "type": _OUTPUT_ITEM_DONE_EVENT, "item": params.get("item")}, now)
                 return
-            if method == "turn/completed":
+            if method == _TURN_COMPLETED_METHOD:
                 self._responses.pop(response_id, None)
                 return
             if method in methods:
                 self.observe({**common, "type": "response." + methods[method] + ".delta", "delta": params.get("delta")}, now)
-            elif method == "item/completed" and isinstance(params.get("item"), dict):
+            elif method == _ITEM_COMPLETED_METHOD and isinstance(params.get("item"), dict):
                 item = params["item"]
-                if item.get("type") in ("agentMessage", "plan"):
-                    name = "output_text" if item["type"] == "agentMessage" else "plan_text"
+                if item.get("type") in (ResponseItemType.AGENT_MESSAGE, ResponseItemType.PLAN):
+                    name = "output_text" if item["type"] == ResponseItemType.AGENT_MESSAGE else "plan_text"
                     self.observe({**common, "item_id": item.get("id"), "type": "response." + name + ".done", "text": item.get("text")}, now)
-                elif item.get("type") == "reasoning":
+                elif item.get("type") == ResponseItemType.REASONING:
                     for field, name in (("summary", "reasoning_summary_text"), ("content", "reasoning_text")):
                         for index, text in enumerate(item.get(field) or []):
                             self.observe({**common, "item_id": item.get("id"), "summary_index": index,
@@ -180,15 +218,15 @@ class ResponseContentCounter:
             identity = (str(event.get("thread_id", "")) + ":" + str(event.get("turn_id", ""))) if event.get("thread_id") else None
             event = {**event, "type": "response." + aliases[event["type"]] + ".delta",
                      "response_id": identity or event.get("response_id")}
-        if event.get("type") == "raw_response_completed":
+        if event.get("type") == _RAW_RESPONSE_COMPLETED_EVENT:
             if event.get("response_id") and self._ledger:
                 self._ledger.usage(event["response_id"], event.get("token_usage"), now)
             return
-        if event.get("type") == "raw_response_item":
-            event = {**event, "type": "response.output_item.done"}
-        if event.get("type") == "agent_message" and isinstance(event.get("message"), str):
+        if event.get("type") == _RAW_RESPONSE_ITEM_EVENT:
+            event = {**event, "type": _OUTPUT_ITEM_DONE_EVENT}
+        if event.get("type") == _AGENT_MESSAGE_EVENT and isinstance(event.get("message"), str):
             event = {**event, "type": "response.output_text.done", "text": event["message"]}
-        if event.get("type") in ("response.output_audio_transcript.delta", "response.output_audio_transcript.done"):
+        if event.get("type") in (_AUDIO_TRANSCRIPT_DELTA_EVENT, _AUDIO_TRANSCRIPT_DONE_EVENT):
             event = {**event, "type": event["type"].replace("output_audio_transcript", "output_text"),
                      "text": event.get("transcript")}
         response = event.get("response") or event
@@ -208,16 +246,16 @@ class ResponseContentCounter:
             self._incomplete("响应 ID 无效，统计不完整")
             return
         if response_id:
-            if response_id not in self._responses and "anonymous" in self._responses and len(self._responses) == 1:
+            if response_id not in self._responses and _ANONYMOUS_RESPONSE in self._responses and len(self._responses) == 1:
                 if self._ledger:
                     self._ledger.rename(self._response_key(), response_id)
-                self._responses[response_id] = self._responses.pop("anonymous")
+                self._responses[response_id] = self._responses.pop(_ANONYMOUS_RESPONSE)
             self._current = response_id
         response_id = response_id or self._current
         if self._ledger:
             self._ledger.usage(self._response_key(), response.get("usage"), now)
         if response_id in self._finished or (self._ledger and self._ledger.finished(self._response_key())):
-            self._current = next(reversed(self._responses), "anonymous")
+            self._current = next(reversed(self._responses), _ANONYMOUS_RESPONSE)
             return
         if response_id not in self._responses:
             if len(self._responses) >= 128:
@@ -240,11 +278,11 @@ class ResponseContentCounter:
                 self._part(state, (name, identity, index), event["delta"], now)
             elif suffix == "done" and isinstance(event.get("text"), str) and "audio" not in name:
                 self._part(state, (name, self._identity(state, event), index), event["text"], now, True)
-        if event_type == "response.output_item.added":
+        if event_type == _OUTPUT_ITEM_ADDED_EVENT:
             self._identity(state, event, event.get("item"))
-        elif event_type == "response.output_item.done":
+        elif event_type == _OUTPUT_ITEM_DONE_EVENT:
             self._item(state, event, event.get("item"), now)
-        elif event_type == "response.content_part.done" and isinstance(event.get("part"), dict):
+        elif event_type == _CONTENT_PART_DONE_EVENT and isinstance(event.get("part"), dict):
             part = event["part"]
             name = part.get("type")
             if name in self._fields:
@@ -263,18 +301,18 @@ class ResponseContentCounter:
                 if isinstance(tool, dict) and isinstance(tool.get("function"), dict):
                     self._part(state, ("tool", choice_id, tool.get("index", tool_index)), tool["function"].get("arguments"), now, complete)
         chat_final = bool(event.get("choices")) and all(isinstance(choice, dict) and ("message" in choice or choice.get("finish_reason") is not None) for choice in event["choices"])
-        terminal = event_type in ("response.completed", "response.incomplete", "response.failed", "response.done") or chat_final
+        terminal = event_type in (_RESPONSE_COMPLETED_EVENT, _RESPONSE_INCOMPLETE_EVENT, _RESPONSE_FAILED_EVENT, _RESPONSE_DONE_EVENT) or chat_final
         final = terminal or response.get("object") == "response"
         if final:
             for output_index, item in enumerate(response.get("output") or []):
                 self._item(state, {"output_index": output_index}, item, now)
-            if terminal or response.get("status") in ("completed", "incomplete", "failed"):
+            if terminal or response.get("status") in (ResponseStatus.COMPLETED, ResponseStatus.INCOMPLETE, ResponseStatus.FAILED):
                 self._responses.pop(response_id, None)
-                if self._ledger and response_id != "anonymous":
+                if self._ledger and response_id != _ANONYMOUS_RESPONSE:
                     self._ledger.finish(self._response_key())
-                if response_id == "anonymous":
+                if response_id == _ANONYMOUS_RESPONSE:
                     self._generation += 1
                 else:
                     self._finished.append(response_id)
-                    self._current = next(reversed(self._responses), "anonymous")
+                    self._current = next(reversed(self._responses), _ANONYMOUS_RESPONSE)
                     self._generation += 1

@@ -61,14 +61,14 @@ class TokenHistoryWindow:
         selector = ttk.Combobox(controls, textvariable=self._range, values=list(self._ranges), state="readonly", width=16)
         selector.pack(side="left")
         selector.bind("<<ComboboxSelected>>", lambda _: self._load())
-        self._reload_button = ttk.Button(controls, text="重新读取", command=self._load)
+        self._reload_button = ttk.Button(controls, text="刷新", command=self._load)
         self._reload_button.pack(side="left", padx=8)
-        self._status = tk.StringVar(self.window, value="正在读取历史…")
+        self._status = tk.StringVar(self.window, value="正在加载…")
         ttk.Label(controls, textvariable=self._status).pack(side="right")
         self.canvas = tk.Canvas(self.window, background="#ffffff", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=12)
         self.canvas.bind("<Configure>", lambda _: self._draw())
-        self._summary = tk.StringVar(self.window, value="累计输出（估算）：正在读取…")
+        self._summary = tk.StringVar(self.window, value="正在加载用量…")
         ttk.Label(self.window, textvariable=self._summary, padding=(12, 8, 12, 0)).pack(anchor="w")
         self._load()
         self._tick()
@@ -81,13 +81,13 @@ class TokenHistoryWindow:
         now = int(time.time())
         self._samples = {}
         self._read_error = ""
-        self._reload_button.configure(state="disabled")
+        self._reload_button.configure(state=tk.DISABLED)
         self._future = self.service.read_async(now - self._ranges[self._range.get()], now)
         self._totals_future = self.service.read_totals_async(now - self._ranges[self._range.get()], now)
         self._totals = None
         self._totals_at = time.monotonic()
-        self._status.set("正在读取历史…")
-        self._summary.set("累计输出（估算）：正在读取…")
+        self._status.set("正在加载…")
+        self._summary.set("正在加载用量…")
         self._last_draw = 0.0
 
     def _tick(self) -> None:
@@ -100,7 +100,7 @@ class TokenHistoryWindow:
             except Exception as exc:
                 self._read_error = f"读取失败: {exc}"
             self._future = None
-            self._reload_button.configure(state="normal")
+            self._reload_button.configure(state=tk.NORMAL)
             loading = False
         now = int(time.time())
         since = now - self._ranges[self._range.get()]
@@ -118,13 +118,13 @@ class TokenHistoryWindow:
         if not loading:
             speeds = list(self._samples.values())
             if self.service.error or self._read_error:
-                self._status.set(self.service.error or self._read_error)
-                self._summary.set("累计输出（估算）：数据不完整，暂不汇总")
+                self._status.set("加载失败，请点击“刷新”重试")
+                self._summary.set("用量暂时无法加载")
             elif speeds:
                 latest = max(self._samples)
                 current = self._samples[latest] if now - latest <= 2 else 0
                 self._status.set(f"当前 {current:.1f} · 平均 {sum(speeds)/len(speeds):.1f} · 最高 {max(speeds):.1f} token/s")
-                self._summary.set("用量正在读取；旧速度采样不折算为实际消耗")
+                self._summary.set("正在加载用量…")
             else:
                 self._status.set("暂无历史记录")
                 self._summary.set("暂无用量记录")
@@ -182,11 +182,9 @@ def format_token_totals(totals):
     """官方用量与没有 usage 的可见输出估算分开显示。"""
     pieces = []
     if totals["official_responses"]:
-        pieces.append(f"官方用量：输入 {totals['input']:,}（缓存 {totals['cached_input']:,}） · 输出 {totals['output']:,}（推理 {totals['reasoning_output']:,}） · 总计 {totals['total']:,}")
+        pieces.append(f"输入 {totals['input']:,}（缓存 {totals['cached_input']:,}） · 输出 {totals['output']:,}（推理 {totals['reasoning_output']:,}） · 总计 {totals['total']:,}")
     if totals["estimated_responses"]:
-        pieces.append(f"无官方用量的可见输出估算：{totals['estimate']:,}")
+        pieces.append(f"流式输出 {totals['estimate']:,}")
     if not pieces:
-        pieces.append("暂无新用量记录；旧速度曲线不计入累计")
-    if totals.get("incomplete"):
-        pieces.append("统计不完整：" + "；".join(sorted(set(totals["incomplete"]))))
+        pieces.append("暂无用量记录")
     return " · ".join(pieces)

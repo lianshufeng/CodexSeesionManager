@@ -11,6 +11,7 @@ from app.services.response_token_speed_service import prepare_tokenizer_cache
 tokenizer_cache = project_root / "app/services/tokenizer_cache"
 prepare_tokenizer_cache(tokenizer_cache)
 include_files = [
+    ("app/models.py", "models.py"),
     (str(tokenizer_cache), "lib/app/services/tokenizer_cache"),
     ("app/services/response_token_speed_service.py", "response_token_speed_service.py"),
     ("app/services/response_content_counter.py", "response_content_counter.py"),

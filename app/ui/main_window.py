@@ -125,11 +125,11 @@ class MainWindow:
         self.root.destroy()
 
     def open_browser(self) -> None:
-        self.open_button.config(state="disabled")
+        self.open_button.config(state=tk.DISABLED)
         Thread(target=self._open_worker, daemon=True).start()
 
     def attach_browser(self) -> None:
-        self.attach_button.config(state="disabled")
+        self.attach_button.config(state=tk.DISABLED)
         Thread(target=self._attach_worker, daemon=True).start()
 
     def _open_worker(self) -> None:
@@ -151,7 +151,7 @@ class MainWindow:
                 self._start_open_monitor()
         finally:
             if message:
-                self.open_button.config(state="normal")
+                self.open_button.config(state=tk.NORMAL)
 
     def _start_open_monitor(self) -> None:
         self._cancel_open_monitor()
@@ -171,7 +171,7 @@ class MainWindow:
         self.chrome_pid = None
         self.attach_active = False
         self.attach_button.pack_forget()
-        self.open_button.config(text="打开", state="normal")
+        self.open_button.config(text="打开", state=tk.NORMAL)
         self.open_button.pack(side="right", padx=(0, 8))
 
     def _apply_attach_result(self, data: SessionViewData, message: str) -> None:
@@ -182,11 +182,11 @@ class MainWindow:
             self._render_profile(data)
             self._render_accounts(data)
             self.attach_active = True
-            self.attach_button.config(text="附加成功", state="disabled")
+            self.attach_button.config(text="附加成功", state=tk.DISABLED)
             self._start_attach_monitor()
         finally:
             if message:
-                self.attach_button.config(state="normal")
+                self.attach_button.config(state=tk.NORMAL)
             self.root.title("Codex Session Manager")
 
     def _start_attach_monitor(self) -> None:

@@ -15,3 +15,4 @@
 /app/services/tokenizer_cache
 /tests/*
 !/tests/test_token_statistics_regression.py
+/tests

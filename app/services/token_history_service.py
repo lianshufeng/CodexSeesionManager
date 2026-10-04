@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enum import StrEnum
+
 import logging
 import json
 import math
@@ -10,6 +12,13 @@ from concurrent.futures import Future
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
+
+
+class HistoryTask(StrEnum):
+    RECORD = "record"
+    REPORT = "report"
+    TOTALS = "totals"
+    READ = "read"
 
 
 class TokenHistoryService:
@@ -39,9 +48,9 @@ class TokenHistoryService:
             else:
                 self._recent.append(sample)
         try:
-            self._queue.put_nowait(("record", sample))
+            self._queue.put_nowait((HistoryTask.RECORD, sample))
         except Full:
-            self._set_error("历史记录队列已满，部分记录未保存")
+            self._set_error("历史记录队列已满，部分记录未保存", incomplete=True)
 
     def recent(self, since: int) -> list[tuple[int, float]]:
         with self._lock:
@@ -53,17 +62,17 @@ class TokenHistoryService:
             result.set_exception(RuntimeError("历史服务已停止"))
             return result
         try:
-            self._queue.put_nowait(("read", (since, until, result)))
+            self._queue.put_nowait((HistoryTask.READ, (since, until, result)))
         except Full:
             result.set_exception(RuntimeError("历史服务繁忙，请稍后重试"))
         return result
 
     def record_report(self, report: dict) -> Future:
         """记录响应快照；相同 ID 覆盖修正，不依赖 UI 采样和回报重试次数。"""
-        return self._request("report", report)
+        return self._request(HistoryTask.REPORT, report)
 
     def read_totals_async(self, since: int, until: int) -> Future:
-        return self._request("totals", (since, until))
+        return self._request(HistoryTask.TOTALS, (since, until))
 
     def _request(self, kind, value):
         result = Future()
@@ -73,7 +82,7 @@ class TokenHistoryService:
         try:
             self._queue.put_nowait((kind, (value, result)))
         except Full:
-            self._set_error("历史记录队列已满，统计不完整")
+            self._set_error("历史记录队列已满，统计不完整", incomplete=True)
             result.set_exception(RuntimeError(self.error))
         return result
 
@@ -83,11 +92,11 @@ class TokenHistoryService:
         if self._thread.is_alive():
             self._set_error("历史记录尚未完成写入")
 
-    def _set_error(self, message: str) -> None:
+    def _set_error(self, message: str, *, incomplete: bool = False) -> None:
         if message != self.error:
             logging.getLogger(__name__).warning(message)
         self.error = message
-        if "不完整" in message or "未保存" in message:
+        if incomplete:
             self._statistics_incomplete = message
 
     def _run(self) -> None:
@@ -119,9 +128,9 @@ class TokenHistoryService:
                     kind, value = self._queue.get(timeout=min(1, max(0, next_flush - time.monotonic())))
                 except Empty:
                     kind, value = "", None
-                if kind == "record":
+                if kind == HistoryTask.RECORD:
                     pending[value[0]] = value[1]
-                elif kind == "report":
+                elif kind == HistoryTask.REPORT:
                     report, result = value
                     try:
                         with connection:
@@ -138,9 +147,9 @@ class TokenHistoryService:
                                                    (session, int(time.time()), json.dumps(sorted(reasons), ensure_ascii=False)))
                         result.set_result(True)
                     except Exception as exc:
-                        self._set_error(f"保存用量失败，统计不完整: {exc}")
+                        self._set_error(f"保存用量失败，统计不完整: {exc}", incomplete=True)
                         result.set_exception(exc)
-                elif kind == "totals":
+                elif kind == HistoryTask.TOTALS:
                     (since, until), result = value
                     try:
                         totals = dict(input=0, output=0, cached_input=0, cache_write_input=0,
@@ -160,7 +169,7 @@ class TokenHistoryService:
                         result.set_result(totals)
                     except Exception as exc:
                         result.set_exception(exc)
-                elif kind == "read":
+                elif kind == HistoryTask.READ:
                     since, until, result = value
                     try:
                         rows = dict(connection.execute("SELECT timestamp, speed FROM samples WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp", (since, until)))
@@ -193,9 +202,9 @@ class TokenHistoryService:
                     kind, value = self._queue.get_nowait()
                 except Empty:
                     break
-                if kind == "read":
+                if kind == HistoryTask.READ:
                     value[2].set_exception(RuntimeError(self.error or "历史服务已停止"))
-                elif kind in ("report", "totals"):
+                elif kind in (HistoryTask.REPORT, HistoryTask.TOTALS):
                     value[1].set_exception(RuntimeError(self.error or "历史服务已停止"))
 
     def _flush(self, connection, pending: dict[int, float]) -> None:

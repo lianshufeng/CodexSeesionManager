@@ -9,6 +9,11 @@ from urllib.parse import quote, urlencode, unquote
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 
+_STOCK_UNAVAILABLE = "无货"
+_STOCK_AVAILABLE = "有货"
+_SALES_FIELD = "sales"
+
+
 @dataclass(frozen=True, slots=True)
 class LowPriceAccount:
     product_id: str
@@ -94,13 +99,13 @@ class _LowPriceAccountParser(HTMLParser):
             and self._has_class(classes, "footnote-regular")
             and (self._has_class(classes, "color-text-tertiary") or self._has_class(classes, "card-secondary-text"))
         ):
-            self._begin_capture("sales", tag)
+            self._begin_capture(_SALES_FIELD, tag)
 
     def handle_endtag(self, tag: str) -> None:
         if self._current is not None and self._capture_key and tag == self._capture_tag and self._depth == self._capture_depth:
             value = self._normalize_text("".join(self._capture_parts))
-            if self._capture_key != "sales" or value.lower().startswith("sold"):
-                if self._capture_key == "sales":
+            if self._capture_key != _SALES_FIELD or value.lower().startswith("sold"):
+                if self._capture_key == _SALES_FIELD:
                     value = self._normalize_sales(value)
                 self._current[self._capture_key] = value
             self._capture_key = ""
@@ -117,7 +122,7 @@ class _LowPriceAccountParser(HTMLParser):
                         product_id=product_id,
                         title=title,
                         price=self._current.get("price", ""),
-                        sales=self._current.get("sales", ""),
+                        sales=self._current.get(_SALES_FIELD, ""),
                         href=self._current.get("href", ""),
                     )
                 )
@@ -176,7 +181,7 @@ class _LowPriceOptionParser(HTMLParser):
                 "item_id": attr_map.get("data-item-id", ""),
                 "disabled": "1" if "disabled" in attr_map else "",
                 "price": self._normalize_price_delta(attr_map.get("data-delta-price", "")),
-                "stock": "无货" if "disabled" in attr_map else "有货",
+                "stock": _STOCK_UNAVAILABLE if "disabled" in attr_map else _STOCK_AVAILABLE,
             }
             return
         if tag == "label" and self._current is not None:
@@ -192,7 +197,7 @@ class _LowPriceOptionParser(HTMLParser):
             label = re.sub(r"(out of stock|нет в наличии)", "", label, flags=re.IGNORECASE).strip()
             self._current["name"] = label
             if re.search(r"(out of stock|нет в наличии)", " ".join(self._label_parts), re.IGNORECASE):
-                self._current["stock"] = "无货"
+                self._current["stock"] = _STOCK_UNAVAILABLE
             if self._current.get("option_id") and self._current.get("value_id") and label:
                 self.options.append(self._current)
             self._current = None
@@ -413,7 +418,7 @@ class LowPriceAccountService:
     def _fetch_variant_prices(self, options: list[dict[str, str]], proxy_url: str) -> list[LowPriceProductVariant]:
         selected_options = options[:8]
         prices = {index: "" for index in range(len(selected_options))}
-        price_indexes = [index for index, option in enumerate(selected_options) if option.get("stock") != "无货"]
+        price_indexes = [index for index, option in enumerate(selected_options) if option.get("stock") != _STOCK_UNAVAILABLE]
         if price_indexes:
             with ThreadPoolExecutor(max_workers=min(8, len(price_indexes))) as executor:
                 futures = {

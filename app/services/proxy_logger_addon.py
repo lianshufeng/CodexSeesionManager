@@ -12,6 +12,12 @@ from threading import Event, Lock, Thread
 
 from mitmproxy import http
 try:
+    from app.models import CredentialType, ProxyControlMessage, PROXY_ACK_OK, PROXY_ACK_YES
+except ModuleNotFoundError as exc:
+    if exc.name != "app":
+        raise
+    from models import CredentialType, ProxyControlMessage, PROXY_ACK_OK, PROXY_ACK_YES
+try:
     from app.services.response_token_speed_service import ResponseTokenSpeedService
 except ModuleNotFoundError as exc:
     if exc.name != "app":
@@ -19,8 +25,8 @@ except ModuleNotFoundError as exc:
     from response_token_speed_service import ResponseTokenSpeedService
 
 
-_RESELECT_EVENT = "RESELECT"
-_IDLE_TIMEOUT_EVENT = "IDLE_TIMEOUT"
+_RESELECT_EVENT = ProxyControlMessage.RESELECT
+_IDLE_TIMEOUT_EVENT = ProxyControlMessage.IDLE_TIMEOUT
 _MIB_TCP_STATE_DELETE_TCB = 12
 _CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 _SELECTED_AUTH_METADATA_KEY = "codex_session_selected_auth_token"
@@ -211,7 +217,7 @@ class ProxyLoggerAddon:
             if not self._should_manual_disconnect():
                 continue
             killed, tracked, reset = self._kill_active_flows_with_stats()
-            self._report_control_event(f"MANUAL_KILL_RESULT {killed} {tracked} {reset}")
+            self._report_control_event(f"{ProxyControlMessage.MANUAL_KILL_RESULT} {killed} {tracked} {reset}")
             _log(f"手动矫正流量，tracked={tracked} reset={reset} killed={killed}")
 
     def _get_selected_auth(self) -> tuple[str, str, str]:
@@ -225,7 +231,7 @@ class ProxyLoggerAddon:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2) as conn:
                 conn.settimeout(0.2)
-                conn.sendall(b"AUTH\n")
+                conn.sendall((ProxyControlMessage.AUTH + "\n").encode("utf-8"))
                 data = conn.recv(4096)
         except OSError:
             return "", "", ""
@@ -241,7 +247,7 @@ class ProxyLoggerAddon:
         return (
             str(auth.get("access_token") or ""),
             str(auth.get("account_id") or ""),
-            str(auth.get("relay_model") or "").strip() if auth.get("credential_type") == "relay_api" else "",
+            str(auth.get("relay_model") or "").strip() if auth.get("credential_type") == CredentialType.RELAY_API else "",
         )
 
     def _rewrite_auth_headers(self, flow: http.HTTPFlow, access_token: str, account_id: str) -> bool:
@@ -423,11 +429,11 @@ class ProxyLoggerAddon:
         return total
 
     def _report_traffic(self) -> None:
-        self._report_control_event(f"TRAFFIC {self._upload_bytes} {self._download_bytes}")
+        self._report_control_event(f"{ProxyControlMessage.TRAFFIC} {self._upload_bytes} {self._download_bytes}")
 
     def _report_token_speed(self, data: dict) -> bool:
-        return self._send_control_message("TOKEN_SPEED " + json.dumps(data, separators=(",", ":")),
-                                          read_response=True) == "OK"
+        return self._send_control_message(ProxyControlMessage.TOKEN_SPEED + " " + json.dumps(data, separators=(",", ":")),
+                                          read_response=True) == PROXY_ACK_OK
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
         resp = flow.response
@@ -463,8 +469,8 @@ class ProxyLoggerAddon:
             return
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2) as conn:
-                suffix = " DISCOVERY" if workspace_discovery else ""
-                conn.sendall(f"USED {access_token}{suffix}\n".encode("utf-8"))
+                suffix = " " + ProxyControlMessage.DISCOVERY if workspace_discovery else ""
+                conn.sendall(f"{ProxyControlMessage.USED} {access_token}{suffix}\n".encode("utf-8"))
         except OSError:
             return
 
@@ -496,17 +502,17 @@ class ProxyLoggerAddon:
     def handle_ping_pong_log(self) -> None:
         if self._should_disconnect_on_pingpong():
             killed, _tracked, _reset = self._kill_active_flows_with_stats(websocket_only=True)
-            self._report_control_event(f"KILL_RESULT {killed}")
+            self._report_control_event(f"{ProxyControlMessage.KILL_RESULT} {killed}")
             if killed > 0:
                 _log(f"ping/pong 命中，已断开 {killed} 个代理连接")
             else:
                 _log("ping/pong 命中，但未找到可断开的代理连接")
 
     def _should_disconnect_on_pingpong(self) -> bool:
-        return self._send_control_message("PINGPONG", read_response=True) == "1"
+        return self._send_control_message(ProxyControlMessage.PINGPONG, read_response=True) == PROXY_ACK_YES
 
     def _should_manual_disconnect(self) -> bool:
-        return self._send_control_message("MANUAL_KILL", read_response=True) == "1"
+        return self._send_control_message(ProxyControlMessage.MANUAL_KILL, read_response=True) == PROXY_ACK_YES
 
     def client_connected(self, *args, **kwargs) -> None:
         self._mark_activity()

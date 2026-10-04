@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enum import StrEnum
+
 import codecs
 import hashlib
 import json
@@ -43,6 +45,22 @@ def prepare_tokenizer_cache(cache: Path) -> None:
             raise ValueError("分词数据校验失败")
         target.write_bytes(content)
     os.environ["TIKTOKEN_CACHE_DIR"] = str(cache)
+
+
+class ContentEncoding(StrEnum):
+    GZIP = "gzip"
+    DEFLATE = "deflate"
+    BR = "br"
+    ZSTD = "zstd"
+    IDENTITY = "identity"
+
+
+class ObservationKind(StrEnum):
+    ISSUE = "issue"
+    FILE = "file"
+    DATA = "data"
+    END = "end"
+    MESSAGE_END = "message_end"
 
 
 class ResponseTokenSpeedService:
@@ -97,7 +115,7 @@ class ResponseTokenSpeedService:
         now = time.monotonic()
         if len(raw) > 65536:
             if len(raw) > 256 * 1024 * 1024:
-                self._submit(("issue", key, "消息超过 256 MiB，统计不完整", "", now))
+                self._submit((ObservationKind.ISSUE, key, "消息超过 256 MiB，统计不完整", "", now))
                 return
             with self._capture_lock:
                 if self._capture_bytes + len(raw) > 256 * 1024 * 1024:
@@ -115,21 +133,21 @@ class ResponseTokenSpeedService:
                     capture.close()
                 with self._capture_lock:
                     self._capture_bytes -= len(raw)
-                self._submit(("issue", key, "消息溢写失败，统计不完整", "", now))
+                self._submit((ObservationKind.ISSUE, key, "消息溢写失败，统计不完整", "", now))
                 return
-            if not self._submit(("file", key, capture, encoding, now)):
+            if not self._submit((ObservationKind.FILE, key, capture, encoding, now)):
                 self._release_capture(capture)
             return
         # 限制队列载荷为约 16 MiB，分词和解压均不阻塞代理转发。
         for offset in range(0, len(raw), 65536):
-            if not self._submit(("data", key, raw[offset:offset + 65536], encoding, now)):
+            if not self._submit((ObservationKind.DATA, key, raw[offset:offset + 65536], encoding, now)):
                 break
 
     def end(self, key: str) -> None:
-        self._submit(("end", key, b"", "", time.monotonic()))
+        self._submit((ObservationKind.END, key, b"", "", time.monotonic()))
 
     def message_end(self, key: str) -> None:
-        self._submit(("message_end", key, b"", "", time.monotonic()))
+        self._submit((ObservationKind.MESSAGE_END, key, b"", "", time.monotonic()))
 
     def _submit(self, item) -> bool:
         try:
@@ -190,28 +208,28 @@ class ResponseTokenSpeedService:
             self._buckets.append((bucket, change))
 
     def _handle(self, kind, key, raw, encoding, now) -> None:
-        if kind == "issue":
+        if kind == ObservationKind.ISSUE:
             self._mark_incomplete(raw)
             return
-        if kind == "file":
+        if kind == ObservationKind.FILE:
             try:
                 while chunk := raw.read(65536):
-                    self._handle("data", key, chunk, encoding, now)
+                    self._handle(ObservationKind.DATA, key, chunk, encoding, now)
             finally:
                 self._release_capture(raw)
             return
         state = self._streams.get(key)
         if state is None:
-            if kind in ("end", "message_end"):
+            if kind in (ObservationKind.END, ObservationKind.MESSAGE_END):
                 return
             decoder = None
-            if encoding in ("gzip", "deflate"):
-                decoder = zlib.decompressobj(31 if encoding == "gzip" else 15)
-            elif encoding == "br":
+            if encoding in (ContentEncoding.GZIP, ContentEncoding.DEFLATE):
+                decoder = zlib.decompressobj(31 if encoding == ContentEncoding.GZIP else 15)
+            elif encoding == ContentEncoding.BR:
                 decoder = brotli.Decompressor()
-            elif encoding == "zstd":
+            elif encoding == ContentEncoding.ZSTD:
                 decoder = zstandard.ZstdDecompressor().decompressobj()
-            elif encoding not in ("", "identity"):
+            elif encoding not in ("", ContentEncoding.IDENTITY):
                 raise ValueError("不支持的响应压缩格式")
             if len(self._streams) >= 128:
                 self._close_stream(next(iter(self._streams)))
@@ -227,26 +245,26 @@ class ResponseTokenSpeedService:
                                                      self._mark_incomplete, key.startswith("sse:"))
             self._streams[key] = state
         decoder = state["decoder"]
-        if kind in ("end", "message_end"):
+        if kind in (ObservationKind.END, ObservationKind.MESSAGE_END):
             if decoder is not None and hasattr(decoder, "flush"):
                 self._count(state, state["utf8"].decode(decoder.flush()), now)
             self._count(state, state["utf8"].decode(b"", final=True), now)
             if state["payload"].sse:
                 self._count(state, "\n\n", now)
             state["payload"].end(now)
-            if kind == "end":
+            if kind == ObservationKind.END:
                 self._close_stream(key)
             else:
                 state["buffer"] = ""
                 state["skip_event"] = False
                 state["utf8"] = codecs.getincrementaldecoder("utf-8")("replace")
-        elif encoding in ("gzip", "deflate"):
+        elif encoding in (ContentEncoding.GZIP, ContentEncoding.DEFLATE):
             while raw:
                 decoded = decoder.decompress(raw, 65536)
                 self._count(state, state["utf8"].decode(decoded), now)
                 raw = decoder.unconsumed_tail
         else:
-            decoded = decoder.process(raw) if encoding == "br" else decoder.decompress(raw) if decoder else raw
+            decoded = decoder.process(raw) if encoding == ContentEncoding.BR else decoder.decompress(raw) if decoder else raw
             self._count(state, state["utf8"].decode(decoded), now)
 
     def _speed(self) -> float:
@@ -274,7 +292,7 @@ class ResponseTokenSpeedService:
                 while True:
                     try:
                         dropped = self._queue.get_nowait()
-                        if dropped[0] == "file":
+                        if dropped[0] == ObservationKind.FILE:
                             self._release_capture(dropped[2])
                     except Empty:
                         break
