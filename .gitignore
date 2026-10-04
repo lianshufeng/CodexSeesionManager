@@ -7,9 +7,11 @@
 /build
 /auth
 /data/token_speed.sqlite3*
+/data/token_statistics_outbox.sqlite3*
 /.idea
 
 *.log
 *.pyc
 /app/services/tokenizer_cache
-/tests
+/tests/*
+!/tests/test_token_statistics_regression.py

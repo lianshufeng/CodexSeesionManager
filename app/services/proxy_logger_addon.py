@@ -7,6 +7,7 @@ import os
 import socket
 import sys
 import time
+from pathlib import Path
 from threading import Event, Lock, Thread
 
 from mitmproxy import http
@@ -71,7 +72,10 @@ class ProxyLoggerAddon:
         self._download_bytes = 0
         self._live_flows: dict[str, object] = {}
         self._last_relay_model_rewrite_log = ""
-        self._token_speed = ResponseTokenSpeedService(self._report_token_speed)
+        source = Path(__file__).resolve()
+        root = source.parents[2] if source.parent.name == "services" else source.parent
+        ledger_path = os.environ.get("CODEX_TOKEN_LEDGER_PATH") or root / "data" / "token_statistics_outbox.sqlite3"
+        self._token_speed = ResponseTokenSpeedService(self._report_token_speed, ledger_path)
 
     def load(self, loader) -> None:
         _log("日志插件已加载")
@@ -421,8 +425,9 @@ class ProxyLoggerAddon:
     def _report_traffic(self) -> None:
         self._report_control_event(f"TRAFFIC {self._upload_bytes} {self._download_bytes}")
 
-    def _report_token_speed(self, data: dict) -> None:
-        self._report_control_event("TOKEN_SPEED " + json.dumps(data, separators=(",", ":")))
+    def _report_token_speed(self, data: dict) -> bool:
+        return self._send_control_message("TOKEN_SPEED " + json.dumps(data, separators=(",", ":")),
+                                          read_response=True) == "OK"
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
         resp = flow.response

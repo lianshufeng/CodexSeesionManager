@@ -10,12 +10,34 @@ class ResponseContentCounter:
     _fields = {"output_text": "text", "refusal": "refusal", "function_call_arguments": "arguments",
                "custom_tool_call_input": "input", "reasoning_text": "text", "reasoning_summary_text": "text"}
 
-    def __init__(self, encoding, sample) -> None:
+    def __init__(self, encoding, sample, ledger=None, scope="anonymous", incomplete=None) -> None:
         self._encoding = encoding
         self._sample = sample
         self._responses = {}
         self._finished = deque(maxlen=16)
         self._current = "anonymous"
+        self._ledger = ledger
+        self._scope = scope
+        self._incomplete = incomplete or (lambda reason: None)
+        self._generation = 0
+
+    def _response_key(self):
+        if self._current == "anonymous":
+            return f"{self._scope}:anonymous:{self._generation}"
+        return str(self._current)
+
+    def _tokens(self, text):
+        encoding = self._encoding()
+        if len(text) <= 32768:
+            return len(encoding.encode(text, disallowed_special=()))
+        # 限制单次分词长度，避免超长无空格文本的 BPE 耗时失控。
+        total, tail, tail_count = 0, "", 0
+        for offset in range(0, len(text), 8192):
+            joined = tail + text[offset:offset + 8192]
+            total += len(encoding.encode(joined, disallowed_special=())) - tail_count
+            tail = joined[-128:]
+            tail_count = len(encoding.encode(tail, disallowed_special=()))
+        return total
 
     def _identity(self, state, event, item=None):
         item = item or {}
@@ -26,16 +48,22 @@ class ResponseContentCounter:
                             ("call", event.get("call_id")), ("call", item.get("call_id"))):
             if value:
                 aliases.append((name, value))
-        identity = next((state["aliases"][a] for a in aliases if a in state["aliases"]), aliases[0] if aliases else ("index", 0))
+        identity = next((state["aliases"][a] for a in aliases if a in state["aliases"]),
+                        next((a for a in aliases if a[0] in ("item", "call")), aliases[0] if aliases else ("index", 0)))
         for alias in aliases:
-            if len(state["aliases"]) < 512:
-                state["aliases"][alias] = identity
+            state["aliases"][alias] = identity
+        if len(state["aliases"]) > 32768:
+            self._incomplete("响应条目身份过多，统计不完整")
+            state["aliases"].clear()
         return identity
 
     def _part(self, state, key, text, now, complete=False):
         if not isinstance(text, str) or not text:
             return
         previous = state["parts"].get(key)
+        recorded = self._ledger.part(self._response_key(), key) if self._ledger else (0, False, "", 0)
+        if recorded[1]:
+            return
         if previous is None:
             previous = state["retired"].pop(key, None)
             if len(state["parts"]) >= 128:
@@ -45,21 +73,25 @@ class ResponseContentCounter:
                     state["retired"].pop(next(iter(state["retired"])))
                 # 旧片段只保留计数用于全文去重，释放文本尾部；新片段继续统计。
                 state["retired"][oldest] = {"tail": "", "tail_count": 0, "total": saved["total"], "done": saved["done"]}
-            previous = previous or {"tail": "", "tail_count": 0, "total": 0, "done": False}
+            if self._ledger and recorded[0]:
+                previous = {"tail": recorded[2], "tail_count": recorded[3], "total": recorded[0], "done": False}
+            previous = previous or {"tail": "", "tail_count": 0, "total": recorded[0], "done": False}
         if previous["done"]:
             return
-        encoding = self._encoding()
         if complete:
-            total = len(encoding.encode(text, disallowed_special=()))
+            total = self._tokens(text)
             change = total - previous["total"]
             previous = {"tail": "", "tail_count": 0, "total": total, "done": True}
         else:
             joined = previous["tail"] + text
-            change = len(encoding.encode(joined, disallowed_special=())) - previous["tail_count"]
+            change = self._tokens(joined) - previous["tail_count"]
             tail = joined[-128:]
-            previous = {"tail": tail, "tail_count": len(encoding.encode(tail, disallowed_special=())),
+            previous = {"tail": tail, "tail_count": self._tokens(tail),
                         "total": previous["total"] + change, "done": False}
         state["parts"][key] = previous
+        if self._ledger:
+            change = self._ledger.set_part(self._response_key(), key, previous["total"], previous["done"], now,
+                                           previous["tail"], previous["tail_count"])
         if change:
             self._sample(change, now)
 
@@ -75,6 +107,8 @@ class ResponseContentCounter:
                         continue
                     name = content.get("type")
                     name = "reasoning_summary_text" if name == "summary_text" else name
+                    if kind == "reasoning" and name == "text":
+                        name = "reasoning_text"
                     if name in self._fields:
                         self._part(state, (name, identity, index), content.get(self._fields[name]), now, True)
         elif kind in ("function_call", "custom_tool_call"):
@@ -82,14 +116,22 @@ class ResponseContentCounter:
             self._part(state, (name, identity, 0), item.get(self._fields[name]), now, True)
         elif kind == "local_shell_call" and isinstance(item.get("action"), dict):
             self._part(state, (kind, identity, 0), json.dumps(item["action"], ensure_ascii=False), now, True)
+        elif kind in ("tool_search_call", "web_search_call"):
+            value = item.get("arguments" if kind == "tool_search_call" else "action")
+            if value is not None:
+                self._part(state, (kind, identity, 0), json.dumps(value, ensure_ascii=False), now, True)
 
     def observe(self, event, now):
+        if isinstance(event, list):
+            for message in event:
+                self.observe(message, now)
+            return
         if not isinstance(event, dict):
             return
         # 云端通知可能在 data/msg 中封装 Codex 内容事件。
         for _ in range(4):
-            nested = next((event.get(key) for key in ("msg", "data") if isinstance(event.get(key), dict)
-                           and any(field in event[key] for field in ("type", "method", "msg"))), None)
+            nested = next((event.get(key) for key in ("msg", "data", "result") if isinstance(event.get(key), dict)
+                           and any(field in event[key] for field in ("type", "method", "msg", "object", "choices"))), None)
             if nested is None:
                 break
             event = nested
@@ -104,6 +146,19 @@ class ResponseContentCounter:
             response_id = str(params.get("threadId", "")) + ":" + str(params.get("turnId", ""))
             common = {"response_id": response_id, "item_id": params.get("itemId"),
                       "summary_index": params.get("summaryIndex", params.get("contentIndex", 0))}
+            if method == "rawResponse/completed":
+                identity = params.get("responseId")
+                if identity and self._ledger:
+                    accepted = self._ledger.usage(identity, params.get("tokenUsage"), now)
+                    if params.get("threadId") and params.get("turnId") and accepted:
+                        self._ledger.cover_estimate(response_id, now)
+                return
+            if method == "rawResponseItem/completed":
+                self.observe({**common, "type": "response.output_item.done", "item": params.get("item")}, now)
+                return
+            if method == "turn/completed":
+                self._responses.pop(response_id, None)
+                return
             if method in methods:
                 self.observe({**common, "type": "response." + methods[method] + ".delta", "delta": params.get("delta")}, now)
             elif method == "item/completed" and isinstance(params.get("item"), dict):
@@ -118,23 +173,56 @@ class ResponseContentCounter:
                                           "type": "response." + name + ".done", "text": text}, now)
             return
         aliases = {"agent_message_delta": "output_text", "agent_message_content_delta": "output_text",
-                   "agent_reasoning_delta": "reasoning_summary_text", "agent_reasoning_raw_content_delta": "reasoning_text"}
+                   "agent_reasoning_delta": "reasoning_summary_text", "agent_reasoning_raw_content_delta": "reasoning_text",
+                   "reasoning_content_delta": "reasoning_summary_text", "reasoning_raw_content_delta": "reasoning_text",
+                   "plan_delta": "plan_text"}
         if event.get("type") in aliases:
-            event = {**event, "type": "response." + aliases[event["type"]] + ".delta"}
+            identity = (str(event.get("thread_id", "")) + ":" + str(event.get("turn_id", ""))) if event.get("thread_id") else None
+            event = {**event, "type": "response." + aliases[event["type"]] + ".delta",
+                     "response_id": identity or event.get("response_id")}
+        if event.get("type") == "raw_response_completed":
+            if event.get("response_id") and self._ledger:
+                self._ledger.usage(event["response_id"], event.get("token_usage"), now)
+            return
+        if event.get("type") == "raw_response_item":
+            event = {**event, "type": "response.output_item.done"}
+        if event.get("type") == "agent_message" and isinstance(event.get("message"), str):
+            event = {**event, "type": "response.output_text.done", "text": event["message"]}
+        if event.get("type") in ("response.output_audio_transcript.delta", "response.output_audio_transcript.done"):
+            event = {**event, "type": event["type"].replace("output_audio_transcript", "output_text"),
+                     "text": event.get("transcript")}
         response = event.get("response") or event
         if not isinstance(response, dict):
             return
-        response_id = event.get("response_id") or response.get("id")
+        response_id = event.get("response_id") or (response.get("id") if "response" in event or "choices" in event or response.get("object") in ("response", "chat.completion", "chat.completion.chunk") else None)
+        if response_id is None:
+            identifiers = [("item", event.get("item_id")), ("call", event.get("call_id"))]
+            candidates = [identity for identity, state in self._responses.items()
+                          if any(value and (name, value) in state["aliases"] for name, value in identifiers)]
+            if len(candidates) == 1:
+                response_id = candidates[0]
+            elif len(candidates) > 1:
+                self._incomplete("交错响应条目身份不明确，统计不完整")
+                return
+        if response_id is not None and (not isinstance(response_id, str) or len(response_id) > 512):
+            self._incomplete("响应 ID 无效，统计不完整")
+            return
         if response_id:
             if response_id not in self._responses and "anonymous" in self._responses and len(self._responses) == 1:
+                if self._ledger:
+                    self._ledger.rename(self._response_key(), response_id)
                 self._responses[response_id] = self._responses.pop("anonymous")
             self._current = response_id
         response_id = response_id or self._current
-        if response_id in self._finished:
+        if self._ledger:
+            self._ledger.usage(self._response_key(), response.get("usage"), now)
+        if response_id in self._finished or (self._ledger and self._ledger.finished(self._response_key())):
+            self._current = next(reversed(self._responses), "anonymous")
             return
         if response_id not in self._responses:
-            if len(self._responses) >= 8:
+            if len(self._responses) >= 128:
                 self._responses.pop(next(iter(self._responses)))
+                self._incomplete("并发响应状态已淘汰，统计不完整")
             self._responses[response_id] = {"parts": {}, "retired": {}, "aliases": {}}
         state = self._responses[response_id]
         event_type = event.get("type", "")
@@ -156,6 +244,11 @@ class ResponseContentCounter:
             self._identity(state, event, event.get("item"))
         elif event_type == "response.output_item.done":
             self._item(state, event, event.get("item"), now)
+        elif event_type == "response.content_part.done" and isinstance(event.get("part"), dict):
+            part = event["part"]
+            name = part.get("type")
+            if name in self._fields:
+                self._part(state, (name, self._identity(state, event), index), part.get(self._fields[name]), now, True)
         for choice in event.get("choices") or []:
             if not isinstance(choice, dict):
                 continue
@@ -166,13 +259,22 @@ class ResponseContentCounter:
             choice_id = choice.get("index", 0)
             for field in ("content", "reasoning_content", "reasoning"):
                 self._part(state, (field, choice_id, 0), delta.get(field), now, complete)
-            for tool in delta.get("tool_calls") or []:
+            for tool_index, tool in enumerate(delta.get("tool_calls") or []):
                 if isinstance(tool, dict) and isinstance(tool.get("function"), dict):
-                    self._part(state, ("tool", choice_id, tool.get("index", 0)), tool["function"].get("arguments"), now, complete)
-        final = event_type in ("response.completed", "response.incomplete", "response.failed") or response.get("object") == "response"
+                    self._part(state, ("tool", choice_id, tool.get("index", tool_index)), tool["function"].get("arguments"), now, complete)
+        chat_final = bool(event.get("choices")) and all(isinstance(choice, dict) and ("message" in choice or choice.get("finish_reason") is not None) for choice in event["choices"])
+        terminal = event_type in ("response.completed", "response.incomplete", "response.failed", "response.done") or chat_final
+        final = terminal or response.get("object") == "response"
         if final:
             for output_index, item in enumerate(response.get("output") or []):
                 self._item(state, {"output_index": output_index}, item, now)
-            if event_type in ("response.completed", "response.incomplete", "response.failed") or response.get("status") in ("completed", "incomplete", "failed"):
+            if terminal or response.get("status") in ("completed", "incomplete", "failed"):
                 self._responses.pop(response_id, None)
-                self._finished.append(response_id)
+                if self._ledger and response_id != "anonymous":
+                    self._ledger.finish(self._response_key())
+                if response_id == "anonymous":
+                    self._generation += 1
+                else:
+                    self._finished.append(response_id)
+                    self._current = next(reversed(self._responses), "anonymous")
+                    self._generation += 1

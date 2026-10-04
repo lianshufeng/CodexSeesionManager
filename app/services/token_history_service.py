@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import math
 import sqlite3
 import time
@@ -25,6 +26,7 @@ class TokenHistoryService:
         self._stop = Event()
         self._thread = Thread(target=self._run, name="token-history", daemon=True)
         self.error = ""
+        self._statistics_incomplete = ""
         self._thread.start()
 
     def record(self, speed: float, timestamp: int | None = None) -> None:
@@ -56,6 +58,25 @@ class TokenHistoryService:
             result.set_exception(RuntimeError("历史服务繁忙，请稍后重试"))
         return result
 
+    def record_report(self, report: dict) -> Future:
+        """记录响应快照；相同 ID 覆盖修正，不依赖 UI 采样和回报重试次数。"""
+        return self._request("report", report)
+
+    def read_totals_async(self, since: int, until: int) -> Future:
+        return self._request("totals", (since, until))
+
+    def _request(self, kind, value):
+        result = Future()
+        if self._stop.is_set():
+            result.set_exception(RuntimeError(self.error or "历史服务已停止"))
+            return result
+        try:
+            self._queue.put_nowait((kind, (value, result)))
+        except Full:
+            self._set_error("历史记录队列已满，统计不完整")
+            result.set_exception(RuntimeError(self.error))
+        return result
+
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=5)
@@ -66,6 +87,8 @@ class TokenHistoryService:
         if message != self.error:
             logging.getLogger(__name__).warning(message)
         self.error = message
+        if "不完整" in message or "未保存" in message:
+            self._statistics_incomplete = message
 
     def _run(self) -> None:
         connection = None
@@ -78,11 +101,16 @@ class TokenHistoryService:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA synchronous=NORMAL")
             connection.execute("CREATE TABLE IF NOT EXISTS samples (timestamp INTEGER PRIMARY KEY, speed REAL NOT NULL)")
+            connection.execute("CREATE TABLE IF NOT EXISTS responses (id TEXT PRIMARY KEY, timestamp INTEGER, estimate INTEGER, usage TEXT)")
+            connection.execute("CREATE INDEX IF NOT EXISTS responses_timestamp ON responses(timestamp)")
+            connection.execute("CREATE TABLE IF NOT EXISTS statistics_status (session TEXT PRIMARY KEY, timestamp INTEGER, reasons TEXT)")
             if self._metric is not None:
                 connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
                 previous = connection.execute("SELECT value FROM metadata WHERE key = 'metric'").fetchone()
                 if previous != (self._metric,):
                     # 统计口径变化时重置旧采样，避免历史曲线混用两种单位。
+                    connection.execute("CREATE TABLE IF NOT EXISTS legacy_samples (timestamp INTEGER PRIMARY KEY, speed REAL NOT NULL)")
+                    connection.execute("INSERT OR IGNORE INTO legacy_samples SELECT * FROM samples")
                     connection.execute("DELETE FROM samples")
                     connection.execute("INSERT OR REPLACE INTO metadata VALUES ('metric', ?)", (self._metric,))
             connection.commit()
@@ -93,6 +121,45 @@ class TokenHistoryService:
                     kind, value = "", None
                 if kind == "record":
                     pending[value[0]] = value[1]
+                elif kind == "report":
+                    report, result = value
+                    try:
+                        with connection:
+                            for record in report.get("records", []):
+                                usage = record.get("usage")
+                                connection.execute("INSERT INTO responses VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET estimate=excluded.estimate, usage=COALESCE(excluded.usage, responses.usage)",
+                                                   (record["id"], int(record["timestamp"]), max(0, int(record["estimate"])),
+                                                    json.dumps(usage) if isinstance(usage, dict) else None))
+                            if report.get("incomplete"):
+                                session = report.get("session", "unknown")
+                                previous = connection.execute("SELECT reasons FROM statistics_status WHERE session=?", (session,)).fetchone()
+                                reasons = set(json.loads(previous[0]) if previous else []) | set(report["incomplete"])
+                                connection.execute("INSERT INTO statistics_status VALUES (?, ?, ?) ON CONFLICT(session) DO UPDATE SET reasons=excluded.reasons",
+                                                   (session, int(time.time()), json.dumps(sorted(reasons), ensure_ascii=False)))
+                        result.set_result(True)
+                    except Exception as exc:
+                        self._set_error(f"保存用量失败，统计不完整: {exc}")
+                        result.set_exception(exc)
+                elif kind == "totals":
+                    (since, until), result = value
+                    try:
+                        totals = dict(input=0, output=0, cached_input=0, cache_write_input=0,
+                                      reasoning_output=0, total=0, estimate=0, official_responses=0, estimated_responses=0)
+                        for estimate, usage_json in connection.execute("SELECT estimate, usage FROM responses WHERE timestamp BETWEEN ? AND ?", (since, until)):
+                            if usage_json:
+                                usage = json.loads(usage_json)
+                                for name in ("input", "output", "cached_input", "cache_write_input", "reasoning_output", "total"):
+                                    totals[name] += usage.get(name, 0)
+                                totals["official_responses"] += 1
+                            elif estimate:
+                                totals["estimate"] += estimate
+                                totals["estimated_responses"] += 1
+                        totals["incomplete"] = [reason for (reasons,) in connection.execute("SELECT reasons FROM statistics_status WHERE timestamp BETWEEN ? AND ?", (since, until)) for reason in json.loads(reasons)]
+                        if self._statistics_incomplete:
+                            totals["incomplete"].append(self._statistics_incomplete)
+                        result.set_result(totals)
+                    except Exception as exc:
+                        result.set_exception(exc)
                 elif kind == "read":
                     since, until, result = value
                     try:
@@ -109,6 +176,8 @@ class TokenHistoryService:
                     try:
                         with connection:
                             connection.execute("DELETE FROM samples WHERE timestamp < ?", (int(time.time()) - self._retention_seconds,))
+                            connection.execute("DELETE FROM responses WHERE timestamp < ?", (int(time.time()) - self._retention_seconds,))
+                            connection.execute("DELETE FROM statistics_status WHERE timestamp < ?", (int(time.time()) - self._retention_seconds,))
                     except sqlite3.Error as exc:
                         self._set_error(f"清理速度历史失败: {exc}")
                     next_cleanup = now + 3600
@@ -126,6 +195,8 @@ class TokenHistoryService:
                     break
                 if kind == "read":
                     value[2].set_exception(RuntimeError(self.error or "历史服务已停止"))
+                elif kind in ("report", "totals"):
+                    value[1].set_exception(RuntimeError(self.error or "历史服务已停止"))
 
     def _flush(self, connection, pending: dict[int, float]) -> None:
         if not pending:
@@ -134,7 +205,7 @@ class TokenHistoryService:
             with connection:
                 connection.executemany("INSERT OR REPLACE INTO samples(timestamp, speed) VALUES (?, ?)", pending.items())
             pending.clear()
-            self.error = ""
+            self.error = self._statistics_incomplete
         except sqlite3.Error as exc:
             self._set_error(f"保存速度历史失败: {exc}")
             # 写入失败后只保留有界缓冲，下轮重试。

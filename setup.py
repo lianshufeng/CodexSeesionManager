@@ -14,6 +14,8 @@ include_files = [
     (str(tokenizer_cache), "lib/app/services/tokenizer_cache"),
     ("app/services/response_token_speed_service.py", "response_token_speed_service.py"),
     ("app/services/response_content_counter.py", "response_content_counter.py"),
+    ("app/services/response_payload_reader.py", "response_payload_reader.py"),
+    ("app/services/response_usage_ledger.py", "response_usage_ledger.py"),
     ("app/services/proxy_logger_addon.py", "proxy_logger_addon.py"),
     ("icon/icon.ico", "icon/icon.ico"),
     ("icon/tray_icon.ico", "icon/tray_icon.ico"),

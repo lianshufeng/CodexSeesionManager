@@ -214,6 +214,7 @@ class ProxyWindow:
         self._token_speed_var = tk.StringVar(value="0.0 token/s")
         self._token_speed_updated_at = 0.0
         self._token_history_service = TokenHistoryService(app_root() / "data" / "token_speed.sqlite3", metric="response_content_tokens_v1")
+        self._token_statistics_note = ""
         self._token_history_window: TokenHistoryWindow | None = None
         self._token_speed_value = 0.0
         self._service_status_var = tk.StringVar(value="正在准备代理服务…")
@@ -828,8 +829,12 @@ class ProxyWindow:
         if self._quota_warmup_check is not None:
             self._quota_warmup_check.configure(state=state)
         if self._is_relay_active():
+            self._token_statistics_note = "（中转直连未覆盖）"
+            self._token_speed_var.set("0.0 token/s" + self._token_statistics_note)
             self._set_auto_load_target("", "")
             self._clear_proxy_kill_pending()
+        elif getattr(self, "_token_statistics_note", "") == "（中转直连未覆盖）":
+            self._token_statistics_note = ""
 
     def _recompute_auto_load_target(self) -> None:
         if self._is_relay_active():
@@ -1893,7 +1898,13 @@ class ProxyWindow:
                 try:
                     conn.settimeout(0.1)
                     try:
-                        payload = conn.recv(65536).decode("utf-8", errors="ignore").strip()
+                        chunks = bytearray()
+                        while b"\n" not in chunks and len(chunks) < 256 * 1024:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                break
+                            chunks.extend(chunk)
+                        payload = chunks.decode("utf-8", errors="strict").strip()
                     except socket.timeout:
                         payload = ""
                     if payload.startswith("USED "):
@@ -1938,6 +1949,11 @@ class ProxyWindow:
                         except ValueError:
                             continue
                         if isinstance(data, dict):
+                            try:
+                                self._token_history_service.record_report(data).result(timeout=0.15)
+                            except Exception:
+                                continue
+                            conn.sendall(b"OK\n")
                             self._post_ui(lambda value=data: self._update_token_speed(value))
                         continue
                     if payload.startswith("TRAFFIC "):
@@ -1966,7 +1982,7 @@ class ProxyWindow:
                         continue
                     token = self._get_auto_load_target_access_token()
                     conn.sendall((token + "\n").encode("utf-8"))
-                except OSError:
+                except (OSError, UnicodeError):
                     continue
 
     def _schedule_refresh_traffic(self) -> None:
@@ -3729,10 +3745,12 @@ del "%~f0" >nul 2>nul
         return "\n".join(lines)
 
     def _update_token_speed(self, data: dict) -> None:
+        if data.get("incomplete"):
+            self._token_statistics_note = "（统计不完整）"
         if "speed" in data:
             output_speed = float(data.get("speed") or 0)
             self._token_speed_value = output_speed
-            self._token_speed_var.set(f"{output_speed:.1f} token/s")
+            self._token_speed_var.set(f"{output_speed:.1f} token/s{getattr(self, '_token_statistics_note', '')}")
             self._token_speed_updated_at = time.monotonic()
             self._refresh_tray_icon_tooltip()
 
@@ -3742,7 +3760,7 @@ del "%~f0" >nul 2>nul
         if time.monotonic() - self._token_speed_updated_at > 3:
             self._token_speed_value = 0.0
             if self._token_speed_var.get() != "0.0 token/s":
-                self._token_speed_var.set("0.0 token/s")
+                self._token_speed_var.set("0.0 token/s" + getattr(self, "_token_statistics_note", ""))
                 self._refresh_tray_icon_tooltip()
         self._token_history_service.record(self._token_speed_value)
         self.root.after(1000, self._tick_token_speed)
@@ -4649,7 +4667,6 @@ del "%~f0" >nul 2>nul
         self._closing = True
         if self._token_history_window is not None and self._token_history_window.window.winfo_exists():
             self._token_history_window.close()
-        self._token_history_service.stop()
         self._remove_tray_icon()
         self._persist_config()
         self.auth_reset_credit_service.stop()
@@ -4664,4 +4681,5 @@ del "%~f0" >nul 2>nul
                 self._auto_load_control_socket.close()
             except OSError:
                 pass
+        self._token_history_service.stop()
         self.root.destroy()

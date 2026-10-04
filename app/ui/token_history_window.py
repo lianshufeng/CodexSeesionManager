@@ -47,6 +47,9 @@ class TokenHistoryWindow:
         self._closed = False
         self._after_id = None
         self._future = None
+        self._totals_future = None
+        self._totals = None
+        self._totals_at = 0.0
         self._samples = {}
         self._read_error = ""
         self._last_draw = 0.0
@@ -80,6 +83,9 @@ class TokenHistoryWindow:
         self._read_error = ""
         self._reload_button.configure(state="disabled")
         self._future = self.service.read_async(now - self._ranges[self._range.get()], now)
+        self._totals_future = self.service.read_totals_async(now - self._ranges[self._range.get()], now)
+        self._totals = None
+        self._totals_at = time.monotonic()
         self._status.set("正在读取历史…")
         self._summary.set("累计输出（估算）：正在读取…")
         self._last_draw = 0.0
@@ -98,6 +104,15 @@ class TokenHistoryWindow:
             loading = False
         now = int(time.time())
         since = now - self._ranges[self._range.get()]
+        if self._totals_future is not None and self._totals_future.done():
+            try:
+                self._totals = self._totals_future.result()
+            except Exception as exc:
+                self._read_error = f"读取用量失败: {exc}"
+            self._totals_future = None
+        if self._totals_future is None and time.monotonic() - self._totals_at >= 1:
+            self._totals_future = self.service.read_totals_async(since, now)
+            self._totals_at = time.monotonic()
         self._samples.update(self.service.recent(since))
         self._samples = {stamp: speed for stamp, speed in self._samples.items() if since <= stamp <= now}
         if not loading:
@@ -109,10 +124,12 @@ class TokenHistoryWindow:
                 latest = max(self._samples)
                 current = self._samples[latest] if now - latest <= 2 else 0
                 self._status.set(f"当前 {current:.1f} · 平均 {sum(speeds)/len(speeds):.1f} · 最高 {max(speeds):.1f} token/s")
-                self._summary.set(f"{self._range.get()} · 累计输出（估算）：{sum(speeds):,.0f} tokens")
+                self._summary.set("用量正在读取；旧速度采样不折算为实际消耗")
             else:
                 self._status.set("暂无历史记录")
-                self._summary.set(f"{self._range.get()} · 累计输出（估算）：0 tokens（暂无记录）")
+                self._summary.set("暂无用量记录")
+            if self._totals is not None and not (self.service.error or self._read_error):
+                self._summary.set(format_token_totals(self._totals))
         # 多日曲线减少重绘频率，汇总仍每秒更新。
         if time.monotonic() - self._last_draw >= (10 if self._ranges[self._range.get()] >= 86400 else 1):
             self._draw()
@@ -159,3 +176,17 @@ class TokenHistoryWindow:
         if self._after_id is not None:
             self.window.after_cancel(self._after_id)
         self.window.destroy()
+
+
+def format_token_totals(totals):
+    """官方用量与没有 usage 的可见输出估算分开显示。"""
+    pieces = []
+    if totals["official_responses"]:
+        pieces.append(f"官方用量：输入 {totals['input']:,}（缓存 {totals['cached_input']:,}） · 输出 {totals['output']:,}（推理 {totals['reasoning_output']:,}） · 总计 {totals['total']:,}")
+    if totals["estimated_responses"]:
+        pieces.append(f"无官方用量的可见输出估算：{totals['estimate']:,}")
+    if not pieces:
+        pieces.append("暂无新用量记录；旧速度曲线不计入累计")
+    if totals.get("incomplete"):
+        pieces.append("统计不完整：" + "；".join(sorted(set(totals["incomplete"]))))
+    return " · ".join(pieces)
