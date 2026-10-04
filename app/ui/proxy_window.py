@@ -74,6 +74,7 @@ _UPDATE_EXTRACT_DIR_NAME = "extracted"
 _UPDATE_SCRIPT_NAME = "apply_update.bat"
 _LOW_PRICE_FETCH_PAGE_COUNT = 8
 _IDLE_TOKEN_SPEED_TEXT = "0.0 token/s"
+_WINDOW_STATE_WITHDRAWN = "withdrawn"
 
 
 @dataclass
@@ -4646,7 +4647,7 @@ del "%~f0" >nul 2>nul
             if not isinstance(child, tk.Toplevel):
                 continue
             try:
-                if child.winfo_exists() and child.state() != tk.WITHDRAWN:
+                if child.winfo_exists() and child.state() != _WINDOW_STATE_WITHDRAWN:
                     return
             except tk.TclError:
                 continue
