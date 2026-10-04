@@ -7,9 +7,18 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
 from typing import Callable
 
-from app.models import ResetCredit, ResetCreditInfo, ResetCreditState
+from app.models import (AutoResetCreditAttempt, ResetCredit, ResetCreditInfo,
+                        ResetCreditResult, ResetCreditState)
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.utils.chatgpt_reset_credit_fetcher import ChatGPTResetCreditFetcher
+
+
+_AUTO_USE_WINDOW_SECONDS = 180
+_AUTO_RETRY_MIN_SECONDS = 10.0
+_AUTO_RETRY_MAX_SECONDS = 30.0
+_AUTO_USE_TERMINAL_RESULTS = frozenset((ResetCreditResult.RESET,
+                                      ResetCreditResult.ALREADY_REDEEMED,
+                                      ResetCreditResult.NO_CREDIT))
 
 
 class AuthResetCreditService:
@@ -18,6 +27,7 @@ class AuthResetCreditService:
         self.fetcher = ChatGPTResetCreditFetcher()
         self._stop_event = Event()
         self._thread: Thread | None = None
+        self._retry_thread: Thread | None = None
         self._lock = Lock()
         self._items: dict[str, ResetCreditState] = {}
         self._request_locks: dict[str, Lock] = {}
@@ -25,6 +35,7 @@ class AuthResetCreditService:
         self._on_change: Callable[[], None] | None = None
         self._auto_use_enabled = Event()
         self._auto_attempted: dict[tuple[str, str], float] = {}
+        self._auto_pending: dict[str, AutoResetCreditAttempt] = {}
         self._on_auto_use: Callable[[], None] | None = None
 
     def set_auto_use_enabled(self, enabled: bool) -> None:
@@ -48,6 +59,8 @@ class AuthResetCreditService:
         self._stop_event.clear()
         self._thread = Thread(target=self._run, daemon=True, name="auth-reset-credits")
         self._thread.start()
+        self._retry_thread = Thread(target=self._run_auto_retry, daemon=True, name="reset-credit-retry")
+        self._retry_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -127,11 +140,51 @@ class AuthResetCreditService:
             if self._stop_event.wait(random.uniform(10.0, 30.0)):
                 return
 
+    def _run_auto_retry(self) -> None:
+        # 补偿独立于全量刷新，慢账号不会额外叠加整轮刷新等待时间。
+        while not self._stop_event.wait(1.0):
+            if not self._auto_use_enabled.is_set():
+                continue
+            try:
+                self._retry_due_once()
+            except Exception as exc:
+                print(f"[ResetCredits] 自动用卡补偿调度失败: {type(exc).__name__}", flush=True)
+
+    def _retry_due_once(self) -> None:
+        if not self._auto_use_enabled.is_set() or self._stop_event.is_set():
+            return
+        now = time.monotonic()
+        with self._lock:
+            due = {account for account, attempt in self._auto_pending.items()
+                   if attempt.retry_at <= now}
+        rows = {}
+        for row in self.auth_sync_service.list_auth_rows():
+            account = row.account_id or row.refresh_token
+            if account in due:
+                rows.setdefault(account, row)
+        proxy_url = self._proxy_provider() if self._proxy_provider else ""
+        if rows:
+            with ThreadPoolExecutor(max_workers=min(4, len(rows)), thread_name_prefix="reset-credit-retry") as executor:
+                list(executor.map(lambda row: self._retry_row(row, proxy_url), rows.values()))
+
+    def _retry_row(self, row: AuthFileRow, proxy_url: str) -> None:
+        with self._request_lock_for(row):
+            account = row.account_id or row.refresh_token
+            with self._lock:
+                attempt = self._auto_pending.get(account)
+                if attempt is None or attempt.retry_at > time.monotonic():
+                    return
+            self._refresh_row_locked(row, proxy_url)
+        if self._on_change:
+            self._on_change()
+
     def refresh_once(self) -> None:
         rows = self.auth_sync_service.list_auth_rows()
         tokens = {row.refresh_token for row in rows}
+        accounts = {row.account_id or row.refresh_token for row in rows}
         with self._lock:
             self._items = {key: value for key, value in self._items.items() if key in tokens}
+            self._auto_pending = {key: value for key, value in self._auto_pending.items() if key in accounts}
             self._auto_attempted = {key: expiry for key, expiry in self._auto_attempted.items()
                                     if expiry > time.time()}
         proxy_url = self._proxy_provider() if self._proxy_provider else ""
@@ -154,12 +207,19 @@ class AuthResetCreditService:
         except Exception:
             with self._lock:
                 previous = self._items.get(row.refresh_token)
+                pending = self._auto_pending.get(row.account_id or row.refresh_token)
+                if pending is not None:
+                    pending.retry_at = time.monotonic() + random.uniform(_AUTO_RETRY_MIN_SECONDS, _AUTO_RETRY_MAX_SECONDS)
             state = ResetCreditState(previous.info if previous else None, failed=True)
         with self._lock:
             self._items[row.refresh_token] = state
         if state.info is not None and not state.failed:
             for _ in state.info.credits:
                 if not self._auto_use_expiring_credit(row, state.info):
+                    break
+                with self._lock:
+                    state = self._items.get(row.refresh_token, state)
+                if state.info is None or state.failed:
                     break
 
     def _auto_use_expiring_credit(self, row: AuthFileRow, info: ResetCreditInfo) -> bool:
@@ -168,9 +228,20 @@ class AuthResetCreditService:
         now = time.time()
         account = row.account_id or row.refresh_token
         with self._lock:
-            credit = min((credit for credit in info.credits
+            pending = self._auto_pending.get(account)
+            if pending is not None:
+                # 查询成功后卡已不在可用列表，是服务端确认不可用；本地时间不作终止依据。
+                if info.available_count <= 0 or not any(credit.credit_id == pending.credit.credit_id for credit in info.credits):
+                    self._auto_attempted[(account, pending.credit.credit_id)] = pending.credit.expires_at
+                    del self._auto_pending[account]
+                    return False
+                if pending.retry_at > time.monotonic():
+                    return False
+                credit = pending.credit
+            else:
+                credit = min((credit for credit in info.credits
                           if info.available_count > 0 and credit.expires_at is not None
-                          and 0 < credit.expires_at - now <= 180
+                          and 0 < credit.expires_at - now <= _AUTO_USE_WINDOW_SECONDS
                           and (account, credit.credit_id) not in self._auto_attempted),
                          key=lambda credit: (credit.expires_at, credit.granted_at, credit.credit_id),
                          default=None)
@@ -181,19 +252,27 @@ class AuthResetCreditService:
             current = self._current_row(row)
             if not self._auto_use_enabled.is_set() or self._stop_event.is_set():
                 return False
-            if credit.expires_at <= time.time():
+            if pending is None and credit.expires_at <= time.time():
                 return False
             with self._lock:
-                self._auto_attempted[key] = credit.expires_at
-            # 固定请求标识保证重启后仍使用同一幂等键；结果未知时不自动重试。
+                self._auto_pending[account] = AutoResetCreditAttempt(credit, float("inf"))
+            # 每次补偿复用同一卡和请求标识，响应丢失时不切换下一张卡。
             request_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"reset-credit:{key[0]}:{key[1]}"))
             proxy_url = self._proxy_provider() if self._proxy_provider else ""
             code = self.fetcher.consume(current.access_token, current.account_id, proxy_url,
                                         credit.credit_id, request_id)
+            if code in _AUTO_USE_TERMINAL_RESULTS:
+                with self._lock:
+                    self._auto_attempted[key] = credit.expires_at
+                    self._auto_pending.pop(account, None)
             print(f"[ResetCredits] 到期自动用卡结果: {code}", flush=True)
         except Exception as exc:
             print(f"[ResetCredits] 到期自动用卡失败: {type(exc).__name__}", flush=True)
         finally:
+            with self._lock:
+                attempt = self._auto_pending.get(account)
+                if attempt is not None:
+                    attempt.retry_at = time.monotonic() + random.uniform(_AUTO_RETRY_MIN_SECONDS, _AUTO_RETRY_MAX_SECONDS)
             try:
                 self._fetch_current(row)
             except Exception:

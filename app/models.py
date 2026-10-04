@@ -104,6 +104,12 @@ class ResetCredit:
     expires_at: float | None = None
 
 
+@dataclass(slots=True)
+class AutoResetCreditAttempt:
+    credit: ResetCredit
+    retry_at: float
+
+
 @dataclass(frozen=True, slots=True)
 class ResetCreditInfo:
     available_count: int
