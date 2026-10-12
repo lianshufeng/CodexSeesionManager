@@ -387,12 +387,29 @@ class ProxyLoggerAddon:
 
     def _is_workspace_discovery(self, flow: http.HTTPFlow) -> bool:
         path = str(getattr(flow.request, "path", "") or "").lower()
-        return path.split("?", 1)[0].rstrip("/").endswith("/accounts/check")
+        parts = path.split("?", 1)[0].rstrip("/").split("/")
+        return (
+            parts[-2:] == ["accounts", "check"]
+            or parts[-3:-1] == ["accounts", "check"]
+            or parts[-3:] == ["accounts", "optimized", "check"]
+        )
 
     def _is_workspace_settings(self, flow: http.HTTPFlow) -> bool:
         path = str(getattr(flow.request, "path", "") or "").lower()
         parts = path.split("?", 1)[0].rstrip("/").split("/")
         return len(parts) >= 3 and parts[-3] == "accounts" and bool(parts[-2]) and parts[-1] == "settings"
+
+    def _is_account_setup_request(self, flow: http.HTTPFlow) -> bool:
+        path = str(getattr(flow.request, "path", "") or "").lower()
+        route, _, query = path.partition("?")
+        return (
+            self._is_workspace_discovery(flow)
+            or self._is_workspace_settings(flow)
+            or route.rstrip("/").endswith(("/wham/config/bundle", "/settings/user"))
+            or (not self._should_use_selected_auth(flow) and any(
+                part.split("=", 1)[0] == "account_id" for part in query.split("&")
+            ))
+        )
 
     def _protect_selected_auth_unauthorized_response(self, flow: http.HTTPFlow) -> bool:
         resp = flow.response
@@ -563,7 +580,7 @@ class ProxyLoggerAddon:
             self._strip_codex_responses_lite_header(flow)
             self._rewrite_relay_http_model(flow, relay_model)
         selected_auth_replaced = False
-        if selected_token and not (self._is_workspace_discovery(flow) or self._is_workspace_settings(flow)):
+        if selected_token and not self._is_account_setup_request(flow):
             selected_auth_replaced = self._rewrite_auth_headers(
                 flow,
                 selected_token,
@@ -585,6 +602,11 @@ class ProxyLoggerAddon:
         resp = flow.response
         if resp is None:
             return
+        if self._is_account_setup_request(flow):
+            path = str(getattr(flow.request, "path", "") or "").split("?", 1)[0]
+            if self._is_workspace_settings(flow):
+                path = "/accounts/{id}/settings"
+            _log(f"账号初始化请求: {flow.request.method} {path} -> {resp.status_code}")
         if not flow.metadata.get("token_speed_stream") and resp.status_code != 101:
             self._token_speed.observe("http:" + flow.id, resp.raw_content or b"", resp.headers.get("content-encoding", "").strip().lower())
         self._token_speed.end(flow.metadata.get("token_speed_key", "http:" + flow.id))
