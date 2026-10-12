@@ -1,6 +1,9 @@
 name: Build and Release Windows EXE
 
 on:
+  push:
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       release_name:

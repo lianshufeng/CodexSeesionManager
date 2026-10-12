@@ -389,6 +389,11 @@ class ProxyLoggerAddon:
         path = str(getattr(flow.request, "path", "") or "").lower()
         return path.split("?", 1)[0].rstrip("/").endswith("/accounts/check")
 
+    def _is_workspace_settings(self, flow: http.HTTPFlow) -> bool:
+        path = str(getattr(flow.request, "path", "") or "").lower()
+        parts = path.split("?", 1)[0].rstrip("/").split("/")
+        return len(parts) >= 3 and parts[-3] == "accounts" and bool(parts[-2]) and parts[-1] == "settings"
+
     def _protect_selected_auth_unauthorized_response(self, flow: http.HTTPFlow) -> bool:
         resp = flow.response
         metadata = getattr(flow, "metadata", None)
@@ -558,7 +563,7 @@ class ProxyLoggerAddon:
             self._strip_codex_responses_lite_header(flow)
             self._rewrite_relay_http_model(flow, relay_model)
         selected_auth_replaced = False
-        if selected_token and not self._is_workspace_discovery(flow):
+        if selected_token and not (self._is_workspace_discovery(flow) or self._is_workspace_settings(flow)):
             selected_auth_replaced = self._rewrite_auth_headers(
                 flow,
                 selected_token,
