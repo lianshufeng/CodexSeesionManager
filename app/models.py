@@ -30,6 +30,7 @@ class ProxyKillReason(StrEnum):
 class ProxyControlMessage(StrEnum):
     AUTH = "AUTH"
     USED = "USED"
+    RATE_LIMIT = "RATE_LIMIT"
     DISCOVERY = "DISCOVERY"
     RESELECT = "RESELECT"
     PINGPONG = "PINGPONG"

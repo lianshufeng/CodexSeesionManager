@@ -66,8 +66,9 @@ class ObservationKind(StrEnum):
 class ResponseTokenSpeedService:
     """后台解码响应并统计实际内容；队列、响应缓存和计数状态均有上限。"""
 
-    def __init__(self, report, ledger_path=None) -> None:
+    def __init__(self, report, ledger_path=None, payload_observer=None) -> None:
         self._report = report
+        self._payload_observer = payload_observer
         self._buckets: deque[tuple[int, int]] = deque(maxlen=31)
         self._queue = Queue(maxsize=256)
         self._streams = {}
@@ -192,6 +193,8 @@ class ResponseTokenSpeedService:
             self._mark_incomplete("消息解析失败，统计不完整")
             return
         if isinstance(payload, dict):
+            if self._payload_observer is not None:
+                self._payload_observer(state["key"], payload)
             tag = payload.get("type") or payload.get("method") or "envelope"
             if isinstance(tag, str) and len(tag) <= 100 and all(c.isalnum() or c in "_./-" for c in tag):
                 label = "event:" + tag
@@ -236,7 +239,7 @@ class ResponseTokenSpeedService:
                 self._mark_incomplete("并发连接状态已淘汰，统计不完整")
             if self._ledger is None:
                 self._ledger = ResponseUsageLedger(self._ledger_path)
-            state = {"decoder": decoder, "utf8": codecs.getincrementaldecoder("utf-8")("replace"),
+            state = {"key": key, "decoder": decoder, "utf8": codecs.getincrementaldecoder("utf-8")("replace"),
                      "buffer": "", "event": [], "event_size": 0, "sse": key.startswith("sse:"),
                      "skip_line": False, "skip_event": False,
                      "counter": ResponseContentCounter(self._get_encoding, self._add_sample, self._ledger,

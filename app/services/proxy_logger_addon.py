@@ -19,10 +19,12 @@ except ModuleNotFoundError as exc:
     from models import CredentialType, ProxyControlMessage, PROXY_ACK_OK, PROXY_ACK_YES
 try:
     from app.services.response_token_speed_service import ResponseTokenSpeedService
+    from app.services.rate_limit_detector import is_rate_limit
 except ModuleNotFoundError as exc:
     if exc.name != "app":
         raise
     from response_token_speed_service import ResponseTokenSpeedService
+    from rate_limit_detector import is_rate_limit
 
 
 _RESELECT_EVENT = ProxyControlMessage.RESELECT
@@ -81,7 +83,9 @@ class ProxyLoggerAddon:
         source = Path(__file__).resolve()
         root = source.parents[2] if source.parent.name == "services" else source.parent
         ledger_path = os.environ.get("CODEX_TOKEN_LEDGER_PATH") or root / "data" / "token_statistics_outbox.sqlite3"
-        self._token_speed = ResponseTokenSpeedService(self._report_token_speed, ledger_path)
+        self._rate_limit_flows = {}
+        self._rate_limit_lock = Lock()
+        self._token_speed = ResponseTokenSpeedService(self._report_token_speed, ledger_path, self._observe_error_payload)
 
     def load(self, loader) -> None:
         _log("日志插件已加载")
@@ -461,12 +465,16 @@ class ProxyLoggerAddon:
         resp = flow.response
         if resp is None or resp.status_code == 101:
             return
+        self._remember_rate_limit_flow("http:" + flow.id, flow)
+        if resp.status_code == 429:
+            self._report_rate_limit(flow, "http")
         content_type = resp.headers.get("content-type", "").lower()
         if "text/event-stream" not in content_type and not resp.stream and not (resp.status_code == 200 and self._should_use_selected_auth(flow)):
             return
         previous_stream = resp.stream
         encoding = resp.headers.get("content-encoding", "").strip().lower()
         speed_key = ("sse:" if "text/event-stream" in content_type else "http:") + flow.id
+        self._remember_rate_limit_flow(speed_key, flow)
         flow.metadata["token_speed_key"] = speed_key
         flow.metadata["token_speed_stream"] = True
 
@@ -590,6 +598,7 @@ class ProxyLoggerAddon:
         if isinstance(metadata, dict):
             metadata[_SELECTED_AUTH_METADATA_KEY] = selected_token if selected_auth_replaced else ""
         usage_token = selected_token if selected_auth_replaced else original_token
+        flow.metadata["rate_limit_usage_token"] = usage_token
         if usage_token:
             self._report_access_token_used(usage_token, self._is_workspace_discovery(flow))
         self._upload_bytes += self._estimate_http_bytes(flow.request.headers, flow.request.raw_content)
@@ -602,6 +611,12 @@ class ProxyLoggerAddon:
         resp = flow.response
         if resp is None:
             return
+        if not flow.metadata.get("token_speed_stream") and resp.status_code >= 400:
+            try:
+                payload = json.loads(resp.get_text(strict=False) or "")
+            except (ValueError, UnicodeError):
+                payload = None
+            self._inspect_error_payload(flow, payload, "http")
         if self._is_account_setup_request(flow):
             path = str(getattr(flow.request, "path", "") or "").split("?", 1)[0]
             if self._is_workspace_settings(flow):
@@ -622,10 +637,59 @@ class ProxyLoggerAddon:
             self._rewrite_relay_websocket_model(flow, relay_model)
         if flow.websocket and flow.websocket.messages:
             message = flow.websocket.messages[-1]
+            if message.from_client:
+                flow.metadata["rate_limit_ws_sequence"] = flow.metadata.get("rate_limit_ws_sequence", 0) + 1
+                flow.metadata.pop("rate_limit_ws_response_id", None)
             if not message.from_client:
+                try:
+                    payload = json.loads(message.content)
+                except (ValueError, UnicodeError):
+                    payload = None
+                response = (payload.get("response") or {}) if isinstance(payload, dict) else {}
+                response_id = payload.get("response_id") if isinstance(payload, dict) else None
+                response_id = response_id or (response.get("id") if isinstance(response, dict) else None)
+                if response_id:
+                    flow.metadata["rate_limit_ws_response_id"] = str(response_id)
+                response_id = response_id or flow.metadata.get("rate_limit_ws_response_id")
+                self._inspect_error_payload(flow, payload, str(response_id or flow.metadata.get("rate_limit_ws_sequence", 0)))
                 self._token_speed.observe("ws:" + flow.id, message.content)
                 self._token_speed.message_end("ws:" + flow.id)
         return None
+
+    def _remember_rate_limit_flow(self, key, flow):
+        with self._rate_limit_lock:
+            self._rate_limit_flows[key] = flow
+            while len(self._rate_limit_flows) > 256:
+                self._rate_limit_flows.pop(next(iter(self._rate_limit_flows)))
+
+    def _observe_error_payload(self, key, payload):
+        with self._rate_limit_lock:
+            flow = self._rate_limit_flows.get(key)
+        if flow is not None:
+            self._inspect_error_payload(flow, payload, "http")
+
+    def _inspect_error_payload(self, flow, payload, request_id):
+        if is_rate_limit(payload):
+            _log("识别到限流或模型容量错误")
+            self._report_rate_limit(flow, request_id)
+        elif isinstance(payload, dict):
+            response = payload.get("response")
+            error = payload.get("error") or (response.get("error") if isinstance(response, dict) else None)
+            if error or payload.get("type") in {"error", "response.failed", "response.error"}:
+                # 只记录错误结构与代码，不输出正文、请求内容或令牌。
+                code = error.get("code", "") if isinstance(error, dict) else payload.get("code", "")
+                _log(f"未匹配限流错误: type={str(payload.get('type', ''))[:80]} code={str(code)[:80]} fields={','.join(str(k)[:40] for k in payload)[:200]}")
+
+    def _report_rate_limit(self, flow, request_id):
+        token = flow.metadata.get("rate_limit_usage_token", "")
+        if not token:
+            return
+        with self._rate_limit_lock:
+            seen = flow.metadata.setdefault("rate_limit_reported", set())
+            if request_id in seen:
+                return
+            seen.add(request_id)
+        self._report_control_event(f"{ProxyControlMessage.RATE_LIMIT} {token}")
 
     def websocket_start(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()

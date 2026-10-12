@@ -31,6 +31,7 @@ from PIL import Image
 from app.version import APP_VERSION
 from app.services.auth_login_service import AuthLoginResult, AuthLoginService
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
+from app.services.auth_cooldown_service import AuthCooldownService
 from app.services.app_config_service import AppConfig, AppConfigService
 from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
 from app.services.auth_usage_service import QUOTA_REFRESH_FAILED, AuthQuotaItem, AuthUsageService
@@ -139,6 +140,7 @@ class ProxyWindow:
         self._auth_load_strategy_menu: tk.Menu | None = None
         self._auth_load_strategy_var = tk.StringVar(value=LoadStrategy.NORMAL)
         self._auto_load_lock = Lock()
+        self._auth_cooldown = AuthCooldownService()
         self._proxy_lock = Lock()
         auto_load_enabled = loaded_config.auto_load if loaded_config is not None else True
         self.auto_load_var = tk.BooleanVar(value=auto_load_enabled)
@@ -405,9 +407,6 @@ class ProxyWindow:
         auth_frame = ttk.LabelFrame(tables, text="连接配置 - 双击切换", padding=8)
         auth_frame.pack(fill="both", expand=True, pady=(10, 0))
 
-        self._auth_hint_var = tk.StringVar(value="")
-        ttk.Label(auth_frame, textvariable=self._auth_hint_var).pack(anchor="w", pady=(0, 4))
-
         auth_options = ttk.Frame(auth_frame)
         auth_options.pack(fill="x", pady=(0, 6))
         self._auto_load_check = ttk.Checkbutton(
@@ -468,6 +467,7 @@ class ProxyWindow:
         auth_columns = (
             "currentMark",
             "loadMark",
+            "cooldown",
             "sourceType",
             "loadStrategy",
             "email",
@@ -480,6 +480,7 @@ class ProxyWindow:
         self.auth_tree = ttk.Treeview(auth_wrap, columns=auth_columns, show="headings", selectmode="browse", height=5)
         self.auth_tree.heading("currentMark", text="当前")
         self.auth_tree.heading("loadMark", text="负载")
+        self.auth_tree.heading("cooldown", text="冷却")
         self.auth_tree.heading("sourceType", text="来源")
         self.auth_tree.heading("loadStrategy", text="策略")
         self.auth_tree.heading("email", text="邮箱")
@@ -490,6 +491,7 @@ class ProxyWindow:
         self.auth_tree.heading("resetCreditExpiry", text="重置卡到期")
         self.auth_tree.column("currentMark", width=46, anchor="center", stretch=False)
         self.auth_tree.column("loadMark", width=46, anchor="center", stretch=False)
+        self.auth_tree.column("cooldown", width=60, anchor="center", stretch=False)
         self.auth_tree.column("sourceType", width=76, anchor="center", stretch=False)
         self.auth_tree.column("loadStrategy", width=58, anchor="center", stretch=False)
         self.auth_tree.column("email", width=170, anchor="w", stretch=True)
@@ -847,11 +849,13 @@ class ProxyWindow:
             current_refresh_token = self._auto_load_target_refresh_token
             current_access_token = self._auto_load_target_access_token
         rows = self.auth_sync_service.list_auth_rows()
-        rows = [row for row in rows if not row.disabled and self._is_auto_load_quota_usable(row.quota)]
+        rows = [row for row in rows if not row.disabled and self._is_auto_load_quota_usable(row.quota)
+                and not self._auth_cooldown.remaining(self._auth_cooldown.key(row))]
         if not rows:
             self._set_auto_load_target("", "")
             self._clear_proxy_kill_pending()
             print("[AutoLoad] 当前没有可选授权文件", flush=True)
+            self.refresh_auth_files(update_status=False)
             return
         using_warmup = False
         if self.quota_warmup_var.get():
@@ -1916,6 +1920,10 @@ class ProxyWindow:
                                 lambda value=token, is_discovery=discovery:
                                 self._on_auto_load_access_token_used(value, is_discovery)
                             )
+                        continue
+                    if payload.startswith(ProxyControlMessage.RATE_LIMIT + " "):
+                        token = payload.removeprefix(ProxyControlMessage.RATE_LIMIT + " ").strip()
+                        self._post_ui(lambda value=token: self._on_auth_rate_limit(value))
                         continue
                     if payload.startswith(ProxyControlMessage.KILL_RESULT + " "):
                         parts = payload.split()
@@ -3337,11 +3345,6 @@ del "%~f0" >nul 2>nul
         self._auth_rows_by_item.clear()
         auth_rows = self.auth_sync_service.list_auth_rows()
         relay_rows = self.relay_config_service.list_relays()
-        if hasattr(self, "_auth_hint_var"):
-            if auth_rows or relay_rows:
-                self._auth_hint_var.set("双击账号可切换；右键可设置备注、删除或调整负载策略")
-            else:
-                self._auth_hint_var.set("尚未添加账号，请点击“更新授权”登录第一个 Codex 账号")
         load_refresh_token = self._get_auto_load_target_refresh_token()
         for row in auth_rows:
             item = self.auth_tree.insert(
@@ -3350,6 +3353,7 @@ del "%~f0" >nul 2>nul
                 values=(
                     "★" if row.current and not self._is_relay_active() else "",
                     self._format_auth_load_mark(row, load_refresh_token),
+                    self._format_auth_cooldown(row),
                     "Codex账号",
                     self._format_auth_load_strategy(row.load_strategy),
                     self._shorten_middle(row.email, 16, 11),
@@ -3369,6 +3373,7 @@ del "%~f0" >nul 2>nul
                 "end",
                 values=(
                     "★" if self._is_relay_active() and row.credential_id == self._active_credential_id else "",
+                    "",
                     "",
                     "中转API",
                     "",
@@ -3866,7 +3871,29 @@ del "%~f0" >nul 2>nul
         if self._closing:
             return
         self._update_reset_credit_countdowns()
+        expired = False
+        for item, row in list(self._auth_rows_by_item.items()):
+            if isinstance(row, AuthFileRow):
+                value = self._format_auth_cooldown(row)
+                expired = expired or bool(self.auth_tree.set(item, "cooldown") and not value)
+                self.auth_tree.set(item, "cooldown", value)
+        if expired:
+            self._recompute_auto_load_target()
         self.root.after(1000, self._tick_reset_credit_countdown)
+
+    def _format_auth_cooldown(self, row):
+        seconds = self._auth_cooldown.remaining(self._auth_cooldown.key(row))
+        return f"{seconds}秒" if seconds else ""
+
+    def _on_auth_rate_limit(self, access_token):
+        rows = self.auth_sync_service.list_auth_rows()
+        row = next((row for row in rows if row.access_token == access_token), None)
+        if row is None:
+            return
+        seconds = self._auth_cooldown.hit(self._auth_cooldown.key(row))
+        print(f"[AutoLoad] 账号限流: account_id={row.account_id} 冷却={seconds}秒", flush=True)
+        self._recompute_auto_load_target()
+        self.refresh_auth_files(update_status=False)
 
     def _refresh_reset_credit_menu(self) -> None:
         if self._auth_menu is None:
