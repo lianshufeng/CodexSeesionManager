@@ -12,6 +12,7 @@ from threading import Event, Lock, Thread
 from typing import Callable
 
 from app.services.auth_sync_service import AuthSyncService
+from app.models import QuotaWindow
 from app.utils.chatgpt_usage_fetcher import ChatGPTUsageFetcher
 
 
@@ -28,6 +29,8 @@ class AuthQuotaItem:
     email: str = ""
     quota_refreshed_at_5h: str = ""
     quota_refreshed_at_7d: str = ""
+    windows: tuple[QuotaWindow, ...] = ()
+    observed_at: float = 0.0
 
 
 class AuthUsageService:
@@ -79,6 +82,10 @@ class AuthUsageService:
 
     def request_refresh(self) -> None:
         self._refresh_event.set()
+
+    def item_for(self, refresh_token: str) -> AuthQuotaItem | None:
+        with self._quota_lock:
+            return self._quota_items_by_token.get(refresh_token)
 
     def refresh_once(self) -> list[AuthQuotaItem]:
         return self._refresh_once()
@@ -348,6 +355,8 @@ class AuthUsageService:
                 email=email,
                 quota_refreshed_at_5h=quota_refreshed_at_5h,
                 quota_refreshed_at_7d=quota_refreshed_at_7d,
+                windows=result.windows,
+                observed_at=time.time(),
             )
             self._quota_items_by_token[refresh_token] = item
         self._pending_items.put(item)

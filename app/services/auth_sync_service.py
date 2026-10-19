@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import tempfile
+from functools import wraps
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import traceback
-from threading import Event, Lock, Thread
+from threading import Event, Lock, RLock, Thread
 from typing import Callable
 
 from app.utils.path_utils import app_root
@@ -24,6 +26,14 @@ _LOAD_STRATEGIES = {
     _LOAD_STRATEGY_DISABLED,
 }
 _FALLBACK_HASH_LENGTH = 32
+
+
+def _serialize_auth_files(method):
+    @wraps(method)
+    def serialized(self, *args, **kwargs):
+        with self._file_lock:
+            return method(self, *args, **kwargs)
+    return serialized
 
 
 @dataclass
@@ -59,6 +69,7 @@ class AuthSyncService:
         self.interval_seconds = interval_seconds
         self._stop_event = Event()
         self._state_lock = Lock()
+        self._file_lock = RLock()
         self._thread: Thread | None = None
         self._on_change: Callable[[], None] | None = None
         self._source_signature: tuple[int, int] | None = None
@@ -113,6 +124,7 @@ class AuthSyncService:
             self._quota_refresh_time_5h_by_refresh_token = dict(quota_refresh_time_5h_by_refresh_token)
             self._quota_refresh_time_7d_by_refresh_token = dict(quota_refresh_time_7d_by_refresh_token)
 
+    @_serialize_auth_files
     def increment_traffic_by_access_token(self, access_token: str) -> bool:
         token = access_token.strip()
         if not token:
@@ -191,6 +203,7 @@ class AuthSyncService:
     def _auth_file_path(self, account_id: str, refresh_token: str) -> Path:
         return self.target_dir / f"{self._safe_auth_file_stem(account_id, refresh_token)}.json"
 
+    @_serialize_auth_files
     def save_logged_in_auth_file(self, data: dict[str, object]) -> tuple[str, str]:
         tokens = data.get("tokens")
         if not isinstance(tokens, dict):
@@ -252,6 +265,7 @@ class AuthSyncService:
                 print(f"[AuthSync] 登录授权回调异常: {exc}\n{traceback.format_exc()}", flush=True)
         return account_id, refresh_token
 
+    @_serialize_auth_files
     def save_refreshed_auth_file(
         self,
         original_path: Path,
@@ -387,6 +401,7 @@ class AuthSyncService:
             self._source_state = state
         return state
 
+    @_serialize_auth_files
     def _sync_once(self) -> None:
         file_signature = self._get_file_signature(self.source_path)
         if file_signature is None:
@@ -454,6 +469,89 @@ class AuthSyncService:
             except Exception as exc:
                 print(f"[AuthSync] 同步回调异常: {exc}\n{traceback.format_exc()}", flush=True)
 
+    @_serialize_auth_files
+    def apply_cloud_version(self, version_root: Path, apply_version: Callable[[Path], None]) -> str:
+        """在同一文件锁内应用云端数据，并协调当前账号的授权。"""
+        staged_auth = version_root / "auth"
+        current = self._read_auth_data(self.source_path)
+        state = self._read_source_state(force=True)
+        replacement = None
+        message = ""
+        if staged_auth.is_dir() and current is not None and state is not None:
+            matches = []
+            for path in staged_auth.glob("*.json"):
+                data = self._read_auth_data(path)
+                tokens = data.get("tokens") if data is not None else None
+                if not isinstance(tokens, dict):
+                    continue
+                account_id = str(data.get("account_id") or tokens.get("account_id") or "")
+                if (state["account_id"] and account_id == state["account_id"]) or (
+                    not state["account_id"] and tokens.get("refresh_token") == state["refresh_token"]
+                ):
+                    matches.append((path, data))
+            if len(matches) > 1:
+                raise RuntimeError("云端存在多个当前账号授权，无法确定版本，未应用拉取数据。")
+            if matches:
+                path, data = matches[0]
+                tokens = data["tokens"]
+                same_tokens = all(tokens.get(key) == state[key] for key in ("refresh_token", "access_token"))
+                cloud_time = self._parse_last_refresh_timestamp(str(data.get("last_refresh") or ""))
+                local_time = self._parse_last_refresh_timestamp(state["last_refresh"])
+                if not same_tokens and tokens.get("refresh_token") and tokens.get("access_token") and cloud_time > local_time > 0:
+                    replacement = self._strip_manager_metadata(data)
+                    message = "当前账号已更新为云端较新的授权。"
+                elif not same_tokens or local_time > cloud_time:
+                    retained = dict(current)
+                    retained[_MANAGER_METADATA_KEY] = dict(self._manager_metadata(data))
+                    self._mark_as_codex_auth(retained)
+                    self._write_auth_data(path, retained)
+                    message = "已保留当前授权：云端版本较旧，或令牌、刷新时间存在冲突。"
+            else:
+                retained = dict(current)
+                self._mark_as_codex_auth(retained)
+                retained_path = staged_auth / self._auth_file_path(state["account_id"], state["refresh_token"]).name
+                if retained_path.exists():
+                    raise RuntimeError("云端文件名与当前账号冲突，未应用拉取数据。")
+                self._write_auth_data(retained_path, retained)
+                message = "云端没有当前账号，已保留当前授权及管理记录。"
+
+        # 下载期间的新登录已由上面的实时读取处理；应用前再次检查外部修改。
+        if self._read_auth_data(self.source_path) != current:
+            raise RuntimeError("当前授权在拉取期间发生变化，请重新拉取。")
+        try:
+            apply_version(version_root)
+            if self._read_auth_data(self.source_path) != current:
+                self._sync_once()
+                message = "当前授权在应用期间发生变化，已保留最新本地授权。"
+            elif replacement is not None:
+                self.source_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(dir=self.source_path.parent, suffix=".tmp", delete=False) as temporary:
+                        temporary_path = Path(temporary.name)
+                    self._write_auth_data(temporary_path, replacement)
+                    temporary_path.replace(self.source_path)
+                    new_token = str(replacement["tokens"]["refresh_token"])
+                    old_token = state["refresh_token"]
+                    if new_token != old_token:
+                        with self._state_lock:
+                            self._traffic_by_refresh_token[new_token] = (
+                                self._traffic_by_refresh_token.get(new_token, 0)
+                                + self._traffic_by_refresh_token.pop(old_token, 0)
+                            )
+                finally:
+                    if temporary_path is not None:
+                        temporary_path.unlink(missing_ok=True)
+        finally:
+            self.invalidate_cached_state()
+            if self._on_change is not None:
+                try:
+                    self._on_change()
+                except Exception as exc:
+                    print(f"[AuthSync] 云同步回调异常: {exc}\n{traceback.format_exc()}", flush=True)
+        return message
+
+    @_serialize_auth_files
     def activate_auth_file(self, refresh_token: str) -> tuple[bool, str]:
         if not refresh_token:
             return False, "刷新令牌不能为空。"
@@ -484,6 +582,7 @@ class AuthSyncService:
                 print(f"[AuthSync] 激活回调异常: {exc}\n{traceback.format_exc()}", flush=True)
         return True, ""
 
+    @_serialize_auth_files
     def delete_auth_file(self, refresh_token: str) -> tuple[bool, str]:
         if not refresh_token:
             return False, "刷新令牌不能为空。"
@@ -529,6 +628,7 @@ class AuthSyncService:
                 print(f"[AuthSync] 删除回调异常: {exc}\n{traceback.format_exc()}", flush=True)
         return True, ""
 
+    @_serialize_auth_files
     def set_auth_load_strategy(self, refresh_token: str, load_strategy: str) -> tuple[bool, str]:
         if not refresh_token:
             return False, "刷新令牌不能为空。"
@@ -580,6 +680,7 @@ class AuthSyncService:
         strategy = _LOAD_STRATEGY_DISABLED if disabled else _LOAD_STRATEGY_NORMAL
         return self.set_auth_load_strategy(refresh_token, strategy)
 
+    @_serialize_auth_files
     def set_auth_note(self, refresh_token: str, note: str) -> tuple[bool, str]:
         if not refresh_token:
             return False, "刷新令牌不能为空。"
@@ -617,6 +718,7 @@ class AuthSyncService:
                 print(f"[AuthSync] 备注回调异常: {exc}\n{traceback.format_exc()}", flush=True)
         return True, ""
 
+    @_serialize_auth_files
     def list_auth_rows(self) -> list[AuthFileRow]:
         current_state = self._read_source_state()
         current_refresh_token = current_state["refresh_token"] if current_state is not None else ""

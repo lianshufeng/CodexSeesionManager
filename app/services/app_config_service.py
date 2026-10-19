@@ -15,6 +15,7 @@ class AppConfig:
     use_upstream_proxy: bool = True
     auto_load: bool = True
     quota_warmup: bool = False
+    quota_warmup_model: str = "gpt-6-luna"
     auto_reset_credit: bool = False
     active_credential_type: str = CredentialType.CODEX_AUTH
     active_credential_id: str = ""
@@ -62,6 +63,7 @@ class AppConfigService:
             use_upstream_proxy=use_upstream_proxy,
             auto_load=auto_load,
             quota_warmup=quota_warmup,
+            quota_warmup_model=str(data.get("quota_warmup_model") or "gpt-6-luna").strip() or "gpt-6-luna",
             auto_reset_credit=bool(data.get("auto_reset_credit", False)),
             active_credential_type=active_credential_type,
             active_credential_id=str(data.get("active_credential_id") or ""),
@@ -80,6 +82,7 @@ class AppConfigService:
             "use_upstream_proxy": config.use_upstream_proxy,
             "auto_load": config.auto_load,
             "quota_warmup": config.quota_warmup,
+            "quota_warmup_model": config.quota_warmup_model,
             "auto_reset_credit": config.auto_reset_credit,
             "active_credential_type": config.active_credential_type,
             "active_credential_id": config.active_credential_id,

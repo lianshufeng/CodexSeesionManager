@@ -4,9 +4,12 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from numbers import Number
+import math
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
+
+from app.models import QuotaWindow
 
 _CHINA_TIMEZONE = timezone(timedelta(hours=8))
 
@@ -23,6 +26,27 @@ class UsageFetchResult:
     raw: dict[str, Any] | None = None
     message: str = ""
 
+    @property
+    def windows(self) -> tuple[QuotaWindow, ...]:
+        rate_limit = (self.raw or {}).get("rate_limit")
+        if not isinstance(rate_limit, dict):
+            return ()
+        windows = []
+        for key in ("primary_window", "secondary_window"):
+            window = rate_limit.get(key)
+            if window is None:
+                continue
+            if not isinstance(window, dict):
+                return ()
+            values = [window.get(field) for field in ("used_percent", "reset_at", "limit_window_seconds")]
+            if any(isinstance(value, bool) or not isinstance(value, Number) or not math.isfinite(value) for value in values):
+                return ()
+            used, reset_at, duration = map(float, values)
+            if not 0 <= used <= 100 or reset_at <= 0 or duration <= 0:
+                return ()
+            windows.append(QuotaWindow(100 - used, reset_at, duration))
+        return tuple(windows)
+
 
 class ChatGPTUsageFetcher:
     def __init__(self) -> None:
@@ -38,7 +62,7 @@ class ChatGPTUsageFetcher:
             return f"{value[:4]}..."
         return f"{value[:keep_prefix]}...{value[-keep_suffix:]}"
 
-    def fetch(self, access_token: str, account_id: str = "") -> UsageFetchResult:
+    def fetch(self, access_token: str, account_id: str = "", proxy_url: str | None = None) -> UsageFetchResult:
         if not access_token:
             return UsageFetchResult(message="access_token 为空")
         headers = {
@@ -51,8 +75,14 @@ class ChatGPTUsageFetcher:
             headers["chatgpt-account-id"] = account_id
 
         request = Request(self.endpoint, headers=headers)
+        open_request = urlopen
+        if proxy_url is not None:
+            proxy_url = proxy_url.strip()
+            if proxy_url and "://" not in proxy_url:
+                proxy_url = "http://" + proxy_url
+            open_request = build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url} if proxy_url else {})).open
         try:
-            with urlopen(request, timeout=15) as response:
+            with open_request(request, timeout=15) as response:
                 body = response.read().decode("utf-8")
                 payload = json.loads(body)
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:

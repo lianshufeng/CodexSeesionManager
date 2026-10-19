@@ -58,6 +58,13 @@ CREDENTIAL_TYPE_CODEX_AUTH = CredentialType.CODEX_AUTH
 CREDENTIAL_TYPE_RELAY_API = CredentialType.RELAY_API
 
 
+@dataclass(frozen=True, slots=True)
+class QuotaWindow:
+    remaining_percent: float
+    reset_at: float
+    duration_seconds: float
+
+
 @dataclass
 class RelayConfig:
     credential_id: str

@@ -6,6 +6,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from app.utils.path_utils import app_root
 
@@ -132,7 +133,7 @@ class CloudSyncService:
                 Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
             )
 
-    def pull_version(self, prefix: str) -> int:
+    def pull_version(self, prefix: str, apply_version: Callable[[Path], None] | None = None) -> int:
         self._validate_version_prefix(prefix)
         client = self._create_client()
         keys = self._list_object_keys(client, prefix)
@@ -159,7 +160,7 @@ class CloudSyncService:
             if missing_paths:
                 raise RuntimeError(f"拉取文件校验失败: {missing_paths[0]}")
             downloaded_count = len(downloaded_paths)
-            self._apply_pulled_version(version_root)
+            (apply_version or self._apply_pulled_version)(version_root)
         return downloaded_count
 
     def _create_client(self):

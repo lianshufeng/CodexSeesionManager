@@ -35,6 +35,7 @@ from app.services.auth_cooldown_service import AuthCooldownService
 from app.services.app_config_service import AppConfig, AppConfigService
 from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
 from app.services.auth_usage_service import QUOTA_REFRESH_FAILED, AuthQuotaItem, AuthUsageService
+from app.services.quota_warmup_service import DEFAULT_WARMUP_MODEL, QuotaWarmupService
 from app.services.auth_reset_credit_service import AuthResetCreditService
 from app.services.cloud_sync_service import CloudSyncConfig, CloudSyncFile, CloudSyncService, CloudSyncVersion
 from app.services.low_price_account_service import (
@@ -108,6 +109,7 @@ class ProxyWindow:
         self.auth_login_service = AuthLoginService(self.auth_sync_service)
         self.auth_token_refresh_service = AuthTokenRefreshService(self.auth_sync_service)
         self.auth_usage_service = AuthUsageService(self.auth_sync_service)
+        self.quota_warmup_service = QuotaWarmupService(self.auth_sync_service, self.auth_usage_service)
         self.auth_reset_credit_service = AuthResetCreditService(self.auth_sync_service)
         self._reset_credit_busy = False
         self.relay_config_service = RelayConfigService()
@@ -146,6 +148,8 @@ class ProxyWindow:
         self.auto_load_var = tk.BooleanVar(value=auto_load_enabled)
         quota_warmup_enabled = loaded_config.quota_warmup if loaded_config is not None else False
         self.quota_warmup_var = tk.BooleanVar(value=quota_warmup_enabled)
+        self.quota_warmup_model_var = tk.StringVar(
+            value=loaded_config.quota_warmup_model if loaded_config is not None else DEFAULT_WARMUP_MODEL)
         self.auto_reset_credit_var = tk.BooleanVar(
             value=loaded_config.auto_reset_credit if loaded_config is not None else False)
         self.auth_reset_credit_service.set_auto_use_enabled(self.auto_reset_credit_var.get())
@@ -164,6 +168,7 @@ class ProxyWindow:
             self._active_credential_id = ""
         self._auto_load_check: ttk.Checkbutton | None = None
         self._quota_warmup_check: ttk.Checkbutton | None = None
+        self._quota_warmup_model_entry: ttk.Entry | None = None
         self._auto_load_enabled = auto_load_enabled
         self._use_upstream_proxy = self.service.config.use_upstream_proxy
         self._upstream_proxy = self.service.config.upstream_proxy
@@ -282,6 +287,8 @@ class ProxyWindow:
             )
         )
         self.auth_usage_service.set_proxy_provider(self._get_proxy_for_usage_request)
+        self.quota_warmup_service.set_proxy_provider(self._get_proxy_for_usage_request)
+        self.quota_warmup_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
         self.auth_reset_credit_service.set_proxy_provider(self._get_proxy_for_usage_request)
         self.auth_reset_credit_service.set_auto_use_callback(self.auth_usage_service.request_refresh)
         self.auth_reset_credit_service.set_change_callback(
@@ -297,6 +304,7 @@ class ProxyWindow:
         self.refresh_all()
         self.root.after(1000, self._tick_reset_credit_countdown)
         self._refresh_credential_mode_state()
+        self.quota_warmup_service.start()
         self._recompute_auto_load_target()
         self._add_tray_icon()
         self.root.after(500, self._auto_start_with_certificate_check)
@@ -424,7 +432,13 @@ class ProxyWindow:
         )
         quota_warmup_check.pack(side="left", padx=(8, 0))
         self._quota_warmup_check = quota_warmup_check
-        self._bind_widget_tooltip(quota_warmup_check, "优先使用5小时额度不低于99%的可用账号，使额度周期尽早开始")
+        self._bind_widget_tooltip(quota_warmup_check, "保留原有预热选号；每分钟检查窗口，向首窗口额度不低于99%的可用账号发送一次 ping，使周期尽早开始")
+        ttk.Label(auth_options, text="预热模型：").pack(side="left", padx=(8, 0))
+        self._quota_warmup_model_entry = ttk.Entry(auth_options, textvariable=self.quota_warmup_model_var, width=17)
+        self._quota_warmup_model_entry.pack(side="left")
+        self._quota_warmup_model_entry.bind("<FocusOut>", self._on_quota_warmup_model_edited)
+        self._quota_warmup_model_entry.bind("<Return>", self._on_quota_warmup_model_edited)
+        self._bind_widget_tooltip(self._quota_warmup_model_entry, "用于自动发送 ping；回车或移出输入框后保存，账号需支持此模型")
         auto_reset_credit_check = ttk.Checkbutton(
             auth_options, text="到期自动用卡", variable=self.auto_reset_credit_var,
             command=self._on_auto_reset_credit_toggled)
@@ -432,17 +446,19 @@ class ProxyWindow:
         self._bind_widget_tooltip(
             auto_reset_credit_check,
             "到期前3分钟内自动用卡。")
-        self._correct_traffic_button = ttk.Button(auth_options, text="矫正流量", command=self.correct_traffic)
+        auth_actions = ttk.Frame(auth_frame)
+        auth_actions.pack(fill="x", pady=(0, 6))
+        self._correct_traffic_button = ttk.Button(auth_actions, text="矫正流量", command=self.correct_traffic)
         self._correct_traffic_button.pack(side="right")
-        self._clean_auth_button = ttk.Button(auth_options, text="清理授权", command=self.clean_auth_files)
+        self._clean_auth_button = ttk.Button(auth_actions, text="清理授权", command=self.clean_auth_files)
         self._clean_auth_button.pack(side="right", padx=(0, 8))
-        self._add_relay_button = ttk.Button(auth_options, text="添加中转站", command=self._add_relay_config)
+        self._add_relay_button = ttk.Button(auth_actions, text="添加中转站", command=self._add_relay_config)
         self._add_relay_button.pack(side="right", padx=(0, 8))
-        self._update_auth_button = ttk.Button(auth_options, text="更新授权", command=self.update_auth)
+        self._update_auth_button = ttk.Button(auth_actions, text="更新授权", command=self.update_auth)
         self._update_auth_button.pack(side="right", padx=(0, 8))
-        low_price_button = ttk.Button(auth_options, text="低价购号", command=self.open_low_price_window)
+        low_price_button = ttk.Button(auth_actions, text="低价购号", command=self.open_low_price_window)
         low_price_button.pack(side="right", padx=(0, 8))
-        self._refresh_tokens_button = ttk.Button(auth_options, text="一键刷新令牌", command=self.refresh_all_tokens)
+        self._refresh_tokens_button = ttk.Button(auth_actions, text="一键刷新令牌", command=self.refresh_all_tokens)
         self._refresh_tokens_button.pack(side="right", padx=(0, 8))
         self._bind_widget_tooltip(
             low_price_button,
@@ -821,8 +837,22 @@ class ProxyWindow:
     def _on_quota_warmup_toggled(self) -> None:
         if self._is_relay_active():
             return
+        self._configure_quota_warmup()
         self._persist_config()
         self._recompute_auto_load_target()
+
+    def _configure_quota_warmup(self) -> None:
+        enabled = self.quota_warmup_var.get() and not self._is_relay_active()
+        self.quota_warmup_service.configure(enabled, self.quota_warmup_model_var.get().strip())
+        if self._quota_warmup_model_entry is not None:
+            self._quota_warmup_model_entry.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _on_quota_warmup_model_edited(self, _event: tk.Event | None = None) -> str:
+        model = self.quota_warmup_model_var.get().strip() or DEFAULT_WARMUP_MODEL
+        self.quota_warmup_model_var.set(model)
+        self._configure_quota_warmup()
+        self._persist_config()
+        return "break"
 
     def _is_relay_active(self) -> bool:
         return self._active_credential_type == CREDENTIAL_TYPE_RELAY_API
@@ -833,6 +863,7 @@ class ProxyWindow:
             self._auto_load_check.configure(state=state)
         if self._quota_warmup_check is not None:
             self._quota_warmup_check.configure(state=state)
+            self._configure_quota_warmup()
         if self._is_relay_active():
             self._token_speed_var.set(_IDLE_TOKEN_SPEED_TEXT)
             self._set_auto_load_target("", "")
@@ -1076,6 +1107,7 @@ class ProxyWindow:
                 use_upstream_proxy=self.use_upstream_proxy_var.get(),
                 auto_load=self.auto_load_var.get(),
                 quota_warmup=self.quota_warmup_var.get(),
+                quota_warmup_model=self.quota_warmup_model_var.get().strip() or DEFAULT_WARMUP_MODEL,
                 auto_reset_credit=self.auto_reset_credit_var.get(),
                 active_credential_type=self._active_credential_type,
                 active_credential_id=self._active_credential_id,
@@ -1536,8 +1568,14 @@ class ProxyWindow:
                 versions = service.list_versions()
             elif action == CloudSyncAction.PULL:
                 assert selected_version is not None
-                service.pull_version(selected_version.prefix)
-                versions = service.list_versions()
+                def apply_version(version_root: Path) -> None:
+                    nonlocal message
+                    message = self.auth_sync_service.apply_cloud_version(version_root, service._apply_pulled_version)
+                service.pull_version(selected_version.prefix, apply_version=apply_version)
+                try:
+                    versions = service.list_versions()
+                except Exception:
+                    message += "\n本地数据已更新，但云端版本列表刷新失败，请稍后重试。"
             elif action == CloudSyncAction.DELETE:
                 assert selected_version is not None
                 service.delete_version(selected_version.prefix)
@@ -1558,12 +1596,15 @@ class ProxyWindow:
         if error:
             messagebox.showerror("云同步失败", error, parent=self._cloud_storage_window)
             return
-        self._render_cloud_sync_versions(versions)
+        if versions or action != CloudSyncAction.PULL:
+            self._render_cloud_sync_versions(versions)
         if action == CloudSyncAction.PULL:
             self._reload_config_from_disk()
             self.auth_sync_service.invalidate_cached_state()
             self.refresh_auth_files(update_status=False)
-            messagebox.showinfo("云同步", "拉取完成，已替换本地对应数据。", parent=self._cloud_storage_window)
+            self.auth_usage_service.request_refresh()
+            self._recompute_auto_load_target()
+            messagebox.showinfo("云同步", "拉取完成，已替换本地对应数据。" + ("\n" + message if message else ""), parent=self._cloud_storage_window)
         elif action == CloudSyncAction.UPLOAD:
             messagebox.showinfo("云同步", "同步完成。", parent=self._cloud_storage_window)
 
@@ -1785,6 +1826,7 @@ class ProxyWindow:
         self.use_upstream_proxy_var.set(loaded_config.use_upstream_proxy)
         self.auto_load_var.set(loaded_config.auto_load)
         self.quota_warmup_var.set(loaded_config.quota_warmup)
+        self.quota_warmup_model_var.set(loaded_config.quota_warmup_model)
         self.auto_reset_credit_var.set(loaded_config.auto_reset_credit)
         self.auth_reset_credit_service.set_auto_use_enabled(loaded_config.auto_reset_credit)
         self.cloud_s3_address_var.set(loaded_config.cloud_s3_address)
@@ -3747,6 +3789,7 @@ del "%~f0" >nul 2>nul
             f"负载策略: {self._format_auth_load_strategy(row.load_strategy)}",
         ]
         lines.append(self._reset_credit_tooltip(row.refresh_token))
+        lines.append("额度预热: " + self.quota_warmup_service.status_for(row))
         return "\n".join(lines)
 
     def _update_token_speed(self, data: dict) -> None:
@@ -4694,6 +4737,7 @@ del "%~f0" >nul 2>nul
             self._token_history_window.close()
         self._remove_tray_icon()
         self._persist_config()
+        self.quota_warmup_service.stop()
         self.auth_reset_credit_service.stop()
         self.auth_usage_service.stop()
         self.auth_sync_service.stop()

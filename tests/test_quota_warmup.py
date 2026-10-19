@@ -1,0 +1,200 @@
+import io
+import json
+import tempfile
+import time
+import tkinter as tk
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from threading import Event
+from unittest.mock import Mock, patch
+
+from app.models import LoadStrategy, QuotaWindow
+from app.services.app_config_service import AppConfig, AppConfigService
+from app.services.auth_sync_service import AuthFileRow
+from app.services.auth_usage_service import AuthQuotaItem
+from app.services.quota_warmup_service import DEFAULT_WARMUP_MODEL, QuotaWarmupService
+from app.utils.chatgpt_usage_fetcher import UsageFetchResult
+from app.utils.codex_warmup_client import CodexWarmupClient, WarmupRejected
+
+
+def usage(reset=990, used=0, duration=18000, secondary_used=20):
+    return UsageFetchResult(quota="100%/80%", raw={"rate_limit": {
+        "primary_window": {"used_percent": used, "reset_at": reset, "limit_window_seconds": duration},
+        "secondary_window": {"used_percent": secondary_used, "reset_at": 200000, "limit_window_seconds": 604800},
+    }})
+
+
+class QuotaWarmupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "warmup.json"
+        self.auth, self.usage, self.client, self.fetcher = Mock(), Mock(), Mock(), Mock()
+        self.row = AuthFileRow("account", "refresh", "", file_name="account.json", access_token="token")
+        self.auth.list_auth_rows.return_value = [self.row]
+        self.usage.item_for.return_value = AuthQuotaItem("refresh", "account", "100%/80%", windows=usage().windows, observed_at=1000)
+        self.fetcher.fetch.side_effect = [usage(), usage(reset=19000, used=1)]
+        self.service = self.make_service()
+        self.service.configure(True, DEFAULT_WARMUP_MODEL)
+
+    def make_service(self):
+        service = QuotaWarmupService(self.auth, self.usage, client=self.client, fetcher=self.fetcher, state_path=self.path)
+        service.set_proxy_provider(lambda: "127.0.0.1:1088")
+        return service
+
+    def check(self, service=None):
+        with patch("app.services.quota_warmup_service.time.time", return_value=1000):
+            (service or self.service).check_once()
+
+    def test_ping_uses_account_and_model_then_confirms_window(self):
+        self.check()
+        self.client.ping.assert_called_once_with("token", "account", "127.0.0.1:1088", "gpt-6-luna", self.service._stop)
+        self.auth.increment_traffic_by_access_token.assert_called_once_with("token")
+        self.assertIn("窗口已启动", self.service.status_for(self.row))
+        self.assertTrue(self.path.exists())
+        self.usage.request_refresh.assert_called_once()
+
+    def test_no_repeat_across_checks_model_edits_or_restart(self):
+        self.check()
+        self.check()
+        self.service.configure(True, "other-model")
+        self.check()
+        restarted = self.make_service()
+        restarted.configure(True, "other-model")
+        self.check(restarted)
+        self.client.ping.assert_called_once()
+        self.assertNotIn("token", self.path.read_text(encoding="utf-8"))
+        self.assertNotIn("refresh", self.path.read_text(encoding="utf-8"))
+
+    def test_disabled_stale_exhausted_and_active_windows_do_not_send(self):
+        original = self.usage.item_for.return_value
+        cases = [replace(original, observed_at=800), replace(original, windows=usage(used=2).windows),
+                 replace(original, windows=usage(secondary_used=100).windows),
+                 replace(original, windows=usage(reset=9000).windows), replace(original, windows=())]
+        for item in cases:
+            self.usage.item_for.return_value = item
+            self.check()
+        self.usage.item_for.return_value = original
+        self.row.disabled = True
+        self.check()
+        self.row.disabled = False
+        self.row.load_strategy = LoadStrategy.DISABLED
+        self.check()
+        self.row.load_strategy = LoadStrategy.NORMAL
+        self.service.configure(False, DEFAULT_WARMUP_MODEL)
+        self.check()
+        self.client.ping.assert_not_called()
+
+    def test_fresh_usage_can_cancel_cached_candidate(self):
+        self.fetcher.fetch.side_effect = [usage(reset=9000, used=2)]
+        self.check()
+        self.client.ping.assert_not_called()
+
+    def test_settings_or_token_changes_during_check_cancel_send(self):
+        self.client.check_model.side_effect = lambda *_: self.service.configure(False, DEFAULT_WARMUP_MODEL)
+        self.check()
+        self.client.ping.assert_not_called()
+        self.service.configure(True, DEFAULT_WARMUP_MODEL)
+        self.fetcher.fetch.side_effect = None
+        self.fetcher.fetch.return_value = usage()
+        self.client.check_model.side_effect = lambda *_: setattr(self.row, "access_token", "rotated")
+        self.check()
+        self.client.ping.assert_not_called()
+
+    def test_model_failure_backs_off_and_model_edit_allows_retry(self):
+        self.client.check_model.side_effect = WarmupRejected("模型不可用")
+        self.fetcher.fetch.side_effect = None
+        self.fetcher.fetch.return_value = usage()
+        self.check()
+        self.check()
+        self.client.check_model.assert_called_once()
+        self.service.configure(True, "working-model")
+        self.client.check_model.side_effect = None
+        self.check()
+        self.client.ping.assert_called_once()
+
+    def test_ambiguous_timeout_is_not_retried_each_minute(self):
+        self.client.ping.side_effect = TimeoutError()
+        self.check()
+        self.check()
+        self.client.ping.assert_called_once()
+        self.assertIn("待确认", self.service.status_for(self.row))
+
+    def test_future_full_and_weekly_windows(self):
+        self.assertTrue(self.service.ready(usage(reset=19000).windows, 1000))
+        self.assertFalse(self.service.ready(usage(reset=19000, used=1).windows, 1000))
+        self.assertFalse(self.service.ready(usage(reset=30000).windows, 1000))
+        weekly = usage(reset=605800, duration=604800).windows
+        self.assertTrue(self.service.ready(weekly, 1000))
+
+    def test_missing_or_invalid_window_data_is_not_guessed(self):
+        data = usage()
+        del data.raw["rate_limit"]["primary_window"]["limit_window_seconds"]
+        self.assertEqual(data.windows, ())
+        for value in (True, float("nan"), "18000", -1):
+            data = usage(duration=value)
+            self.assertEqual(data.windows, ())
+
+    def test_config_roundtrip_and_old_config_default(self):
+        config = AppConfigService(Path(self.temp.name) / "config.json")
+        config.config_path.write_text('{"quota_warmup": true}', encoding="utf-8")
+        self.assertEqual(config.load().quota_warmup_model, DEFAULT_WARMUP_MODEL)
+        config.save(AppConfig(quota_warmup=True, quota_warmup_model="my-model"))
+        self.assertEqual(config.load().quota_warmup_model, "my-model")
+
+    def test_ui_entry_enable_save_and_disable(self):
+        from app.ui.proxy_window import ProxyWindow
+        from tkinter import ttk
+
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        window = ProxyWindow.__new__(ProxyWindow)
+        window.quota_warmup_service = self.service
+        window.quota_warmup_var = tk.BooleanVar(root, True)
+        window.quota_warmup_model_var = tk.StringVar(root, "  custom-model  ")
+        window._quota_warmup_model_entry = ttk.Entry(root, textvariable=window.quota_warmup_model_var)
+        window._is_relay_active = Mock(return_value=False)
+        window._persist_config = Mock()
+        window._recompute_auto_load_target = Mock()
+        window._on_quota_warmup_model_edited()
+        self.assertEqual(window.quota_warmup_model_var.get(), "custom-model")
+        self.assertEqual(str(window._quota_warmup_model_entry["state"]), "normal")
+        window.quota_warmup_var.set(False)
+        window._on_quota_warmup_toggled()
+        self.assertEqual(str(window._quota_warmup_model_entry["state"]), "disabled")
+        self.assertEqual(window.quota_warmup_model_var.get(), "custom-model")
+        window._persist_config.assert_called()
+
+
+class WarmupClientTests(unittest.TestCase):
+    def test_post_payload_headers_proxy_and_completed_sse(self):
+        client = CodexWarmupClient()
+        response = io.BytesIO(b'data: {"type":"response.created"}\n\ndata: {"type":"response.completed"}\n\n')
+        opener = Mock()
+        opener.open.return_value = response
+        with patch("app.utils.codex_warmup_client.build_opener", return_value=opener) as build:
+            client.ping("account-token", "account-id", "127.0.0.1:1088", "gpt-6-luna", Event())
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization"), "Bearer account-token")
+        self.assertEqual(request.get_header("Chatgpt-account-id"), "account-id")
+        payload = json.loads(request.data)
+        self.assertEqual(payload["model"], "gpt-6-luna")
+        self.assertEqual(payload["input"][0]["content"][0]["text"], "ping")
+        self.assertEqual(payload["tools"], [])
+        self.assertFalse(payload["store"])
+        self.assertEqual(build.call_args.args[0].proxies["https"], "http://127.0.0.1:1088")
+
+    def test_incomplete_stream_is_uncertain_and_unsupported_model_rejected(self):
+        client = CodexWarmupClient()
+        with patch.object(client, "_open", return_value=io.BytesIO(b'data: {"type":"response.failed"}\n')):
+            with self.assertRaises(TimeoutError):
+                client.ping("t", "a", "", "m", Event())
+        with patch.object(client, "_open", return_value=io.BytesIO(b'{"models":[]}')):
+            with self.assertRaises(WarmupRejected):
+                client.check_model("t", "a", "", "m")
+
+
+if __name__ == "__main__":
+    unittest.main()
