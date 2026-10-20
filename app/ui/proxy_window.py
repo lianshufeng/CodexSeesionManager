@@ -432,7 +432,7 @@ class ProxyWindow:
         )
         quota_warmup_check.pack(side="left", padx=(8, 0))
         self._quota_warmup_check = quota_warmup_check
-        self._bind_widget_tooltip(quota_warmup_check, "保留原有预热选号；每分钟检查窗口，向首窗口额度不低于99%的可用账号发送一次 ping，使周期尽早开始")
+        self._bind_widget_tooltip(quota_warmup_check, "保留原有预热选号；每分钟观察窗口，确认未启动后发送 ping；已完成但未生效时5分钟后最多补发一次，超时结果不确定时暂停重发")
         ttk.Label(auth_options, text="预热模型：").pack(side="left", padx=(8, 0))
         self._quota_warmup_model_entry = ttk.Entry(auth_options, textvariable=self.quota_warmup_model_var, width=17)
         self._quota_warmup_model_entry.pack(side="left")

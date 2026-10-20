@@ -18,7 +18,7 @@ from app.utils.chatgpt_usage_fetcher import UsageFetchResult
 from app.utils.codex_warmup_client import CodexWarmupClient, WarmupRejected
 
 
-def usage(reset=990, used=0, duration=18000, secondary_used=20):
+def usage(reset=19000, used=0, duration=18000, secondary_used=20):
     return UsageFetchResult(quota="100%/80%", raw={"rate_limit": {
         "primary_window": {"used_percent": used, "reset_at": reset, "limit_window_seconds": duration},
         "secondary_window": {"used_percent": secondary_used, "reset_at": 200000, "limit_window_seconds": 604800},
@@ -37,6 +37,7 @@ class QuotaWarmupTests(unittest.TestCase):
         self.fetcher.fetch.side_effect = [usage(), usage(reset=19000, used=1)]
         self.service = self.make_service()
         self.service.configure(True, DEFAULT_WARMUP_MODEL)
+        self.service._observe("account", DEFAULT_WARMUP_MODEL, usage(reset=18940).windows, 940)
 
     def make_service(self):
         service = QuotaWarmupService(self.auth, self.usage, client=self.client, fetcher=self.fetcher, state_path=self.path)
@@ -47,10 +48,19 @@ class QuotaWarmupTests(unittest.TestCase):
         with patch("app.services.quota_warmup_service.time.time", return_value=1000):
             (service or self.service).check_once()
 
+    def check_at(self, now, reset=None, *, used=0, service=None):
+        self.usage.item_for.return_value = replace(
+            self.usage.item_for.return_value,
+            windows=usage(reset=reset if reset is not None else now + 18000, used=used).windows,
+            observed_at=now)
+        with patch("app.services.quota_warmup_service.time.time", return_value=now):
+            (service or self.service).check_once()
+
     def test_ping_uses_account_and_model_then_confirms_window(self):
         self.check()
         self.client.ping.assert_called_once_with("token", "account", "127.0.0.1:1088", "gpt-6-luna", self.service._stop)
         self.auth.increment_traffic_by_access_token.assert_called_once_with("token")
+        self.check_at(1060, reset=19000)
         self.assertIn("窗口已启动", self.service.status_for(self.row))
         self.assertTrue(self.path.exists())
         self.usage.request_refresh.assert_called_once()
@@ -119,14 +129,196 @@ class QuotaWarmupTests(unittest.TestCase):
         self.check()
         self.check()
         self.client.ping.assert_called_once()
-        self.assertIn("待确认", self.service.status_for(self.row))
+        self.assertIn("结果不确定", self.service.status_for(self.row))
+
+    def test_completed_ping_with_rolling_full_window_retries_after_backoff(self):
+        self.fetcher.fetch.side_effect = [usage(), usage(reset=19000)]
+        self.check()
+        self.assertIn("等待窗口启动确认", self.service.status_for(self.row))
+        self.assertEqual(self.service._attempts["account"]["until"], 1300)
+        self.check()
+        self.client.ping.assert_called_once()
+        for now in (1060, 1120, 1180, 1240):
+            self.check_at(now)
+        self.usage.item_for.return_value = replace(
+            self.usage.item_for.return_value, windows=usage(reset=19301).windows, observed_at=1301)
+        self.fetcher.fetch.side_effect = [usage(reset=19301), usage(reset=19301, used=1)]
+        with patch("app.services.quota_warmup_service.time.time", return_value=1301):
+            self.service.check_once()
+        self.assertEqual(self.client.ping.call_count, 2)
+        self.check_at(1361, reset=19301)
+        self.assertIn("窗口已启动", self.service.status_for(self.row))
+
+    def test_stable_full_window_confirms_after_backoff_without_resending(self):
+        self.fetcher.fetch.side_effect = [usage(), usage(reset=19000)]
+        self.check()
+        self.usage.item_for.return_value = replace(
+            self.usage.item_for.return_value, windows=usage(reset=19000).windows, observed_at=1301)
+        with patch("app.services.quota_warmup_service.time.time", return_value=1301):
+            self.service.check_once()
+        self.client.ping.assert_called_once()
+        self.assertIn("窗口已启动", self.service.status_for(self.row))
+
+    def test_timeout_keeps_cycle_protection_after_fifteen_minutes(self):
+        self.client.ping.side_effect = TimeoutError()
+        self.check()
+        self.usage.item_for.return_value = replace(
+            self.usage.item_for.return_value, windows=usage(reset=19901).windows, observed_at=1901)
+        with patch("app.services.quota_warmup_service.time.time", return_value=1901):
+            self.service.check_once()
+        self.client.ping.assert_called_once()
+        self.assertIn("结果不确定", self.service.status_for(self.row))
 
     def test_future_full_and_weekly_windows(self):
         self.assertTrue(self.service.ready(usage(reset=19000).windows, 1000))
-        self.assertFalse(self.service.ready(usage(reset=19000, used=1).windows, 1000))
+        self.assertTrue(self.service.ready(usage(reset=19000, used=1).windows, 1000))
         self.assertFalse(self.service.ready(usage(reset=30000).windows, 1000))
         weekly = usage(reset=605800, duration=604800).windows
         self.assertTrue(self.service.ready(weekly, 1000))
+
+    def test_first_observation_and_repeated_cache_never_send(self):
+        self.service._attempts.clear()
+        self.check()
+        self.check()
+        self.client.ping.assert_not_called()
+        self.assertIn("观察", self.service.status_for(self.row))
+
+    def test_full_quota_with_fixed_reset_never_sends(self):
+        self.service._attempts.clear()
+        self.check()
+        self.check_at(1060, reset=19000)
+        self.check_at(1301, reset=19000)
+        self.client.ping.assert_not_called()
+        self.assertIn("窗口已启动", self.service.status_for(self.row))
+
+    def test_rolling_ninety_nine_percent_can_warmup(self):
+        self.usage.item_for.return_value = replace(
+            self.usage.item_for.return_value, windows=usage(used=1).windows)
+        self.fetcher.fetch.side_effect = None
+        self.fetcher.fetch.return_value = usage(used=1)
+        self.check()
+        self.client.ping.assert_called_once()
+
+    def test_expired_reset_alone_is_not_evidence_for_sending(self):
+        self.service._attempts.clear()
+        self.check_at(1000, reset=990)
+        self.check_at(1060, reset=990)
+        self.client.ping.assert_not_called()
+
+    def test_only_two_sends_even_after_restart_or_model_change(self):
+        self.fetcher.fetch.side_effect = lambda *_args, **_kwargs: usage(reset=time.time() + 18000)
+        self.check()
+        for now in range(1060, 1301, 60):
+            self.check_at(now)
+        self.assertEqual(self.client.ping.call_count, 2)
+        restarted = self.make_service()
+        restarted.configure(True, "other-model")
+        for now in range(1360, 1961, 60):
+            self.check_at(now, service=restarted)
+        self.assertEqual(self.client.ping.call_count, 2)
+        self.assertIn("本周期停止发送", restarted.status_for(self.row))
+
+    def test_timeout_never_resends_even_if_window_keeps_sliding(self):
+        self.client.ping.side_effect = TimeoutError()
+        self.check()
+        restarted = self.make_service()
+        restarted.configure(True, "other-model")
+        for now in range(1060, 1601, 60):
+            self.check_at(now, service=restarted)
+        self.client.ping.assert_called_once()
+        self.assertIn("结果不确定", restarted.status_for(self.row))
+
+    def test_user_activity_confirms_start_without_requiring_quota_drop(self):
+        self.fetcher.fetch.side_effect = [usage(), usage()]
+        self.check()
+        self.check_at(1060, reset=19000)
+        self.check_at(1300, reset=19000)
+        self.client.ping.assert_called_once()
+        self.assertIn("窗口已启动", self.service.status_for(self.row))
+
+    def test_new_cycle_gets_new_budget_only_after_confirmed_window_expires(self):
+        self.check()
+        self.check_at(1060, reset=19000)
+        self.check_at(19001)
+        self.client.ping.assert_called_once()
+        self.fetcher.fetch.side_effect = [usage(reset=37061), usage(reset=37061)]
+        self.check_at(19061)
+        self.assertEqual(self.client.ping.call_count, 2)
+        state = self.service._attempts["account"]
+        self.assertEqual(state["cycle"], 2)
+        self.assertEqual(state["count"], 1)
+
+    def test_weekly_first_window_uses_same_observation_rules(self):
+        self.service._attempts.clear()
+        for now in (1000, 1060):
+            result = usage(reset=now + 604800, duration=604800)
+            self.usage.item_for.return_value = replace(
+                self.usage.item_for.return_value, windows=result.windows, observed_at=now)
+            self.fetcher.fetch.side_effect = None
+            self.fetcher.fetch.return_value = result
+            with patch("app.services.quota_warmup_service.time.time", return_value=now):
+                self.service.check_once()
+        self.client.ping.assert_called_once()
+
+    def test_observation_gap_requires_rebuilding_rolling_evidence(self):
+        self.check_at(1600)
+        self.client.ping.assert_not_called()
+        self.fetcher.fetch.side_effect = [usage(reset=19660), usage(reset=19660)]
+        self.check_at(1660)
+        self.client.ping.assert_called_once()
+
+    def test_legacy_attempt_is_not_blindly_repeated(self):
+        self.service._attempts["account"] = {
+            "model": DEFAULT_WARMUP_MODEL, "until": 19000, "attempted": True,
+            "status": "预热完成，窗口已启动"}
+        self.check()
+        self.check_at(1060)
+        self.client.ping.assert_not_called()
+        self.assertIn("结果不确定", self.service.status_for(self.row))
+
+    def test_persistence_failure_prevents_ping(self):
+        with patch.object(Path, "replace", side_effect=OSError("disk unavailable")):
+            with self.assertRaises(OSError):
+                self.check()
+        self.client.ping.assert_not_called()
+
+    def test_quota_failure_after_completed_request_does_not_clear_budget(self):
+        self.check()
+        original = self.usage.item_for.return_value
+        self.usage.item_for.return_value = replace(original, windows=())
+        with patch("app.services.quota_warmup_service.time.time", return_value=1060):
+            self.service.check_once()
+        self.assertEqual(self.service._attempts["account"]["phase"], "waiting")
+        self.assertEqual(self.service._attempts["account"]["count"], 1)
+        self.client.ping.assert_called_once()
+
+    def test_disabled_during_model_check_cancels_ping(self):
+        self.client.check_model.side_effect = lambda *_: setattr(self.row, "disabled", True)
+        self.check()
+        self.client.ping.assert_not_called()
+
+    def test_secondary_window_zero_blocks_send(self):
+        self.usage.item_for.return_value = replace(
+            self.usage.item_for.return_value, windows=usage(secondary_used=100).windows)
+        self.check()
+        self.client.ping.assert_not_called()
+
+    def test_send_budget_is_persisted_before_network_call(self):
+        def verify(*_args):
+            persisted = self.make_service()._attempts["account"]
+            self.assertEqual(persisted["phase"], "uncertain")
+            self.assertEqual(persisted["count"], 1)
+            self.assertEqual(persisted["last_sent_at"], 1000)
+        self.client.ping.side_effect = verify
+        self.check()
+        self.client.ping.assert_called_once()
+
+    def test_small_reset_jitter_confirms_active_full_window(self):
+        self.service._attempts.clear()
+        self.check()
+        self.check_at(1060, reset=19005)
+        self.client.ping.assert_not_called()
+        self.assertIn("窗口已启动", self.service.status_for(self.row))
 
     def test_missing_or_invalid_window_data_is_not_guessed(self):
         data = usage()
