@@ -18,7 +18,7 @@ DEFAULT_WARMUP_MODEL = "gpt-6-luna"
 OBSERVATION_INTERVAL = 45
 RESET_TOLERANCE = 15
 RETRY_INTERVAL = 300
-MAX_CYCLE_ATTEMPTS = 2
+VERIFY_INTERVAL = 60
 
 
 class QuotaWarmupService:
@@ -78,15 +78,12 @@ class QuotaWarmupService:
 
     @staticmethod
     def ready(windows: tuple[QuotaWindow, ...], now: float) -> bool:
-        if not windows or windows[0].remaining_percent < 99:
+        if not windows or windows[0].remaining_percent != 100:
             return False
         if any(window.remaining_percent <= 0 for window in windows):
             return False
-        first = windows[0]
-        # 仅筛选候选；是否未启动必须通过连续观察确认，不能依赖百分比。
-        return first.reset_at <= now or (
-            abs(first.reset_at - now - first.duration_seconds) <= 90
-        )
+        # 百分比只筛选候选；发送后比较绝对重置时间确认周期是否启动。
+        return True
 
     @staticmethod
     def _key(row) -> str:
@@ -125,42 +122,34 @@ class QuotaWarmupService:
             # 旧记录没有窗口证据，尚在保护期内的发送按结果不确定处理。
             protected = state.get("attempted", False) and state.get("until", 0) > observed_at
             state.update(version=2, phase="uncertain" if protected else "observing",
-                         count=MAX_CYCLE_ATTEMPTS if protected else 0, cycle=1,
-                         observation={}, cycle_reset_at=0, rolling_since=0,
+                         count=0, cycle=1,
+                         observation={}, cycle_reset_at=0,
                          status="旧预热记录结果不确定，继续观察" if protected else "观察窗口中")
+        if state.get("phase") == "exhausted":
+            state.update(phase="retry", status="等待5分钟后继续预热")
+        if state.get("phase") == "uncertain" and not state.get("before_reset_at"):
+            state.update(phase="retry", until=min(state.get("until", observed_at + RETRY_INTERVAL),
+                                                 observed_at + RETRY_INTERVAL),
+                         status="旧记录缺少验证基准，5分钟后继续预热")
         previous = state.get("observation", {})
         elapsed = observed_at - previous.get("at", observed_at)
         if previous and elapsed < OBSERVATION_INTERVAL:
             return state
         first = windows[0]
-        # 只有已确认启动的窗口确实到期，才能开启下一周期的发送预算。
+        # 到期或额度恢复后重置时间明显变化，均重新检查，避免提前重置被漏掉。
         boundary = state.get("cycle_reset_at", 0)
-        if boundary and observed_at >= boundary and first.reset_at > boundary + RESET_TOLERANCE:
+        if (boundary and abs(first.reset_at - boundary) > RESET_TOLERANCE
+                and (observed_at >= boundary or first.remaining_percent == 100)):
             state.update(cycle=state["cycle"] + 1, count=0, phase="observing", until=0,
-                         attempted=False, cycle_reset_at=0, rolling_since=0, confirmed_at=0,
+                         attempted=False, cycle_reset_at=0, confirmed_at=0,
                          last_sent_at=0, status="新周期观察中")
         comparable = previous and previous.get("duration") == first.duration_seconds
         stable = (comparable and first.reset_at > observed_at
                   and abs(first.reset_at - previous["reset_at"]) <= RESET_TOLERANCE)
-        rolling = (comparable and elapsed <= 180
-                   and abs(first.reset_at - previous["reset_at"] - elapsed) <= RESET_TOLERANCE
-                   and abs(previous["reset_at"] - previous["at"] - first.duration_seconds) <= 90
-                   and self.ready(windows, observed_at))
         if stable:
             state.update(phase="active", cycle_reset_at=first.reset_at, until=first.reset_at,
-                         confirmed_at=state.get("confirmed_at") or observed_at, rolling_since=0,
+                         confirmed_at=state.get("confirmed_at") or observed_at,
                          status="已确认，窗口已启动，无需重复预热")
-        elif rolling:
-            state["rolling_since"] = state.get("rolling_since") or max(previous["at"], state.get("last_sent_at", 0))
-            if state["phase"] in {"observing", "eligible"}:
-                state.update(phase="eligible", status="窗口持续滑动，等待预热")
-            elif (state["phase"] == "waiting" and state.get("count", 0) >= MAX_CYCLE_ATTEMPTS
-                  and observed_at >= state.get("until", 0)):
-                state.update(phase="exhausted", status="预热未启动周期，本周期停止发送")
-        else:
-            state["rolling_since"] = 0
-            if state["phase"] == "eligible":
-                state.update(phase="observing", status="窗口变化尚不明确，继续观察")
         state["observation"] = {
             "at": observed_at, "reset_at": first.reset_at, "duration": first.duration_seconds,
             "windows": [{"reset_at": w.reset_at, "duration": w.duration_seconds,
@@ -173,14 +162,56 @@ class QuotaWarmupService:
 
     @staticmethod
     def _can_send(state: dict, model: str, now: float) -> bool:
-        if state.get("count", 0) >= MAX_CYCLE_ATTEMPTS or not state.get("rolling_since"):
-            return False
         phase = state.get("phase")
         if phase == "backoff":
             return state.get("until", 0) <= now or state.get("model") != model
-        if phase == "waiting":
-            return now >= state.get("until", 0) and state["rolling_since"] >= state.get("last_sent_at", 0)
-        return phase == "eligible"
+        if phase == "retry":
+            return now >= state.get("until", 0)
+        return phase in {"observing", "eligible"}
+
+    def _verify(self, row, key: str, state: dict) -> None:
+        """独立查询，比较 ping 前的绝对时间；不使用发送前的额度缓存。"""
+        now = time.time()
+        if now < state.get("verify_after", 0):
+            return
+        model = state["model"]
+        try:
+            result = self.fetcher.fetch(row.access_token, row.account_id, proxy_url=self._proxy_provider())
+            if not result.windows:
+                raise RuntimeError("额度接口未返回有效窗口")
+            first = result.windows[0]
+            now = time.time()
+            same_duration = first.duration_seconds == state["before_duration"]
+            stable = same_duration and first.reset_at > now and abs(
+                first.reset_at - state["before_reset_at"]) <= RESET_TOLERANCE
+            observation = {"at": now, "reset_at": first.reset_at, "duration": first.duration_seconds,
+                           "windows": [{"reset_at": w.reset_at, "duration": w.duration_seconds,
+                                        "remaining": w.remaining_percent} for w in result.windows]}
+            if stable:
+                self._record(key, model, first.reset_at, "一分钟后确认，窗口已启动", True,
+                             phase="active", cycle_reset_at=first.reset_at, confirmed_at=now,
+                             before_reset_at=0, verify_after=0, observation=observation)
+            elif same_duration and first.reset_at > state["before_reset_at"] + RESET_TOLERANCE:
+                retry_at = min(state["until"], state.get("last_sent_at", now) + RETRY_INTERVAL)
+                self._record(key, model, retry_at, "重置时间仍变化，预热未生效，等待5分钟补发", True,
+                             phase="retry", before_reset_at=0,
+                             verify_after=now + VERIFY_INTERVAL, observation=observation)
+            else:
+                retry_at = min(state["until"], state.get("last_sent_at", now) + RETRY_INTERVAL)
+                retry = now >= retry_at
+                self._record(key, model, retry_at,
+                             "窗口变化异常，已到5分钟补偿间隔" if retry else "窗口变化异常，继续验证并暂停重发", True,
+                             phase="retry" if retry else "uncertain",
+                             before_reset_at=0 if retry else first.reset_at,
+                             before_duration=first.duration_seconds, verify_after=now + VERIFY_INTERVAL,
+                             observation=observation)
+        except Exception as exc:
+            retry_at = min(state["until"], state.get("last_sent_at", now) + RETRY_INTERVAL)
+            retry = time.time() >= retry_at
+            self._record(key, model, retry_at, f"窗口验证失败，稍后重查（{type(exc).__name__}）", True,
+                         phase="retry" if retry else state["phase"],
+                         before_reset_at=0 if retry else state["before_reset_at"],
+                         verify_after=time.time() + VERIFY_INTERVAL)
 
     def check_once(self) -> None:
         if not self._check_lock.acquire(blocking=False):
@@ -195,11 +226,16 @@ class QuotaWarmupService:
                     return
                 if row.disabled or row.load_strategy == LoadStrategy.DISABLED or not row.access_token:
                     continue
+                key = self._key(row)
+                with self._lock:
+                    state = dict(self._attempts.get(key, {}))
+                if state.get("phase") in {"waiting", "uncertain"} and state.get("before_reset_at"):
+                    self._verify(row, key, state)
+                    continue
                 item = self.usage.item_for(row.refresh_token)
                 now = time.time()
                 if item is None or not item.windows or not 0 <= now - item.observed_at <= 90:
                     continue
-                key = self._key(row)
                 state = self._observe(key, model, item.windows, item.observed_at)
                 if not self.ready(item.windows, item.observed_at) or not self._can_send(state, model, now):
                     continue
@@ -220,12 +256,8 @@ class QuotaWarmupService:
             if not windows:
                 raise RuntimeError("额度接口未返回有效窗口")
             state = self._observe(key, model, windows, observed_at)
-            baseline = state.get("observation", {})
-            still_rolling = (baseline.get("duration") == windows[0].duration_seconds
-                             and abs(windows[0].reset_at - baseline.get("reset_at", 0)
-                                     - (observed_at - baseline.get("at", observed_at))) <= RESET_TOLERANCE)
             limits = (result.raw or {}).get("rate_limit") or {}
-            if (not still_rolling or not self.ready(windows, observed_at) or not self._can_send(state, model, observed_at)
+            if (not self.ready(windows, observed_at) or not self._can_send(state, model, observed_at)
                     or limits.get("allowed") is False or limits.get("limit_reached") is True):
                 return
             self.client.check_model(row.access_token, row.account_id, proxy, model)
@@ -236,22 +268,23 @@ class QuotaWarmupService:
                     or current.load_strategy == LoadStrategy.DISABLED or current.access_token != access_token):
                 return
             sent_at = time.time()
-            until = sent_at + windows[0].duration_seconds
-            # 先持久化再发送，避免程序重启、请求超时导致重复消耗。
+            until = sent_at + RETRY_INTERVAL
+            # 先持久化再发送，重启或超时后仍遵守5分钟补偿间隔。
             self._record(key, model, until, "预热请求发送中，结果待确认", True,
                          phase="uncertain", count=state.get("count", 0) + 1,
-                         last_sent_at=sent_at, rolling_since=0)
+                         last_sent_at=sent_at, before_reset_at=windows[0].reset_at,
+                         before_duration=windows[0].duration_seconds, verify_after=sent_at + VERIFY_INTERVAL)
             attempted = True
             try:
                 self.client.ping(row.access_token, row.account_id, proxy, model, self._stop)
             finally:
                 self.auth.increment_traffic_by_access_token(row.access_token)
             self._record(key, model, sent_at + RETRY_INTERVAL, "请求完成，等待窗口启动确认", True,
-                         phase="waiting")
+                         phase="waiting", verify_after=time.time() + VERIFY_INTERVAL)
         except WarmupRejected as exc:
             self._record(key, model, time.time() + 3600, str(exc), attempted, phase="backoff")
         except Exception as exc:
-            status = "预热结果不确定，继续观察并暂停重发" if attempted else "检查失败，15分钟后重试"
+            status = "预热结果不确定，验证后按5分钟间隔补偿" if attempted else "检查失败，15分钟后重试"
             self._record(key, model, until, status + f"（{type(exc).__name__}）", attempted,
                          phase="uncertain" if attempted else "backoff")
         finally:
