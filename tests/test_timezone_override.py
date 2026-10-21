@@ -169,6 +169,9 @@ class LaunchTests(unittest.TestCase):
         window.timezone_override_var.set("1")
         window.language_name_var.set("ja-JP")
         window.language_override_var.set("1")
+        window.auto_retry_var = tk.BooleanVar(root, False)
+        from app.services.codex_retry_service import CodexRetryService
+        window.codex_retry_service = CodexRetryService()
         window._timezone_launch_busy = False
         window._bind_widget_tooltip = Mock()
         window._schedule_refresh_launch_buttons = Mock()
@@ -180,6 +183,15 @@ class LaunchTests(unittest.TestCase):
         self.assertIn("en-US", window._language_combo["values"])
         self.assertIn("America/New_York", window._timezone_combo["values"])
         self.assertTrue(window._timezone_combo.bind("<<ComboboxSelected>>"))
+        self.assertEqual(window._auto_retry_check.cget("text"), "自动重试")
+        self.assertFalse(window.auto_retry_var.get())
+        with patch.object(window.codex_retry_service, "start"):
+            window._auto_retry_check.invoke()
+            self.assertTrue(window.codex_retry_service.enabled)
+            window._auto_retry_check.invoke()
+            self.assertFalse(window.codex_retry_service.enabled)
+            self.assertTrue(window.codex_retry_service.debugging_enabled)
+        window._persist_config.reset_mock()
         window.timezone_override_var.set("")
         window._on_timezone_edited()
         self.assertEqual(str(window._timezone_combo["state"]), "disabled")

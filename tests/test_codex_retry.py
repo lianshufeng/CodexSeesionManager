@@ -17,6 +17,7 @@ import websocket
 
 from app.services.codex_retry_script import RETRY_SCRIPT
 from app.services.codex_retry_service import CodexRetryService
+from app.services.app_config_service import AppConfig, AppConfigService
 
 
 CAPACITY = "Selected model is at capacity. Please try a different model."
@@ -26,6 +27,8 @@ class RetryServiceTests(unittest.TestCase):
     def test_port_configuration_and_disable(self):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(CodexRetryService().port, 9222)
+            self.assertFalse(CodexRetryService().enabled)
+            self.assertIn("--remote-debugging-port=9222", CodexRetryService().launch_arguments)
             self.assertEqual(CodexRetryService(0.1).interval_seconds, 0.1)
             self.assertFalse(CodexRetryService(port=0).enabled)
             self.assertEqual(CodexRetryService(port=0).launch_arguments, [])
@@ -34,7 +37,40 @@ class RetryServiceTests(unittest.TestCase):
                     CodexRetryService(port=port)
         with patch.dict(os.environ, CODEX_DEBUG_PORT="9233", CODEX_AUTO_RETRY="0"):
             self.assertEqual(CodexRetryService().port, 9233)
-            self.assertEqual(CodexRetryService().launch_arguments, [])
+            self.assertFalse(CodexRetryService(enabled=True).enabled)
+            self.assertIn("--remote-debugging-port=9233", CodexRetryService().launch_arguments)
+
+    def test_switch_gates_scanning_but_keeps_debugging_and_cooldowns(self):
+        service = CodexRetryService(port=9222)
+        arguments = service.launch_arguments
+        service._retry_cooldowns["one"] = 123
+        service._opener = Mock()
+        with patch.object(service, "start") as start:
+            service._scan_once()
+            service._opener.open.assert_not_called()
+            service.set_enabled(True)
+            self.assertTrue(service.enabled)
+            start.assert_called_once()
+            service.set_enabled(False)
+            self.assertFalse(service.enabled)
+            self.assertEqual(service.launch_arguments, arguments)
+            self.assertEqual(service._retry_cooldowns, {"one": 123})
+            service._scan_once()
+            service._opener.open.assert_not_called()
+            ws = Mock()
+            with self.assertRaises(RuntimeError):
+                service._evaluate(ws, RETRY_SCRIPT)
+            ws.send.assert_not_called()
+
+    def test_config_defaults_off_and_remembers_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = AppConfigService(Path(directory) / "config.json")
+            config.config_path.write_text('{"port": 8081}', encoding="utf-8")
+            self.assertFalse(config.load().auto_retry)
+            for enabled in (True, False):
+                config.save(AppConfig(port=8081, auto_retry=enabled))
+                self.assertEqual(config.load().auto_retry, enabled)
+                self.assertEqual(config.load().port, 8081)
 
     def test_old_desktop_instance_requires_restart_but_renderer_is_ignored(self):
         service = CodexRetryService(port=9222)
@@ -49,7 +85,7 @@ class RetryServiceTests(unittest.TestCase):
                 self.assertFalse(service.running_without_debugging(exe))
 
     def test_disconnects_do_not_end_monitoring(self):
-        service = CodexRetryService(interval_seconds=0.01, port=9222)
+        service = CodexRetryService(interval_seconds=0.01, port=9222, enabled=True)
         service._scan_once = Mock(side_effect=[OSError("disconnected"), OSError("not ready"), None])
 
         def tick(_interval):
@@ -109,7 +145,7 @@ class RetryBrowserTests(unittest.TestCase):
         cls.addClassCleanup(cls.ws.close)
 
     def setUp(self):
-        self.service = CodexRetryService(port=9222)
+        self.service = CodexRetryService(port=9222, enabled=True)
         self.evaluate("window.__codexSessionManagerRetryState = undefined; "
                       "window.__codexSessionManagerRetryCooldowns = {}; window.clicks = 0; "
                       f"window.testNow = {int(time.time() * 1000)}; Date.now = () => window.testNow;")
@@ -205,6 +241,36 @@ class RetryBrowserTests(unittest.TestCase):
         self.service._scan_once()
         self.assertEqual(self.evaluate("window.clicks"), 2)
 
+    def test_disabled_monitor_does_not_click_and_resumes_without_restarting_browser(self):
+        descriptor = dict(self.tab, url="app://-/index.html")
+        response = Mock()
+        response.read.return_value = json.dumps([descriptor]).encode()
+        self.service._opener = Mock()
+        self.service._opener.open.return_value.__enter__ = Mock(return_value=response)
+        self.service._opener.open.return_value.__exit__ = Mock(return_value=False)
+        reader = CodexRetryService(enabled=True)
+
+        def clicks():
+            return reader._evaluate(self.ws, "window.clicks")["result"]["result"]["value"]
+
+        with patch.object(self.service, "start"):
+            self.service.set_enabled(False)
+            self.service._scan_once()
+            self.service._opener.open.assert_not_called()
+            self.assertEqual(clicks(), 0)
+            self.service.set_enabled(True)
+            self.service._scan_once()
+            self.assertEqual(clicks(), 1)
+            self.service.set_enabled(False)
+            self.service._scan_once()
+            self.assertEqual(clicks(), 1)
+            self.service.set_enabled(True)
+            self.service._scan_once()
+            self.assertEqual(clicks(), 1)
+            self.advance()
+            self.service._scan_once()
+            self.assertEqual(clicks(), 2)
+
     def sidebar_fixture(self):
         self.fixture(message="healthy")
         markup = ('<button data-app-action-sidebar-thread-row data-app-action-sidebar-thread-id="two">'
@@ -278,7 +344,7 @@ class RetryLaunchTests(unittest.TestCase):
             window.service.process.poll.return_value = None
             window.service.ensure_launch_permissions.return_value = (True, "")
             window._is_relay_active = Mock(return_value=True)
-            window.codex_retry_service = CodexRetryService(port=9222)
+            window.codex_retry_service = CodexRetryService(port=9222, enabled=True)
             with patch.object(window.codex_retry_service, "running_without_debugging", return_value=True), \
                     patch("app.ui.proxy_window.messagebox.showwarning") as warning, \
                     patch("app.ui.proxy_window.subprocess.Popen") as spawn:

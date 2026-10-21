@@ -102,9 +102,10 @@ class CodexProcessRow:
 class ProxyWindow:
     def __init__(self, root: tk.Tk, remote_port: int | None = None) -> None:
         self.root = root
-        self.codex_retry_service = CodexRetryService(port=remote_port)
         self.config_service = AppConfigService()
         loaded_config = self.config_service.load()
+        auto_retry_enabled = loaded_config.auto_retry if loaded_config is not None else False
+        self.codex_retry_service = CodexRetryService(port=remote_port, enabled=auto_retry_enabled)
         self.service = ProxyService()
         self._timezone_proxies: list[TimezoneProxyService] = []
         self._timezone_launch_busy = False
@@ -162,6 +163,7 @@ class ProxyWindow:
         self._proxy_lock = Lock()
         auto_load_enabled = loaded_config.auto_load if loaded_config is not None else True
         self.auto_load_var = tk.BooleanVar(value=auto_load_enabled)
+        self.auto_retry_var = tk.BooleanVar(value=auto_retry_enabled)
         quota_warmup_enabled = loaded_config.quota_warmup if loaded_config is not None else False
         self.quota_warmup_var = tk.BooleanVar(value=quota_warmup_enabled)
         self.quota_warmup_model_var = tk.StringVar(
@@ -183,6 +185,7 @@ class ProxyWindow:
             self._active_credential_type = CREDENTIAL_TYPE_CODEX_AUTH
             self._active_credential_id = ""
         self._auto_load_check: ttk.Checkbutton | None = None
+        self._auto_retry_check: ttk.Checkbutton | None = None
         self._quota_warmup_check: ttk.Checkbutton | None = None
         self._quota_warmup_model_entry: ttk.Entry | None = None
         self._auto_load_enabled = auto_load_enabled
@@ -367,7 +370,7 @@ class ProxyWindow:
         self._timezone_combo.bind("<<ComboboxSelected>>", self._on_timezone_edited)
         self._timezone_combo.bind("<FocusOut>", self._on_timezone_edited)
         self._timezone_combo.bind("<Return>", self._on_timezone_edited)
-        self._bind_widget_tooltip(self._timezone_combo, "下次启动时生效，仅修改模型收到的时区和日期。")
+        self._bind_widget_tooltip(self._timezone_combo, "覆盖模型时区。")
 
         ttk.Checkbutton(
             upstream_row, text="语言覆盖", variable=self.language_override_var,
@@ -381,8 +384,7 @@ class ProxyWindow:
         self._language_combo.bind("<<ComboboxSelected>>", self._on_timezone_edited)
         self._language_combo.bind("<FocusOut>", self._on_timezone_edited)
         self._language_combo.bind("<Return>", self._on_timezone_edited)
-        self._bind_widget_tooltip(
-            self._language_combo, "下次启动时覆盖请求语言头和已存在的语言字段；不修改 Windows 系统语言。")
+        self._bind_widget_tooltip(self._language_combo, "覆盖请求语言。")
 
         actions = ttk.Frame(top)
         actions.pack(side="right", anchor="e")
@@ -472,6 +474,17 @@ class ProxyWindow:
             command=self._on_auto_load_toggled,
         )
         self._auto_load_check.pack(side="left")
+        self._auto_retry_check = ttk.Checkbutton(
+            auth_options,
+            text="自动重试",
+            variable=self.auto_retry_var,
+            command=self._on_auto_retry_toggled,
+        )
+        self._auto_retry_check.pack(side="left", padx=(8, 0))
+        self._bind_widget_tooltip(
+            self._auto_retry_check,
+            "自动重试容量错误。",
+        )
         quota_warmup_check = ttk.Checkbutton(
             auth_options,
             text="额度预热",
@@ -480,13 +493,13 @@ class ProxyWindow:
         )
         quota_warmup_check.pack(side="left", padx=(8, 0))
         self._quota_warmup_check = quota_warmup_check
-        self._bind_widget_tooltip(quota_warmup_check, "优先选择5小时剩余额度不低于99%的可用账号承接正常请求；后台自动ping预热暂时停用")
+        self._bind_widget_tooltip(quota_warmup_check, "优先使用高额度账号。")
         ttk.Label(auth_options, text="预热模型：").pack(side="left", padx=(8, 0))
         self._quota_warmup_model_entry = ttk.Entry(auth_options, textvariable=self.quota_warmup_model_var, width=17)
         self._quota_warmup_model_entry.pack(side="left")
         self._quota_warmup_model_entry.bind("<FocusOut>", self._on_quota_warmup_model_edited)
         self._quota_warmup_model_entry.bind("<Return>", self._on_quota_warmup_model_edited)
-        self._bind_widget_tooltip(self._quota_warmup_model_entry, "后台自动ping预热暂时停用；模型设置保留，暂不生效")
+        self._bind_widget_tooltip(self._quota_warmup_model_entry, "设置额度预热模型。")
         auto_reset_credit_check = ttk.Checkbutton(
             auth_options, text="到期自动用卡", variable=self.auto_reset_credit_var,
             command=self._on_auto_reset_credit_toggled)
@@ -1140,6 +1153,10 @@ class ProxyWindow:
         self.auth_reset_credit_service.set_auto_use_enabled(self.auto_reset_credit_var.get())
         self._persist_config()
 
+    def _on_auto_retry_toggled(self) -> None:
+        self.codex_retry_service.set_enabled(self.auto_retry_var.get())
+        self._persist_config()
+
     def _persist_config(self) -> None:
         try:
             port = int(self.port_var.get().strip())
@@ -1158,6 +1175,7 @@ class ProxyWindow:
                 upstream_proxy=upstream_proxy,
                 use_upstream_proxy=self.use_upstream_proxy_var.get(),
                 auto_load=self.auto_load_var.get(),
+                auto_retry=self.auto_retry_var.get(),
                 quota_warmup=self.quota_warmup_var.get(),
                 quota_warmup_model=self.quota_warmup_model_var.get().strip() or DEFAULT_WARMUP_MODEL,
                 auto_reset_credit=self.auto_reset_credit_var.get(),
@@ -1877,6 +1895,8 @@ class ProxyWindow:
         self.upstream_proxy_var.set(loaded_config.upstream_proxy)
         self.use_upstream_proxy_var.set(loaded_config.use_upstream_proxy)
         self.auto_load_var.set(loaded_config.auto_load)
+        self.auto_retry_var.set(loaded_config.auto_retry)
+        self.codex_retry_service.set_enabled(loaded_config.auto_retry)
         self.quota_warmup_var.set(loaded_config.quota_warmup)
         self.quota_warmup_model_var.set(loaded_config.quota_warmup_model)
         self.auto_reset_credit_var.set(loaded_config.auto_reset_credit)
@@ -4685,9 +4705,9 @@ del "%~f0" >nul 2>nul
             )
             return True
         args = [str(exe)]
-        if self.codex_retry_service.enabled:
+        if self.codex_retry_service.debugging_enabled:
             if self.codex_retry_service.running_without_debugging(exe):
-                messagebox.showwarning("需要重新启动", "请先完全退出 Codex，再从管理器启动，以启用自动重试调试连接。")
+                messagebox.showwarning("需要重新启动", "请先完全退出 Codex，再从管理器启动，以启用默认调试连接。")
                 return False
             args.extend(self.codex_retry_service.launch_arguments)
         if exe.name.lower() == "chatgpt.exe" or timezone_active:

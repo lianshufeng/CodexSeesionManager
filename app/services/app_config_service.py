@@ -14,6 +14,7 @@ class AppConfig:
     upstream_proxy: str = "127.0.0.1:1088"
     use_upstream_proxy: bool = True
     auto_load: bool = True
+    auto_retry: bool = False
     quota_warmup: bool = False
     quota_warmup_model: str = "gpt-6-luna"
     auto_reset_credit: bool = False
@@ -70,6 +71,7 @@ class AppConfigService:
             upstream_proxy=upstream_proxy,
             use_upstream_proxy=use_upstream_proxy,
             auto_load=auto_load,
+            auto_retry=bool(data.get("auto_retry", False)),
             quota_warmup=quota_warmup,
             quota_warmup_model=str(data.get("quota_warmup_model") or "gpt-6-luna").strip() or "gpt-6-luna",
             auto_reset_credit=bool(data.get("auto_reset_credit", False)),
@@ -93,6 +95,7 @@ class AppConfigService:
             "upstream_proxy": config.upstream_proxy,
             "use_upstream_proxy": config.use_upstream_proxy,
             "auto_load": config.auto_load,
+            "auto_retry": config.auto_retry,
             "quota_warmup": config.quota_warmup,
             "quota_warmup_model": config.quota_warmup_model,
             "auto_reset_credit": config.auto_reset_credit,

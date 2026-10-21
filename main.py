@@ -82,7 +82,7 @@ def _install_exception_hooks(root) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--remote-port", type=int, help="Codex 调试端口，默认 9222；0 关闭自动重试")
+    parser.add_argument("--remote-port", type=int, help="Codex 调试端口，默认 9222；0 关闭调试连接")
     args = parser.parse_known_args()[0]
     from app.utils.path_utils import app_root
     from app.utils.single_instance import SingleInstance
