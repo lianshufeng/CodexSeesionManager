@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import traceback
+import argparse
 from pathlib import Path
 
 _MB_YESNO = 0x00000004
@@ -80,6 +81,9 @@ def _install_exception_hooks(root) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--remote-port", type=int, help="Codex 调试端口，默认 9222；0 关闭自动重试")
+    args = parser.parse_known_args()[0]
     from app.utils.path_utils import app_root
     from app.utils.single_instance import SingleInstance
 
@@ -128,7 +132,7 @@ def main() -> None:
                 root.iconbitmap(icon_path)
             except tk.TclError:
                 pass
-        window = ProxyWindow(root)
+        window = ProxyWindow(root, remote_port=args.remote_port)
         single_instance.start_restore_server(window.request_restore_window)
         root.mainloop()
     finally:

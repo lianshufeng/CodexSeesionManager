@@ -196,11 +196,17 @@ class LaunchTests(unittest.TestCase):
             window.service.process.poll.return_value = None
             window.service.ensure_launch_permissions.return_value = (True, "")
             window._is_relay_active = Mock(return_value=True)
-            with patch("app.ui.proxy_window.subprocess.Popen") as spawn:
+            from app.services.codex_retry_service import CodexRetryService
+            window.codex_retry_service = CodexRetryService(port=9222)
+            with patch("app.ui.proxy_window.subprocess.Popen") as spawn, \
+                    patch.object(window.codex_retry_service, "start"), \
+                    patch.object(window.codex_retry_service, "running_without_debugging", return_value=False):
                 self.assertTrue(window._launch_codex_process(SimpleNamespace(path=str(exe)), 18081, True))
                 args = spawn.call_args.args[0]
                 self.assertIn("--proxy-server=http://127.0.0.1:18081", args)
                 self.assertNotIn("--no-proxy-server", args)
+                self.assertIn("--remote-debugging-port=9222", args)
+                self.assertIn("--remote-debugging-address=127.0.0.1", args)
                 self.assertEqual(spawn.call_args.kwargs["env"]["HTTPS_PROXY"], "http://127.0.0.1:18081")
                 self.assertEqual(spawn.call_args.kwargs["env"]["NO_PROXY"], "")
 

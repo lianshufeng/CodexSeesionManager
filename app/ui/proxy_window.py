@@ -51,6 +51,7 @@ from app.models import (CREDENTIAL_TYPE_CODEX_AUTH, CREDENTIAL_TYPE_RELAY_API, R
 from app.services.relay_config_service import RelayConfigService
 from app.services.codex_local_config_service import CodexLocalConfigService
 from app.services.packaged_app_launch_service import activate_packaged_app, packaged_app_id
+from app.services.codex_retry_service import CodexRetryService
 from app.utils.path_utils import app_root
 from tkinter import messagebox, ttk
 
@@ -99,8 +100,9 @@ class CodexProcessRow:
 
 
 class ProxyWindow:
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, remote_port: int | None = None) -> None:
         self.root = root
+        self.codex_retry_service = CodexRetryService(port=remote_port)
         self.config_service = AppConfigService()
         loaded_config = self.config_service.load()
         self.service = ProxyService()
@@ -311,6 +313,7 @@ class ProxyWindow:
         self.auth_sync_service.start()
         self.auth_usage_service.start()
         self.auth_reset_credit_service.start()
+        self.codex_retry_service.start()
         self._center_window(1040, 660)
         self._load_or_probe_initial_config(loaded_config is not None)
         self._sync_proxy_config_cache()
@@ -4682,6 +4685,11 @@ del "%~f0" >nul 2>nul
             )
             return True
         args = [str(exe)]
+        if self.codex_retry_service.enabled:
+            if self.codex_retry_service.running_without_debugging(exe):
+                messagebox.showwarning("需要重新启动", "请先完全退出 Codex，再从管理器启动，以启用自动重试调试连接。")
+                return False
+            args.extend(self.codex_retry_service.launch_arguments)
         if exe.name.lower() == "chatgpt.exe" or timezone_active:
             if bypass_proxy:
                 args.append("--no-proxy-server")
@@ -4718,6 +4726,7 @@ del "%~f0" >nul 2>nul
                 self.codex_local_config_service.set_proxy_environment(None)
                 messagebox.showerror("启动失败", str(exc))
                 return False
+            self.codex_retry_service.start()
             return True
         subprocess.Popen(
             args,
@@ -4728,6 +4737,7 @@ del "%~f0" >nul 2>nul
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        self.codex_retry_service.start()
         return True
 
     def _is_cli_codex_executable(self, path: Path) -> bool:
@@ -4916,6 +4926,7 @@ del "%~f0" >nul 2>nul
 
     def _shutdown_app(self) -> None:
         self._closing = True
+        self.codex_retry_service.stop()
         if self._token_history_window is not None and self._token_history_window.window.winfo_exists():
             self._token_history_window.close()
         self._remove_tray_icon()
