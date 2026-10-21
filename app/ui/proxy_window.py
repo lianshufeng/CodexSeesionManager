@@ -57,6 +57,7 @@ from tkinter import messagebox, ttk
 from app.services.proxy_service import ProxyConfig, ProxyService
 from app.services.timezone_proxy_service import TimezoneProxyService
 from app.services.timezone_rewrite_service import COMMON_TIMEZONES, DEFAULT_TIMEZONE, validate_timezone
+from app.services.language_rewrite_service import COMMON_LANGUAGES, DEFAULT_LANGUAGE, validate_language
 from app.services.tray_service import RecoverableTrayIcon
 from app.services.token_history_service import TokenHistoryService
 from app.ui.token_history_window import TokenHistoryWindow
@@ -130,6 +131,10 @@ class ProxyWindow:
             value=loaded_config.timezone_override if loaded_config is not None else True)
         self.timezone_name_var = tk.StringVar(
             value=loaded_config.timezone_name if loaded_config is not None else DEFAULT_TIMEZONE)
+        self.language_override_var = tk.BooleanVar(
+            value=loaded_config.language_override if loaded_config is not None else True)
+        self.language_name_var = tk.StringVar(
+            value=loaded_config.language_name if loaded_config is not None else DEFAULT_LANGUAGE)
         self.upstream_proxy_var = tk.StringVar(value=self.service.config.upstream_proxy)
         self.use_upstream_proxy_var = tk.BooleanVar(value=self.service.config.use_upstream_proxy)
         self.cloud_s3_address_var = tk.StringVar(
@@ -358,6 +363,21 @@ class ProxyWindow:
         self._timezone_combo.bind("<FocusOut>", self._on_timezone_edited)
         self._timezone_combo.bind("<Return>", self._on_timezone_edited)
         self._bind_widget_tooltip(self._timezone_combo, "下次启动时生效，仅修改模型收到的时区和日期。")
+
+        ttk.Checkbutton(
+            upstream_row, text="语言覆盖", variable=self.language_override_var,
+            command=self._on_timezone_edited,
+        ).pack(side="left", padx=(16, 0))
+        self._language_combo = ttk.Combobox(
+            upstream_row, textvariable=self.language_name_var, values=COMMON_LANGUAGES, width=10,
+            state=tk.NORMAL if self.language_override_var.get() else tk.DISABLED,
+        )
+        self._language_combo.pack(side="left", padx=(8, 0))
+        self._language_combo.bind("<<ComboboxSelected>>", self._on_timezone_edited)
+        self._language_combo.bind("<FocusOut>", self._on_timezone_edited)
+        self._language_combo.bind("<Return>", self._on_timezone_edited)
+        self._bind_widget_tooltip(
+            self._language_combo, "下次启动时覆盖请求语言头和已存在的语言字段；不修改 Windows 系统语言。")
 
         actions = ttk.Frame(top)
         actions.pack(side="right", anchor="e")
@@ -1127,6 +1147,8 @@ class ProxyWindow:
             AppConfig(
                 timezone_override=self.timezone_override_var.get(),
                 timezone_name=self.timezone_name_var.get().strip() or DEFAULT_TIMEZONE,
+                language_override=self.language_override_var.get(),
+                language_name=self.language_name_var.get().strip() or DEFAULT_LANGUAGE,
                 port=port,
                 upstream_proxy=upstream_proxy,
                 use_upstream_proxy=self.use_upstream_proxy_var.get(),
@@ -4493,16 +4515,21 @@ del "%~f0" >nul 2>nul
     def _launch_codex(self, row: CodexInstallRow) -> None:
         if self._timezone_launch_busy:
             return
-        if not self.timezone_override_var.get():
+        if not self.timezone_override_var.get() and not self.language_override_var.get():
             if self._timezone_proxies:
-                messagebox.showwarning("需要重新启动", "请完全退出已启用时区的实例并停止服务器，再启动新的实例。")
+                messagebox.showwarning("需要重新启动", "请完全退出已启用覆盖的实例并停止服务器，再启动新的实例。")
                 return
             self._launch_codex_process(row)
             return
         try:
-            timezone_name = validate_timezone(self.timezone_name_var.get())
+            timezone_name = validate_timezone(self.timezone_name_var.get()) if self.timezone_override_var.get() else None
         except (ValueError, KeyError):
             messagebox.showerror("时区无效", "请输入有效的 IANA 时区，例如 Asia/Tokyo。")
+            return
+        try:
+            language_name = validate_language(self.language_name_var.get()) if self.language_override_var.get() else None
+        except ValueError:
+            messagebox.showerror("语言无效", "请输入有效的语言代码，例如 ja-JP、en-US 或 zh-CN。")
             return
         if not Path(row.path).exists():
             messagebox.showerror("启动失败", f"找不到文件 {row.path}")
@@ -4520,7 +4547,7 @@ del "%~f0" >nul 2>nul
                         or not self._is_cli_codex_executable(Path(row.path))
                     )
                 ):
-                    messagebox.showwarning("需要重新启动", "请先完全退出正在运行的 ChatGPT / Codex，再启动以应用时区。")
+                    messagebox.showwarning("需要重新启动", "请先完全退出正在运行的 ChatGPT / Codex，再启动以应用时区和语言。")
                     return
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -4529,7 +4556,7 @@ del "%~f0" >nul 2>nul
         launch_cancel = self._timezone_launch_cancel
         self._persist_config()
         self._timezone_launch_busy = True
-        self._service_status_var.set(f"正在准备时区代理: {timezone_name}")
+        self._service_status_var.set(f"正在准备覆盖代理: 时区 {timezone_name or '关闭'}，语言 {language_name or '关闭'}")
         self._set_timezone_launch_busy(True)
         upstream_port = self.service.config.port
 
@@ -4537,7 +4564,7 @@ del "%~f0" >nul 2>nul
             proxy = None
             error = ""
             try:
-                proxy = TimezoneProxyService(timezone_name, upstream_port)
+                proxy = TimezoneProxyService(timezone_name, upstream_port, language_name)
                 if self._closing or launch_cancel.is_set():
                     return
                 self._timezone_proxies.append(proxy)
@@ -4561,10 +4588,14 @@ del "%~f0" >nul 2>nul
             button.config(state=tk.DISABLED if busy else tk.NORMAL)
         self._timezone_combo.config(
             state=tk.NORMAL if not busy and self.timezone_override_var.get() else tk.DISABLED)
+        self._language_combo.config(
+            state=tk.NORMAL if not busy and self.language_override_var.get() else tk.DISABLED)
 
     def _on_timezone_edited(self, _event=None) -> None:
         self._timezone_combo.config(
             state=tk.NORMAL if not self._timezone_launch_busy and self.timezone_override_var.get() else tk.DISABLED)
+        self._language_combo.config(
+            state=tk.NORMAL if not self._timezone_launch_busy and self.language_override_var.get() else tk.DISABLED)
         self._persist_config()
 
     def _finish_timezone_launch(self, row, proxy, error: str, cancel_event: Event | None = None) -> None:
@@ -4583,7 +4614,7 @@ del "%~f0" >nul 2>nul
                 proxy.stop()
                 if proxy in self._timezone_proxies:
                     self._timezone_proxies.remove(proxy)
-            self._service_status_var.set("时区代理启动失败")
+            self._service_status_var.set("覆盖代理启动失败")
             messagebox.showerror("启动失败", error)
             return
         if proxy not in self._timezone_proxies:
@@ -4594,7 +4625,8 @@ del "%~f0" >nul 2>nul
                 self._timezone_proxies.remove(proxy)
                 self._service_status_var.set("Codex 启动未完成")
                 return
-            self._service_status_var.set(f"时区规则已准备: {proxy.timezone_name}，实际改写结果请查看日志")
+            self._service_status_var.set(
+                f"覆盖规则已准备: 时区 {proxy.timezone_name or '关闭'}，语言 {proxy.language_name or '关闭'}，实际结果请查看日志")
         except Exception as exc:
             proxy.stop()
             self._timezone_proxies.remove(proxy)

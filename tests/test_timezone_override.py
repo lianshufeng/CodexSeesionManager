@@ -17,6 +17,7 @@ from app.services.app_config_service import AppConfig, AppConfigService
 from app.services.timezone_proxy_addon import TimezoneProxyAddon
 from app.services.timezone_proxy_service import TimezoneProxyService
 from app.services.timezone_rewrite_service import TimezoneRewriter, validate_timezone
+from app.services.language_rewrite_service import LanguageRewriter, validate_language
 
 
 def context(zone="Asia/Shanghai", day="2026-10-21", tag="environment_context"):
@@ -166,6 +167,8 @@ class LaunchTests(unittest.TestCase):
             setattr(window, name, tk.StringVar(root, value="0"))
         window.timezone_name_var.set("Asia/Tokyo")
         window.timezone_override_var.set("1")
+        window.language_name_var.set("ja-JP")
+        window.language_override_var.set("1")
         window._timezone_launch_busy = False
         window._bind_widget_tooltip = Mock()
         window._schedule_refresh_launch_buttons = Mock()
@@ -173,11 +176,14 @@ class LaunchTests(unittest.TestCase):
         window._build_ui()
         root.update_idletasks()
         self.assertEqual(window._timezone_combo.get(), "Asia/Tokyo")
+        self.assertEqual(window._language_combo.get(), "ja-JP")
+        self.assertIn("en-US", window._language_combo["values"])
         self.assertIn("America/New_York", window._timezone_combo["values"])
         self.assertTrue(window._timezone_combo.bind("<<ComboboxSelected>>"))
         window.timezone_override_var.set("")
         window._on_timezone_edited()
         self.assertEqual(str(window._timezone_combo["state"]), "disabled")
+        self.assertEqual(str(window._language_combo["state"]), "normal")
         window._persist_config.assert_called_once()
 
     def test_relay_launch_routes_through_instance_proxy(self):
@@ -219,6 +225,129 @@ class LaunchTests(unittest.TestCase):
         window._finish_timezone_launch("row", proxy, "")
         proxy.stop.assert_called_once()
         self.assertEqual(window._timezone_proxies, [])
+
+
+class LanguageTests(unittest.TestCase):
+    def test_config_defaults_and_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = AppConfigService(Path(directory) / "config.json")
+            config.config_path.write_text('{"timezone_name":"Asia/Tokyo"}', encoding="utf-8")
+            self.assertTrue(config.load().language_override)
+            self.assertEqual(config.load().language_name, "ja-JP")
+            config.save(AppConfig(language_override=False, language_name="en-US"))
+            self.assertFalse(config.load().language_override)
+            self.assertEqual(config.load().language_name, "en-US")
+
+    def test_language_validation(self):
+        self.assertEqual(validate_language(" JA_jp "), "ja-JP")
+        self.assertEqual(validate_language("zh-hant-tw"), "zh-Hant-TW")
+        for value in ("", "日语", "ja-JP\r\nX-Test: yes", "ja;q=0.5"):
+            with self.assertRaises(ValueError):
+                validate_language(value)
+
+    def test_existing_metadata_and_context(self):
+        payload = request("<environment_context><os_language>zh-CN</os_language>"
+                          "<locale>zh-CN</locale><timezone>Asia/Shanghai</timezone></environment_context>")
+        payload["client_metadata"] = {"locale": "zh-CN", "country": "CN", "other": "zh-CN"}
+        payload["_meta"] = {"openai/locale": "zh-CN", "openai/userLocation": {"country": "CN"}}
+        rewriter = LanguageRewriter("ja-JP")
+        self.assertTrue(rewriter.rewrite(payload))
+        self.assertIn("<os_language>ja-JP</os_language>", text(payload))
+        self.assertIn("<locale>ja-JP</locale>", text(payload))
+        self.assertIn("Asia/Shanghai", text(payload))
+        self.assertEqual(payload["client_metadata"], {"locale": "ja-JP", "country": "CN", "other": "zh-CN"})
+        self.assertEqual(payload["_meta"]["openai/locale"], "ja-JP")
+        self.assertEqual(payload["_meta"]["openai/userLocation"], {"country": "CN"})
+        self.assertFalse(rewriter.rewrite(payload))
+
+    def test_no_fields_invented_and_user_text_untouched(self):
+        payload = request("系统语言是 zh-CN，请解释 locale 字段")
+        payload["input"].append({"type": "function_call", "arguments": '{"language":"zh-CN"}'})
+        original = copy.deepcopy(payload)
+        self.assertFalse(LanguageRewriter("ja-JP").rewrite(payload))
+        self.assertEqual(payload, original)
+
+    def test_mcp_metadata_only(self):
+        payload = {"params": {"_meta": {"openai/locale": "en-US"}, "arguments": {"language": "en-US"}}}
+        self.assertTrue(LanguageRewriter("ja-JP").rewrite(payload))
+        self.assertEqual(payload["params"]["_meta"]["openai/locale"], "ja-JP")
+        self.assertEqual(payload["params"]["arguments"]["language"], "en-US")
+
+    def test_language_only_proxy_has_private_environment(self):
+        import os
+        with patch.object(TimezoneProxyService, "find_available_port", return_value=18081), \
+                patch.dict(os.environ, {"CODEX_SESSION_TIMEZONE": "Europe/London"}):
+            proxy = TimezoneProxyService(None, 18080, "ja-JP")
+            env = proxy._process_environment()
+            self.assertNotIn("CODEX_SESSION_TIMEZONE", env)
+            self.assertEqual(env["CODEX_SESSION_LANGUAGE"], "ja-JP")
+            self.assertEqual(os.environ["CODEX_SESSION_TIMEZONE"], "Europe/London")
+
+    def test_headers_metadata_compression_and_disabled(self):
+        for compression in (None, "gzip", "zstd"):
+            addon = TimezoneProxyAddon(language_name="ja-JP")
+            flow = tflow.tflow()
+            payload = request()
+            payload["client_metadata"] = {"locale": "zh-CN"}
+            flow.request = http.Request.make("POST", "https://example.test/responses",
+                json.dumps(payload).encode(), {"Content-Type": "application/json", "Accept-Language": "zh-CN"})
+            if compression:
+                flow.request.encode(compression)
+            addon.request(flow)
+            updated = json.loads(flow.request.get_text())
+            self.assertEqual(flow.request.headers["accept-language"], "ja-JP,ja;q=0.9")
+            self.assertEqual(updated["client_metadata"]["locale"], "ja-JP")
+            self.assertIn("Asia/Shanghai", text(updated))
+            self.assertEqual(int(flow.request.headers["content-length"]), len(flow.request.raw_content))
+        addon = TimezoneProxyAddon("Asia/Tokyo")
+        flow = tflow.tflow()
+        flow.request.headers["Accept-Language"] = "zh-CN"
+        addon.request(flow)
+        self.assertEqual(flow.request.headers["Accept-Language"], "zh-CN")
+
+    def test_websocket_language_only_and_server_untouched(self):
+        addon = TimezoneProxyAddon(language_name="ja-JP")
+        flow = tflow.tflow()
+        flow.request.path = "/responses"
+        flow.websocket = websocket.WebSocketData()
+        payload = request()
+        payload.update(type="response.create", client_metadata={"locale": "zh-CN"})
+        for from_client in (True, False):
+            msg = websocket.WebSocketMessage(1, from_client, json.dumps(payload).encode())
+            flow.websocket.messages.append(msg)
+            addon.websocket_message(flow)
+            parsed = json.loads(msg.content)
+            self.assertEqual(parsed["client_metadata"]["locale"], "ja-JP" if from_client else "zh-CN")
+            self.assertIn("Asia/Shanghai", text(parsed))
+
+    def test_language_only_launch_ignores_disabled_timezone(self):
+        from app.ui.proxy_window import ProxyWindow
+        with tempfile.TemporaryDirectory() as directory:
+            exe = Path(directory) / "ChatGPT.exe"
+            exe.touch()
+            window = ProxyWindow.__new__(ProxyWindow)
+            window._timezone_launch_busy = False
+            window._closing = False
+            window.timezone_override_var = Mock(get=Mock(return_value=False))
+            window.language_override_var = Mock(get=Mock(return_value=True))
+            window.timezone_name_var = Mock(get=Mock(return_value="invalid zone"))
+            window.language_name_var = Mock(get=Mock(return_value="ja-JP"))
+            window._timezone_proxies = []
+            window._stop_timezone_proxies = Mock()
+            window._persist_config = Mock()
+            window._set_timezone_launch_busy = Mock()
+            window._service_status_var = Mock()
+            window._post_ui = Mock()
+            window.service = Mock()
+            window.service.process.poll.return_value = None
+            window.service.config.port = 18080
+            with patch("app.ui.proxy_window.psutil.process_iter", return_value=[]), \
+                    patch("app.ui.proxy_window.TimezoneProxyService") as factory, \
+                    patch("app.ui.proxy_window.Thread") as thread:
+                factory.return_value.run.return_value = (True, "")
+                window._launch_codex(SimpleNamespace(path=str(exe)))
+                thread.call_args.kwargs["target"]()
+                factory.assert_called_once_with(None, 18080, "ja-JP")
 
 
 if __name__ == "__main__":

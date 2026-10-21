@@ -26,6 +26,8 @@ class AppConfig:
     cloud_password: str = ""
     timezone_override: bool = True
     timezone_name: str = "Asia/Tokyo"
+    language_override: bool = True
+    language_name: str = "ja-JP"
 
 
 class AppConfigService:
@@ -62,6 +64,8 @@ class AppConfigService:
         return AppConfig(
             timezone_override=bool(data.get("timezone_override", True)),
             timezone_name=str(data.get("timezone_name") or "Asia/Tokyo"),
+            language_override=bool(data.get("language_override", True)),
+            language_name=str(data.get("language_name") or "ja-JP"),
             port=port,
             upstream_proxy=upstream_proxy,
             use_upstream_proxy=use_upstream_proxy,
@@ -83,6 +87,8 @@ class AppConfigService:
         payload = {
             "timezone_override": config.timezone_override,
             "timezone_name": config.timezone_name,
+            "language_override": config.language_override,
+            "language_name": config.language_name,
             "port": config.port,
             "upstream_proxy": config.upstream_proxy,
             "use_upstream_proxy": config.use_upstream_proxy,

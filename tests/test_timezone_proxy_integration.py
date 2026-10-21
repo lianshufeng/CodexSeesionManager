@@ -40,6 +40,9 @@ class EchoHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         body = encoding.decode(body, self.headers.get("Content-Encoding", "identity"))
+        payload = json.loads(body)
+        payload["_received_accept_language"] = self.headers.get("Accept-Language", "")
+        body = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -116,7 +119,7 @@ class ProxyChainIntegration(unittest.TestCase):
                     else:
                         self.fail("main proxy did not start")
                     with patch.object(TimezoneProxyService, "certificate_dir", return_value=confdir):
-                        proxy = TimezoneProxyService("Asia/Tokyo", main_port)
+                        proxy = TimezoneProxyService("Asia/Tokyo", main_port, "ja-JP")
                         ok, error = proxy.run()
                         self.assertTrue(ok, error)
                         client_context = ssl.create_default_context(cafile=str(confdir / "mitmproxy-ca-cert.pem"))
@@ -128,6 +131,7 @@ class ProxyChainIntegration(unittest.TestCase):
 
                         payload = {"input": [{"role": "developer", "content": [{"type": "input_text",
                                    "text": "<environment_context><timezone>Asia/Shanghai</timezone></environment_context>"}]}]}
+                        payload["client_metadata"] = {"locale": "zh-CN"}
                         body = json.dumps(payload).encode()
                         for port, expected in ((main_port, "Asia/Shanghai"), (proxy.config.port, "Asia/Tokyo")):
                             conn = connection(port)
@@ -138,6 +142,13 @@ class ProxyChainIntegration(unittest.TestCase):
                                 result = response.read().decode()
                                 self.assertEqual(response.status, 200, result)
                                 self.assertIn(expected, result)
+                                decoded = json.loads(result)
+                                if port == proxy.config.port:
+                                    self.assertEqual(decoded["client_metadata"]["locale"], "ja-JP")
+                                    self.assertEqual(decoded["_received_accept_language"], "ja-JP,ja;q=0.9")
+                                else:
+                                    self.assertEqual(decoded["client_metadata"]["locale"], "zh-CN")
+                                    self.assertEqual(decoded["_received_accept_language"], "")
                             finally:
                                 conn.close()
                         conn = connection(proxy.config.port)
@@ -160,6 +171,7 @@ class ProxyChainIntegration(unittest.TestCase):
                                 size = struct.unpack("!H", reader.read(2))[0]
                             echoed = reader.read(size).decode()
                             self.assertIn("Asia/Tokyo", echoed)
+                            self.assertEqual(json.loads(echoed)["client_metadata"]["locale"], "ja-JP")
                             reader.close()
                         finally:
                             conn.close()

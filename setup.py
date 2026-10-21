@@ -20,6 +20,7 @@ include_files = [
     ("app/services/proxy_logger_addon.py", "proxy_logger_addon.py"),
     ("app/services/timezone_proxy_addon.py", "timezone_proxy_addon.py"),
     ("app/services/timezone_rewrite_service.py", "timezone_rewrite_service.py"),
+    ("app/services/language_rewrite_service.py", "language_rewrite_service.py"),
     ("icon/icon.ico", "icon/icon.ico"),
     ("icon/tray_icon.ico", "icon/tray_icon.ico"),
 ]
