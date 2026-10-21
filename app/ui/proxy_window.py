@@ -318,7 +318,9 @@ class ProxyWindow:
         self.refresh_all()
         self.root.after(1000, self._tick_reset_credit_countdown)
         self._refresh_credential_mode_state()
-        self.quota_warmup_service.start()
+        # 暂停后台自动 ping 预热及其验证、补偿，保留实现以便恢复。
+        # “额度预热”的高额度账号选号仍由 _recompute_auto_load_target 执行。
+        # self.quota_warmup_service.start()
         self._recompute_auto_load_target()
         self._add_tray_icon()
         self.root.after(500, self._auto_start_with_certificate_check)
@@ -475,13 +477,13 @@ class ProxyWindow:
         )
         quota_warmup_check.pack(side="left", padx=(8, 0))
         self._quota_warmup_check = quota_warmup_check
-        self._bind_widget_tooltip(quota_warmup_check, "保留原有预热选号；仅对首窗口剩余100%的可用账号发送ping，一分钟后验证重置时间；未生效或超时后按5分钟间隔持续补偿，确认启动后停止")
+        self._bind_widget_tooltip(quota_warmup_check, "优先选择5小时剩余额度不低于99%的可用账号承接正常请求；后台自动ping预热暂时停用")
         ttk.Label(auth_options, text="预热模型：").pack(side="left", padx=(8, 0))
         self._quota_warmup_model_entry = ttk.Entry(auth_options, textvariable=self.quota_warmup_model_var, width=17)
         self._quota_warmup_model_entry.pack(side="left")
         self._quota_warmup_model_entry.bind("<FocusOut>", self._on_quota_warmup_model_edited)
         self._quota_warmup_model_entry.bind("<Return>", self._on_quota_warmup_model_edited)
-        self._bind_widget_tooltip(self._quota_warmup_model_entry, "用于自动发送 ping；回车或移出输入框后保存，账号需支持此模型")
+        self._bind_widget_tooltip(self._quota_warmup_model_entry, "后台自动ping预热暂时停用；模型设置保留，暂不生效")
         auto_reset_credit_check = ttk.Checkbutton(
             auth_options, text="到期自动用卡", variable=self.auto_reset_credit_var,
             command=self._on_auto_reset_credit_toggled)
@@ -3837,7 +3839,7 @@ del "%~f0" >nul 2>nul
             f"负载策略: {self._format_auth_load_strategy(row.load_strategy)}",
         ]
         lines.append(self._reset_credit_tooltip(row.refresh_token))
-        lines.append("额度预热: " + self.quota_warmup_service.status_for(row))
+        lines.append("额度预热: 自动ping暂时停用，高额度账号选号由额度预热开关控制")
         return "\n".join(lines)
 
     def _update_token_speed(self, data: dict) -> None:
