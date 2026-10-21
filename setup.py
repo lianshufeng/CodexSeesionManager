@@ -18,6 +18,8 @@ include_files = [
     ("app/services/response_payload_reader.py", "response_payload_reader.py"),
     ("app/services/response_usage_ledger.py", "response_usage_ledger.py"),
     ("app/services/proxy_logger_addon.py", "proxy_logger_addon.py"),
+    ("app/services/timezone_proxy_addon.py", "timezone_proxy_addon.py"),
+    ("app/services/timezone_rewrite_service.py", "timezone_rewrite_service.py"),
     ("icon/icon.ico", "icon/icon.ico"),
     ("icon/tray_icon.ico", "icon/tray_icon.ico"),
 ]
@@ -45,7 +47,7 @@ setup(
             "build_exe": os.environ.get("BUILD_EXE_DIR", str(project_root / "build" / "exe.win-amd64-3.11")),
             "include_files": include_files,
             "include_msvcr": True,
-            "packages": ["mitmproxy", "mitmproxy_rs", "mitmproxy_windows", "psutil", "websocket", "pystray", "PIL", "app", "tiktoken", "tiktoken_ext"],
+            "packages": ["mitmproxy", "mitmproxy_rs", "mitmproxy_windows", "psutil", "websocket", "pystray", "PIL", "app", "tiktoken", "tiktoken_ext", "tzdata"],
             "excludes": []  # 不需要的库可以排除掉
         }
     }

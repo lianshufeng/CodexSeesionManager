@@ -24,6 +24,8 @@ class AppConfig:
     cloud_bucket_name: str = ""
     cloud_account: str = ""
     cloud_password: str = ""
+    timezone_override: bool = True
+    timezone_name: str = "Asia/Tokyo"
 
 
 class AppConfigService:
@@ -58,6 +60,8 @@ class AppConfigService:
         if not isinstance(cloud_storage, dict):
             cloud_storage = {}
         return AppConfig(
+            timezone_override=bool(data.get("timezone_override", True)),
+            timezone_name=str(data.get("timezone_name") or "Asia/Tokyo"),
             port=port,
             upstream_proxy=upstream_proxy,
             use_upstream_proxy=use_upstream_proxy,
@@ -77,6 +81,8 @@ class AppConfigService:
     def save(self, config: AppConfig) -> None:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "timezone_override": config.timezone_override,
+            "timezone_name": config.timezone_name,
             "port": config.port,
             "upstream_proxy": config.upstream_proxy,
             "use_upstream_proxy": config.use_upstream_proxy,

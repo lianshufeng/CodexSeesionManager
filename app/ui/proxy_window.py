@@ -55,6 +55,8 @@ from app.utils.path_utils import app_root
 from tkinter import messagebox, ttk
 
 from app.services.proxy_service import ProxyConfig, ProxyService
+from app.services.timezone_proxy_service import TimezoneProxyService
+from app.services.timezone_rewrite_service import COMMON_TIMEZONES, DEFAULT_TIMEZONE, validate_timezone
 from app.services.tray_service import RecoverableTrayIcon
 from app.services.token_history_service import TokenHistoryService
 from app.ui.token_history_window import TokenHistoryWindow
@@ -101,6 +103,9 @@ class ProxyWindow:
         self.config_service = AppConfigService()
         loaded_config = self.config_service.load()
         self.service = ProxyService()
+        self._timezone_proxies: list[TimezoneProxyService] = []
+        self._timezone_launch_busy = False
+        self._timezone_launch_cancel = Event()
         if loaded_config is not None:
             self.service.config.port = loaded_config.port
             self.service.config.upstream_proxy = loaded_config.upstream_proxy
@@ -121,6 +126,10 @@ class ProxyWindow:
         self.root.bind("<Escape>", lambda _event: self._on_close())
 
         self.port_var = tk.StringVar(value=str(self.service.config.port))
+        self.timezone_override_var = tk.BooleanVar(
+            value=loaded_config.timezone_override if loaded_config is not None else True)
+        self.timezone_name_var = tk.StringVar(
+            value=loaded_config.timezone_name if loaded_config is not None else DEFAULT_TIMEZONE)
         self.upstream_proxy_var = tk.StringVar(value=self.service.config.upstream_proxy)
         self.use_upstream_proxy_var = tk.BooleanVar(value=self.service.config.use_upstream_proxy)
         self.cloud_s3_address_var = tk.StringVar(
@@ -336,6 +345,20 @@ class ProxyWindow:
         self._upstream_entry.bind("<FocusOut>", self._on_upstream_proxy_edited)
         self._upstream_entry.bind("<Return>", self._on_upstream_proxy_edited)
 
+        ttk.Checkbutton(
+            upstream_row, text="时区覆盖", variable=self.timezone_override_var,
+            command=self._on_timezone_edited,
+        ).pack(side="left", padx=(16, 0))
+        self._timezone_combo = ttk.Combobox(
+            upstream_row, textvariable=self.timezone_name_var, values=COMMON_TIMEZONES, width=23,
+            state=tk.NORMAL if self.timezone_override_var.get() else tk.DISABLED,
+        )
+        self._timezone_combo.pack(side="left", padx=(8, 0))
+        self._timezone_combo.bind("<<ComboboxSelected>>", self._on_timezone_edited)
+        self._timezone_combo.bind("<FocusOut>", self._on_timezone_edited)
+        self._timezone_combo.bind("<Return>", self._on_timezone_edited)
+        self._bind_widget_tooltip(self._timezone_combo, "下次启动时生效，仅修改模型收到的时区和日期。")
+
         actions = ttk.Frame(top)
         actions.pack(side="right", anchor="e")
 
@@ -446,19 +469,19 @@ class ProxyWindow:
         self._bind_widget_tooltip(
             auto_reset_credit_check,
             "到期前3分钟内自动用卡。")
-        auth_actions = ttk.Frame(auth_frame)
-        auth_actions.pack(fill="x", pady=(0, 6))
-        self._correct_traffic_button = ttk.Button(auth_actions, text="矫正流量", command=self.correct_traffic)
+        auth_actions = ttk.Frame(auth_options)
+        auth_actions.pack(side="right", padx=(12, 0))
+        self._correct_traffic_button = ttk.Button(auth_actions, text="矫正流量", width=0, command=self.correct_traffic)
         self._correct_traffic_button.pack(side="right")
-        self._clean_auth_button = ttk.Button(auth_actions, text="清理授权", command=self.clean_auth_files)
+        self._clean_auth_button = ttk.Button(auth_actions, text="清理授权", width=0, command=self.clean_auth_files)
         self._clean_auth_button.pack(side="right", padx=(0, 8))
-        self._add_relay_button = ttk.Button(auth_actions, text="添加中转站", command=self._add_relay_config)
+        self._add_relay_button = ttk.Button(auth_actions, text="添加中转站", width=0, command=self._add_relay_config)
         self._add_relay_button.pack(side="right", padx=(0, 8))
-        self._update_auth_button = ttk.Button(auth_actions, text="更新授权", command=self.update_auth)
+        self._update_auth_button = ttk.Button(auth_actions, text="更新授权", width=0, command=self.update_auth)
         self._update_auth_button.pack(side="right", padx=(0, 8))
-        low_price_button = ttk.Button(auth_actions, text="低价购号", command=self.open_low_price_window)
+        low_price_button = ttk.Button(auth_actions, text="低价购号", width=0, command=self.open_low_price_window)
         low_price_button.pack(side="right", padx=(0, 8))
-        self._refresh_tokens_button = ttk.Button(auth_actions, text="一键刷新令牌", command=self.refresh_all_tokens)
+        self._refresh_tokens_button = ttk.Button(auth_actions, text="一键刷新令牌", width=0, command=self.refresh_all_tokens)
         self._refresh_tokens_button.pack(side="right", padx=(0, 8))
         self._bind_widget_tooltip(
             low_price_button,
@@ -1102,6 +1125,8 @@ class ProxyWindow:
             return
         self.config_service.save(
             AppConfig(
+                timezone_override=self.timezone_override_var.get(),
+                timezone_name=self.timezone_name_var.get().strip() or DEFAULT_TIMEZONE,
                 port=port,
                 upstream_proxy=upstream_proxy,
                 use_upstream_proxy=self.use_upstream_proxy_var.get(),
@@ -2130,6 +2155,7 @@ class ProxyWindow:
         self.refresh_installs()
 
     def stop_server(self) -> None:
+        self._stop_timezone_proxies()
         self.service.stop()
         self.codex_local_config_service.set_proxy_environment(None)
         print("代理已停止")
@@ -4449,6 +4475,7 @@ del "%~f0" >nul 2>nul
                     command=lambda launch_row=row: self._launch_codex(launch_row),
                 )
                 self._launch_buttons[item] = button
+            button.config(state=tk.DISABLED if self._timezone_launch_busy else tk.NORMAL)
             bbox = self.tree.bbox(item, "action")
             if not bbox:
                 button.place_forget()
@@ -4464,32 +4491,152 @@ del "%~f0" >nul 2>nul
             )
 
     def _launch_codex(self, row: CodexInstallRow) -> None:
+        if self._timezone_launch_busy:
+            return
+        if not self.timezone_override_var.get():
+            if self._timezone_proxies:
+                messagebox.showwarning("需要重新启动", "请完全退出已启用时区的实例并停止服务器，再启动新的实例。")
+                return
+            self._launch_codex_process(row)
+            return
+        try:
+            timezone_name = validate_timezone(self.timezone_name_var.get())
+        except (ValueError, KeyError):
+            messagebox.showerror("时区无效", "请输入有效的 IANA 时区，例如 Asia/Tokyo。")
+            return
+        if not Path(row.path).exists():
+            messagebox.showerror("启动失败", f"找不到文件 {row.path}")
+            return
+        if not self.service.process or self.service.process.poll() is not None:
+            messagebox.showwarning("代理未启动", "请先启动代理服务器。")
+            return
+        # Electron may activate an existing instance instead of inheriting new launch settings.
+        for process in psutil.process_iter(["name", "cmdline"]):
+            try:
+                name = (process.info["name"] or "").lower()
+                if name == "chatgpt.exe" or (
+                    name == "codex.exe" and (
+                        "app-server" in (process.info["cmdline"] or [])
+                        or not self._is_cli_codex_executable(Path(row.path))
+                    )
+                ):
+                    messagebox.showwarning("需要重新启动", "请先完全退出正在运行的 ChatGPT / Codex，再启动以应用时区。")
+                    return
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        self._stop_timezone_proxies()
+        self._timezone_launch_cancel = Event()
+        launch_cancel = self._timezone_launch_cancel
+        self._persist_config()
+        self._timezone_launch_busy = True
+        self._service_status_var.set(f"正在准备时区代理: {timezone_name}")
+        self._set_timezone_launch_busy(True)
+        upstream_port = self.service.config.port
+
+        def worker() -> None:
+            proxy = None
+            error = ""
+            try:
+                proxy = TimezoneProxyService(timezone_name, upstream_port)
+                if self._closing or launch_cancel.is_set():
+                    return
+                self._timezone_proxies.append(proxy)
+                ok, error = proxy.run()
+                if not ok:
+                    proxy.stop()
+            except Exception as exc:
+                error = str(exc)
+                if proxy is not None:
+                    proxy.stop()
+            if self._closing or launch_cancel.is_set():
+                if proxy is not None:
+                    proxy.stop()
+                return
+            self._post_ui(lambda: self._finish_timezone_launch(row, proxy, error, launch_cancel))
+
+        Thread(target=worker, daemon=True).start()
+
+    def _set_timezone_launch_busy(self, busy: bool) -> None:
+        for button in self._launch_buttons.values():
+            button.config(state=tk.DISABLED if busy else tk.NORMAL)
+        self._timezone_combo.config(
+            state=tk.NORMAL if not busy and self.timezone_override_var.get() else tk.DISABLED)
+
+    def _on_timezone_edited(self, _event=None) -> None:
+        self._timezone_combo.config(
+            state=tk.NORMAL if not self._timezone_launch_busy and self.timezone_override_var.get() else tk.DISABLED)
+        self._persist_config()
+
+    def _finish_timezone_launch(self, row, proxy, error: str, cancel_event: Event | None = None) -> None:
+        if self._closing or (cancel_event is not None and cancel_event.is_set()):
+            if proxy is not None:
+                proxy.stop()
+                if proxy in self._timezone_proxies:
+                    self._timezone_proxies.remove(proxy)
+            return
+        self._timezone_launch_busy = False
+        self._set_timezone_launch_busy(False)
+        if not error and (not self.service.process or self.service.process.poll() is not None):
+            error = "主代理已停止，请重新启动服务器后重试。"
+        if error:
+            if proxy is not None:
+                proxy.stop()
+                if proxy in self._timezone_proxies:
+                    self._timezone_proxies.remove(proxy)
+            self._service_status_var.set("时区代理启动失败")
+            messagebox.showerror("启动失败", error)
+            return
+        if proxy not in self._timezone_proxies:
+            self._timezone_proxies.append(proxy)
+        try:
+            if not self._launch_codex_process(row, proxy.config.port, True):
+                proxy.stop()
+                self._timezone_proxies.remove(proxy)
+                self._service_status_var.set("Codex 启动未完成")
+                return
+            self._service_status_var.set(f"时区规则已准备: {proxy.timezone_name}，实际改写结果请查看日志")
+        except Exception as exc:
+            proxy.stop()
+            self._timezone_proxies.remove(proxy)
+            messagebox.showerror("启动失败", str(exc))
+
+    def _stop_timezone_proxies(self) -> None:
+        self._timezone_launch_cancel.set()
+        self._timezone_launch_busy = False
+        self._set_timezone_launch_busy(False)
+        for proxy in self._timezone_proxies:
+            proxy.stop()
+        self._timezone_proxies.clear()
+
+    def _launch_codex_process(self, row: CodexInstallRow, proxy_port: int | None = None,
+                              timezone_active: bool = False) -> bool:
         exe = Path(row.path)
         app_id = packaged_app_id(exe)
         if not exe.exists():
             messagebox.showerror("启动失败", f"找不到文件 {row.path}")
-            return
+            return False
         if not (self.service.process and self.service.process.poll() is None):
             self._service_status_var.set("代理尚未启动，请先点击“启动服务器”")
             messagebox.showwarning("代理未启动", "请先点击“启动服务器”，等待代理运行后再启动 Codex。")
-            return
+            return False
         if not app_id:
             ok, message = self.service.ensure_launch_permissions(exe)
             if not ok:
                 messagebox.showerror("启动失败", message)
-                return
-        proxy_port = self.service.config.port
+                return False
+        proxy_port = proxy_port or self.service.config.port
+        bypass_proxy = self._is_relay_active() and not timezone_active
         env = os.environ.copy()
         proxy_url = f"http://127.0.0.1:{proxy_port}"
         proxy_env_keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
-        if self._is_relay_active():
+        if bypass_proxy:
             for key in proxy_env_keys:
                 env.pop(key, None)
         else:
             for key in proxy_env_keys:
                 env[key] = proxy_url
-        env["NO_PROXY"] = "localhost,127.0.0.1"
-        env["no_proxy"] = "localhost,127.0.0.1"
+        env["NO_PROXY"] = "" if timezone_active else "localhost,127.0.0.1"
+        env["no_proxy"] = env["NO_PROXY"]
         current_dir = str(exe.parent)
         print(f"[ProxyWindow] 启动外部程序: {exe.name}", flush=True)
         if self._is_cli_codex_executable(exe):
@@ -4499,26 +4646,26 @@ del "%~f0" >nul 2>nul
                 env=env,
                 creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
             )
-            return
+            return True
         args = [str(exe)]
-        if exe.name.lower() == "chatgpt.exe":
-            if self._is_relay_active():
+        if exe.name.lower() == "chatgpt.exe" or timezone_active:
+            if bypass_proxy:
                 args.append("--no-proxy-server")
             else:
                 args.extend(
                     [
                         f"--proxy-server={proxy_url}",
-                        "--proxy-bypass-list=localhost;127.0.0.1;<local>",
+                        "--proxy-bypass-list=<-loopback>" if timezone_active else "--proxy-bypass-list=localhost;127.0.0.1;<local>",
                     ]
                 )
         if app_id:
             ok, message = self.codex_local_config_service.set_proxy_environment(
-                None if self._is_relay_active() else proxy_url
+                None if bypass_proxy else proxy_url, bypass_local=not timezone_active,
             )
             if not ok:
                 messagebox.showerror("启动失败", message)
-                return
-            if not self._is_relay_active():
+                return False
+            if not bypass_proxy:
                 for process in psutil.process_iter(["name", "cmdline"]):
                     try:
                         if process.info["name"] != "codex.exe" or "app-server" not in (process.info["cmdline"] or []):
@@ -4528,7 +4675,7 @@ del "%~f0" >nul 2>nul
                                 "Codex 未接入负载代理",
                                 "Codex 已在运行，现有进程没有使用负载代理。请完全退出 Codex 后再点击启动。",
                             )
-                            return
+                            return False
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         continue
             try:
@@ -4536,7 +4683,8 @@ del "%~f0" >nul 2>nul
             except OSError as exc:
                 self.codex_local_config_service.set_proxy_environment(None)
                 messagebox.showerror("启动失败", str(exc))
-            return
+                return False
+            return True
         subprocess.Popen(
             args,
             cwd=current_dir,
@@ -4546,6 +4694,7 @@ del "%~f0" >nul 2>nul
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        return True
 
     def _is_cli_codex_executable(self, path: Path) -> bool:
         normalized_path = str(path).replace("/", "\\").lower()
@@ -4742,6 +4891,7 @@ del "%~f0" >nul 2>nul
         self.auth_usage_service.stop()
         self.auth_sync_service.stop()
         self._low_price_seller_info_executor.shutdown(wait=False, cancel_futures=True)
+        self._stop_timezone_proxies()
         self.service.stop()
         self.codex_local_config_service.set_proxy_environment(None)
         self._auto_load_control_stop.set()

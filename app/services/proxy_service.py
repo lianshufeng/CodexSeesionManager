@@ -188,6 +188,12 @@ class ProxyService:
             return candidate
         return Path(__file__).with_name("proxy_logger_addon.py")
 
+    def _process_environment(self) -> dict[str, str]:
+        return os.environ.copy()
+
+    def _extra_arguments(self) -> list[str]:
+        return []
+
     def _normalize_upstream_proxy(self, upstream: str) -> str:
         value = upstream.strip()
         if value.startswith("http://"):
@@ -230,6 +236,7 @@ class ProxyService:
             "--listen-port",
             str(self.config.port),
         ]
+        argv.extend(self._extra_arguments())
         if self.config.use_upstream_proxy and upstream:
             argv[1:1] = ["--mode", f"upstream:http://{upstream}"]
             self._log(f"二级代理: http://{upstream}")
@@ -237,7 +244,7 @@ class ProxyService:
             self._log("二级代理: 直连")
         self._log(f"日志插件: {addon_script}")
         self._log("启动命令: " + " ".join(argv))
-        env = os.environ.copy()
+        env = self._process_environment()
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         self.process = subprocess.Popen(

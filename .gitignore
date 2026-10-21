@@ -21,3 +21,5 @@
 !/tests/
 !/tests/test_cloud_auth_sync.py
 !/tests/test_quota_warmup.py
+!/tests/test_timezone_override.py
+!/tests/test_timezone_proxy_integration.py

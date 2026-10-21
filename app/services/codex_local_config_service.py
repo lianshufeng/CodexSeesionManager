@@ -30,7 +30,7 @@ class CodexLocalConfigService:
         self.auth_path = self.codex_home / "auth.json"
         self.env_path = self.codex_home / ".env"
 
-    def set_proxy_environment(self, proxy_url: str | None) -> tuple[bool, str]:
+    def set_proxy_environment(self, proxy_url: str | None, *, bypass_local: bool = True) -> tuple[bool, str]:
         if not proxy_url and not self.env_path.exists():
             return True, ""
         try:
@@ -56,8 +56,8 @@ class CodexLocalConfigService:
                         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                         "http_proxy", "https_proxy", "all_proxy",
                     )),
-                    'NO_PROXY="localhost,127.0.0.1"',
-                    'no_proxy="localhost,127.0.0.1"',
+                    f'NO_PROXY={json.dumps("localhost,127.0.0.1" if bypass_local else "")}',
+                    f'no_proxy={json.dumps("localhost,127.0.0.1" if bypass_local else "")}',
                     _PROXY_ENV_END,
                 ]
                 cleaned = f"{cleaned}\n\n" if cleaned else ""
