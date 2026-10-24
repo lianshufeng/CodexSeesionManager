@@ -16,11 +16,3 @@
 *.pyc
 /app/services/tokenizer_cache
 /tests/*
-!/tests/test_token_statistics_regression.py
-/tests
-!/tests/
-!/tests/test_cloud_auth_sync.py
-!/tests/test_quota_warmup.py
-!/tests/test_timezone_override.py
-!/tests/test_timezone_proxy_integration.py
-!/tests/test_codex_retry.py
