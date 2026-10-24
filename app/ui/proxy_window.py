@@ -4540,6 +4540,8 @@ del "%~f0" >nul 2>nul
     def _launch_codex(self, row: CodexInstallRow) -> None:
         if self._timezone_launch_busy:
             return
+        if not self._confirm_codex_relaunch():
+            return
         if not self.timezone_override_var.get() and not self.language_override_var.get():
             if self._timezone_proxies:
                 messagebox.showwarning("需要重新启动", "请完全退出已启用覆盖的实例并停止服务器，再启动新的实例。")
@@ -4607,6 +4609,24 @@ del "%~f0" >nul 2>nul
             self._post_ui(lambda: self._finish_timezone_launch(row, proxy, error, launch_cancel))
 
         Thread(target=worker, daemon=True).start()
+
+    def _confirm_codex_relaunch(self) -> bool:
+        """启动安装项前处理已存在的 Codex/ChatGPT 进程。"""
+        process_rows = self._list_codex_process_rows()
+        if not process_rows:
+            return True
+        if not messagebox.askyesno(
+            "Codex 已在运行",
+            "检测到 Codex/ChatGPT 已在运行，是否结束现有进程并重新启动？",
+        ):
+            return False
+        process_ids = [row.pid for row in process_rows]
+        item_depths = {str(row.pid): 0 for row in process_rows}
+        errors = self._kill_process_ids(process_ids, item_depths)
+        if errors:
+            messagebox.showerror("结束进程失败", "\n".join(errors))
+            return False
+        return True
 
     def _set_timezone_launch_busy(self, busy: bool) -> None:
         for button in self._launch_buttons.values():
