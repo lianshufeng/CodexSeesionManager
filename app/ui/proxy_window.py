@@ -324,9 +324,7 @@ class ProxyWindow:
         self.refresh_all()
         self.root.after(1000, self._tick_reset_credit_countdown)
         self._refresh_credential_mode_state()
-        # 暂停后台自动 ping 预热及其验证、补偿，保留实现以便恢复。
-        # “额度预热”的高额度账号选号仍由 _recompute_auto_load_target 执行。
-        # self.quota_warmup_service.start()
+        self.quota_warmup_service.start()
         self._recompute_auto_load_target()
         self._add_tray_icon()
         self.root.after(500, self._auto_start_with_certificate_check)
@@ -493,7 +491,7 @@ class ProxyWindow:
         )
         quota_warmup_check.pack(side="left", padx=(8, 0))
         self._quota_warmup_check = quota_warmup_check
-        self._bind_widget_tooltip(quota_warmup_check, "优先使用高额度账号。")
+        self._bind_widget_tooltip(quota_warmup_check, "优先使用高额度账号；后台错峰发送简短预热请求，确认窗口启动后停止。")
         ttk.Label(auth_options, text="预热模型：").pack(side="left", padx=(8, 0))
         self._quota_warmup_model_entry = ttk.Entry(auth_options, textvariable=self.quota_warmup_model_var, width=17)
         self._quota_warmup_model_entry.pack(side="left")
@@ -904,7 +902,9 @@ class ProxyWindow:
 
     def _configure_quota_warmup(self) -> None:
         enabled = self.quota_warmup_var.get() and not self._is_relay_active()
-        self.quota_warmup_service.configure(enabled, self.quota_warmup_model_var.get().strip())
+        self.quota_warmup_service.configure(
+            enabled, self.quota_warmup_model_var.get().strip(),
+            self.timezone_name_var.get().strip() if self.timezone_override_var.get() else None)
         if self._quota_warmup_model_entry is not None:
             self._quota_warmup_model_entry.configure(state=tk.NORMAL if enabled else tk.DISABLED)
 
@@ -3862,7 +3862,7 @@ del "%~f0" >nul 2>nul
             f"负载策略: {self._format_auth_load_strategy(row.load_strategy)}",
         ]
         lines.append(self._reset_credit_tooltip(row.refresh_token))
-        lines.append("额度预热: 自动ping暂时停用，高额度账号选号由额度预热开关控制")
+        lines.append("额度预热: " + self.quota_warmup_service.status_for(row))
         return "\n".join(lines)
 
     def _update_token_speed(self, data: dict) -> None:
@@ -4641,6 +4641,7 @@ del "%~f0" >nul 2>nul
             state=tk.NORMAL if not self._timezone_launch_busy and self.timezone_override_var.get() else tk.DISABLED)
         self._language_combo.config(
             state=tk.NORMAL if not self._timezone_launch_busy and self.language_override_var.get() else tk.DISABLED)
+        self._configure_quota_warmup()
         self._persist_config()
 
     def _finish_timezone_launch(self, row, proxy, error: str, cancel_event: Event | None = None) -> None:

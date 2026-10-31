@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -35,6 +36,7 @@ class QuotaWarmupService:
         self._thread = None
         self._enabled = False
         self._model = DEFAULT_WARMUP_MODEL
+        self._timezone_name: str | None = None
         self._generation = 0
         self._proxy_provider: Callable[[], str] = lambda: ""
         self._on_change: Callable[[], None] | None = None
@@ -46,12 +48,13 @@ class QuotaWarmupService:
         except (OSError, ValueError):
             pass
 
-    def configure(self, enabled: bool, model: str) -> None:
+    def configure(self, enabled: bool, model: str, timezone_name: str | None = None) -> None:
         with self._lock:
             model = model.strip()
-            if (enabled, model) != (self._enabled, self._model):
+            if (enabled, model, timezone_name) != (self._enabled, self._model, self._timezone_name):
                 self._generation += 1
             self._enabled, self._model = enabled, model
+            self._timezone_name = timezone_name
 
     def set_proxy_provider(self, provider: Callable[[], str]) -> None:
         self._proxy_provider = provider
@@ -93,7 +96,7 @@ class QuotaWarmupService:
         with self._lock:
             state = dict(self._attempts.get(self._key(row), {}))
         lines = [state.get("status", "等待窗口观察")]
-        for field, label in (("last_sent_at", "最近发送"), ("confirmed_at", "最近确认")):
+        for field, label in (("send_at", "计划发送"), ("last_sent_at", "最近发送"), ("confirmed_at", "最近确认")):
             if state.get(field):
                 lines.append(label + ": " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state[field])))
         return "\n".join(lines)
@@ -142,12 +145,13 @@ class QuotaWarmupService:
                 and (observed_at >= boundary or first.remaining_percent == 100)):
             state.update(cycle=state["cycle"] + 1, count=0, phase="observing", until=0,
                          attempted=False, cycle_reset_at=0, confirmed_at=0,
-                         last_sent_at=0, status="新周期观察中")
+                         last_sent_at=0, send_at=0, status="新周期观察中")
         comparable = previous and previous.get("duration") == first.duration_seconds
         stable = (comparable and first.reset_at > observed_at
                   and abs(first.reset_at - previous["reset_at"]) <= RESET_TOLERANCE)
         if stable:
             state.update(phase="active", cycle_reset_at=first.reset_at, until=first.reset_at,
+                         send_at=0,
                          confirmed_at=state.get("confirmed_at") or observed_at,
                          status="已确认，窗口已启动，无需重复预热")
         state["observation"] = {
@@ -162,9 +166,11 @@ class QuotaWarmupService:
 
     @staticmethod
     def _can_send(state: dict, model: str, now: float) -> bool:
+        if state.get("send_at", 0) > now:
+            return False
         phase = state.get("phase")
         if phase == "backoff":
-            return state.get("until", 0) <= now or state.get("model") != model
+            return state.get("until", 0) <= now
         if phase == "retry":
             return now >= state.get("until", 0)
         return phase in {"observing", "eligible"}
@@ -190,14 +196,14 @@ class QuotaWarmupService:
             if stable:
                 self._record(key, model, first.reset_at, "一分钟后确认，窗口已启动", True,
                              phase="active", cycle_reset_at=first.reset_at, confirmed_at=now,
-                             before_reset_at=0, verify_after=0, observation=observation)
+                             before_reset_at=0, verify_after=0, send_at=0, observation=observation)
             elif same_duration and first.reset_at > state["before_reset_at"] + RESET_TOLERANCE:
-                retry_at = min(state["until"], state.get("last_sent_at", now) + RETRY_INTERVAL)
+                retry_at = max(state["until"], state.get("last_sent_at", now) + RETRY_INTERVAL)
                 self._record(key, model, retry_at, "重置时间仍变化，预热未生效，等待5分钟补发", True,
                              phase="retry", before_reset_at=0,
                              verify_after=now + VERIFY_INTERVAL, observation=observation)
             else:
-                retry_at = min(state["until"], state.get("last_sent_at", now) + RETRY_INTERVAL)
+                retry_at = max(state["until"], state.get("last_sent_at", now) + RETRY_INTERVAL)
                 retry = now >= retry_at
                 self._record(key, model, retry_at,
                              "窗口变化异常，已到5分钟补偿间隔" if retry else "窗口变化异常，继续验证并暂停重发", True,
@@ -206,7 +212,7 @@ class QuotaWarmupService:
                              before_duration=first.duration_seconds, verify_after=now + VERIFY_INTERVAL,
                              observation=observation)
         except Exception as exc:
-            retry_at = min(state["until"], state.get("last_sent_at", now) + RETRY_INTERVAL)
+            retry_at = max(state["until"], state.get("last_sent_at", now) + RETRY_INTERVAL)
             retry = time.time() >= retry_at
             self._record(key, model, retry_at, f"窗口验证失败，稍后重查（{type(exc).__name__}）", True,
                          phase="retry" if retry else state["phase"],
@@ -221,6 +227,7 @@ class QuotaWarmupService:
                 enabled, model, generation = self._enabled, self._model, self._generation
             if not enabled or not model or self._stop.is_set():
                 return
+            sent_this_pass = False
             for row in self.auth.list_auth_rows():
                 if self._stop.is_set():
                     return
@@ -239,7 +246,14 @@ class QuotaWarmupService:
                 state = self._observe(key, model, item.windows, item.observed_at)
                 if not self.ready(item.windows, item.observed_at) or not self._can_send(state, model, now):
                     continue
+                if not state.get("send_at"):
+                    self._record(key, model, state.get("until", 0), "等待错峰预热", state.get("attempted", False),
+                                 send_at=now + random.uniform(30, 180))
+                    continue
+                if sent_this_pass:
+                    continue
                 self._warmup(row, key, model, generation)
+                sent_this_pass = True
         finally:
             self._check_lock.release()
 
@@ -264,28 +278,31 @@ class QuotaWarmupService:
             current = next((item for item in self.auth.list_auth_rows() if self._key(item) == key), None)
             with self._lock:
                 active = self._enabled and self._generation == generation
+                timezone_name = self._timezone_name
             if (not active or self._stop.is_set() or current is None or current.disabled
                     or current.load_strategy == LoadStrategy.DISABLED or current.access_token != access_token):
                 return
             sent_at = time.time()
-            until = sent_at + RETRY_INTERVAL
+            until = sent_at + RETRY_INTERVAL + random.uniform(0, 120)
             # 先持久化再发送，重启或超时后仍遵守5分钟补偿间隔。
             self._record(key, model, until, "预热请求发送中，结果待确认", True,
                          phase="uncertain", count=state.get("count", 0) + 1,
-                         last_sent_at=sent_at, before_reset_at=windows[0].reset_at,
+                         last_sent_at=sent_at, send_at=0, before_reset_at=windows[0].reset_at,
                          before_duration=windows[0].duration_seconds, verify_after=sent_at + VERIFY_INTERVAL)
             attempted = True
             try:
-                self.client.ping(row.access_token, row.account_id, proxy, model, self._stop)
+                self.client.ping(row.access_token, row.account_id, proxy, model, self._stop,
+                                 timezone_name=timezone_name)
             finally:
                 self.auth.increment_traffic_by_access_token(row.access_token)
-            self._record(key, model, sent_at + RETRY_INTERVAL, "请求完成，等待窗口启动确认", True,
+            self._record(key, model, until, "请求完成，等待窗口启动确认", True,
                          phase="waiting", verify_after=time.time() + VERIFY_INTERVAL)
         except WarmupRejected as exc:
-            self._record(key, model, time.time() + 3600, str(exc), attempted, phase="backoff")
+            self._record(key, model, time.time() + exc.retry_after, str(exc), attempted,
+                         phase="backoff", send_at=0)
         except Exception as exc:
             status = "预热结果不确定，验证后按5分钟间隔补偿" if attempted else "检查失败，15分钟后重试"
             self._record(key, model, until, status + f"（{type(exc).__name__}）", attempted,
-                         phase="uncertain" if attempted else "backoff")
+                         phase="uncertain" if attempted else "backoff", send_at=0)
         finally:
             self.usage.request_refresh()
