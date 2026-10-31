@@ -10,6 +10,7 @@
 /data/token_statistics_outbox.sqlite3*
 /data/quota_warmup.json
 /data/quota_warmup.tmp
+/data/connection_affinity.json
 /.idea
 
 *.log
