@@ -62,7 +62,7 @@ from app.services.language_rewrite_service import COMMON_LANGUAGES, DEFAULT_LANG
 from app.services.tray_service import RecoverableTrayIcon
 from app.services.token_history_service import TokenHistoryService
 from app.ui.token_history_window import TokenHistoryWindow
-from app.ui.login_credentials_dialog import edit_login_credentials
+from app.ui.login_credentials_dialog import edit_login_credentials, show_login_credentials
 from app.models import LoginCredentials
 
 
@@ -119,6 +119,7 @@ class ProxyWindow:
         self.auth_sync_service = AuthSyncService()
         self.auth_login_service = AuthLoginService(self.auth_sync_service)
         self._auth_login_busy = False
+        self._login_credentials_window = None
         self.auth_token_refresh_service = AuthTokenRefreshService(self.auth_sync_service)
         self.auth_usage_service = AuthUsageService(self.auth_sync_service)
         self.quota_warmup_service = QuotaWarmupService(self.auth_sync_service, self.auth_usage_service)
@@ -291,7 +292,8 @@ class ProxyWindow:
         self.root.after(1000, self._tick_token_speed)
         self.auth_login_service.set_result_callback(
             lambda result, error: self._post_ui(
-                lambda value=result, message=error: self._finish_update_auth(value, message)
+                lambda value=result, message=error, session_id=self.auth_login_service.session_id:
+                    self._finish_update_auth(value, message, session_id)
             )
         )
         self.auth_sync_service.set_change_callback(
@@ -2569,8 +2571,6 @@ del "%~f0" >nul 2>nul
         print(f"已刷新 {install_count} 项 / {auth_count} 个文件")
 
     def update_auth(self) -> None:
-        if self._auth_login_busy:
-            return
         if not self._refresh_config():
             return
         proxy_url = self._upstream_proxy if self._use_upstream_proxy else ""
@@ -2578,15 +2578,20 @@ del "%~f0" >nul 2>nul
         credentials = None
         if isinstance(row, AuthFileRow):
             credentials = LoginCredentials.from_dict(self.auth_sync_service.get_login_credentials(row.refresh_token))
+            if not credentials.email:
+                credentials.email = row.email
         try:
             self._auth_login_busy = True
             if self._update_auth_button is not None:
-                self._update_auth_button.config(text="登录中…", state=tk.DISABLED)
+                self._update_auth_button.config(text="更新授权", state=tk.NORMAL)
             self.auth_login_service.start_login(
                 proxy_url, log=lambda message: print(message, flush=True),
                 credentials=credentials,
                 expected_account_id=row.account_id if isinstance(row, AuthFileRow) else "",
             )
+            if self._login_credentials_window is not None and self._login_credentials_window.winfo_exists():
+                self._login_credentials_window.destroy()
+            self._login_credentials_window = show_login_credentials(self.root, credentials or LoginCredentials())
         except Exception as exc:
             self._set_auth_login_idle()
             messagebox.showerror("更新授权失败", str(exc))
@@ -2596,8 +2601,13 @@ del "%~f0" >nul 2>nul
         if self._update_auth_button is not None:
             self._update_auth_button.config(text="更新授权", state=tk.NORMAL)
 
-    def _finish_update_auth(self, result: AuthLoginResult | None, error: str) -> None:
+    def _finish_update_auth(self, result: AuthLoginResult | None, error: str, session_id: int) -> None:
+        if session_id != self.auth_login_service.session_id:
+            return
         self._set_auth_login_idle()
+        if self._login_credentials_window is not None and self._login_credentials_window.winfo_exists():
+            self._login_credentials_window.destroy()
+        self._login_credentials_window = None
         if error:
             messagebox.showerror("更新授权失败", error)
             return
@@ -4134,8 +4144,8 @@ del "%~f0" >nul 2>nul
         self._auth_menu.entryconfigure(2, state=tk.NORMAL)
         self._auth_menu.entryconfigure(3, state=tk.NORMAL if is_relay else tk.DISABLED)
         self._auth_menu.entryconfigure(4, state=tk.DISABLED if is_relay else tk.NORMAL)
-        self._auth_menu.entryconfigure("登录凭据", state=tk.DISABLED if is_relay or self._auth_login_busy else tk.NORMAL)
-        self._auth_menu.entryconfigure("更新此账号授权", state=tk.DISABLED if is_relay or self._auth_login_busy else tk.NORMAL)
+        self._auth_menu.entryconfigure("登录凭据", state=tk.DISABLED if is_relay else tk.NORMAL)
+        self._auth_menu.entryconfigure("更新此账号授权", state=tk.DISABLED if is_relay else tk.NORMAL)
         self._auth_menu.entryconfigure("取消授权登录", state=tk.NORMAL if self._auth_login_busy else tk.DISABLED)
         if not is_relay:
             self._auth_load_strategy_var.set(row.load_strategy)
@@ -4181,7 +4191,7 @@ del "%~f0" >nul 2>nul
 
     def _edit_selected_login_credentials(self) -> None:
         row = self._get_selected_auth_row()
-        if not isinstance(row, AuthFileRow) or self._auth_login_busy:
+        if not isinstance(row, AuthFileRow):
             return
         credentials = LoginCredentials.from_dict(self.auth_sync_service.get_login_credentials(row.refresh_token))
         if not credentials.email:

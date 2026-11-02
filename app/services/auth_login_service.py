@@ -20,7 +20,6 @@ from urllib import error, parse, request
 
 from app.services.auth_sync_service import AuthSyncService
 from app.models import LoginCredentials
-from app.services.browser_auth_service import BrowserAuthService
 
 
 _AUTH_URL = "https://auth.openai.com/oauth/authorize"
@@ -49,6 +48,7 @@ class AuthLoginResult:
 
 @dataclass
 class _PendingLogin:
+    session_id: int
     state: str
     code_verifier: str
     redirect_uri: str
@@ -60,6 +60,7 @@ class AuthLoginService:
     def __init__(self, auth_sync_service: AuthSyncService) -> None:
         self.auth_sync_service = auth_sync_service
         self._lock = Lock()
+        self._login_lock = Lock()
         self._callback_server: HTTPServer | None = None
         self._callback_port = 0
         self._callback_thread: Thread | None = None
@@ -69,6 +70,7 @@ class AuthLoginService:
         self._done = Event()
         self._active = False
         self._outcome: tuple[AuthLoginResult | None, str] | None = None
+        self._session_id = 0
 
     def set_result_callback(self, callback: Callable[[AuthLoginResult | None, str], None]) -> None:
         self._result_callback = callback
@@ -98,14 +100,34 @@ class AuthLoginService:
         expected_account_id: str = "",
         callback_port: int | None = None,
     ) -> None:
+        with self._login_lock:
+            self._start_login(proxy_url, log, credentials, expected_account_id, callback_port)
+
+    @property
+    def session_id(self) -> int:
+        with self._lock:
+            return self._session_id
+
+    def _start_login(
+        self,
+        proxy_url: str = "",
+        log: Callable[[str], None] | None = None,
+        credentials: LoginCredentials | None = None,
+        expected_account_id: str = "",
+        callback_port: int | None = None,
+    ) -> None:
         if credentials is not None:
             credentials.validate()
         with self._lock:
             if self._active:
-                raise RuntimeError("已有登录流程正在进行，请完成或取消后重试。")
+                self._done.set()
+            self._session_id += 1
+            session_id = self._session_id
             self._active = True
-            self._done = Event()
+            done = Event()
+            self._done = done
             self._outcome = None
+            self._pending_login = None
         try:
             self.start_callback_listener(log, callback_port)
         except Exception:
@@ -120,6 +142,7 @@ class AuthLoginService:
 
         with self._lock:
             self._pending_login = _PendingLogin(
+                session_id=session_id,
                 state=state,
                 code_verifier=code_verifier,
                 redirect_uri=redirect_uri,
@@ -127,33 +150,33 @@ class AuthLoginService:
                 expected_account_id=expected_account_id,
             )
         Thread(
-            target=self._login_worker, args=(authorize_url, credentials, proxy_url, log),
+            target=self._login_worker, args=(authorize_url, credentials, proxy_url, log, session_id, done),
             daemon=True, name="browser-auth-login",
         ).start()
 
-    def _login_worker(self, authorize_url, credentials, proxy_url, log) -> None:
+    def _login_worker(self, authorize_url, credentials, proxy_url, log, session_id: int, done: Event) -> None:
         status = lambda message: log(f"[AuthLogin] {message}") if log is not None else None
         try:
-            if credentials is not None and credentials.has_password:
-                BrowserAuthService().run(authorize_url, credentials, self._done, status, proxy_url)
-            else:
-                status("凭据未配置完整，请在无痕窗口中手动登录")
-                self._open_authorize_url(authorize_url)
-                if not self._done.wait(300):
-                    raise RuntimeError("登录超时，请重新更新授权。")
+            status("请在浏览器中登录，可从登录信息窗口复制账号、密码和验证码")
+            self._open_authorize_url(authorize_url)
+            if not done.wait(300):
+                raise RuntimeError("登录超时，请重新更新授权。")
         except RuntimeError as exc:
-            self._notify_result(None, str(exc))
+            self._notify_result(None, str(exc), session_id)
         except Exception:
             # 浏览器异常可能携带输入内容，不将原始异常写入日志。
-            self._notify_result(None, "自动登录未能完成，请重试或手动登录。")
+            self._notify_result(None, "登录未能完成，请重试。", session_id)
         finally:
-            self.stop_callback_listener()
-            with self._lock:
-                self._active = False
-                outcome = self._outcome
-            callback = self._result_callback
-            if callback is not None and outcome is not None:
-                callback(*outcome)
+            with self._login_lock:
+                if self.session_id != session_id:
+                    return
+                self.stop_callback_listener()
+                with self._lock:
+                    self._active = False
+                    outcome = self._outcome
+                callback = self._result_callback
+                if callback is not None and outcome is not None:
+                    callback(*outcome)
 
     def cancel_login(self) -> None:
         self._notify_result(None, "登录已取消。")
@@ -213,13 +236,13 @@ class AuthLoginService:
 
                 error_text = params.get("error", [""])[0]
                 if error_text:
-                    service._notify_result(None, error_text)
+                    service._notify_result(None, error_text, pending_login.session_id)
                     self._send_page(400, "登录失败，请关闭此页面后重试。")
                     return
 
                 code = params.get("code", [""])[0]
                 if not code:
-                    service._notify_result(None, "网页登录回调缺少 code。")
+                    service._notify_result(None, "网页登录回调缺少 code。", pending_login.session_id)
                     self._send_page(400, "登录失败，请关闭此页面后重试。")
                     return
 
@@ -279,18 +302,22 @@ class AuthLoginService:
             if pending_login.expected_account_id and account_id != pending_login.expected_account_id:
                 raise RuntimeError("登录结果与选中账号不一致，未保存授权。")
             with self._lock:
-                if self._done.is_set():
+                if pending_login.session_id != self._session_id or self._done.is_set():
                     return "登录已取消，未保存授权。"
                 account_id, refresh_token = self.auth_sync_service.save_logged_in_auth_file(auth_data)
+                self._pending_login = None
+                self._outcome = (AuthLoginResult(account_id=account_id, refresh_token=refresh_token), "")
+                self._done.set()
         except Exception as exc:
             error_message = str(exc)
-            self._notify_result(None, error_message)
+            self._notify_result(None, error_message, pending_login.session_id)
             return error_message
-        self._notify_result(AuthLoginResult(account_id=account_id, refresh_token=refresh_token), "")
         return ""
 
-    def _notify_result(self, result: AuthLoginResult | None, error: str) -> None:
+    def _notify_result(self, result: AuthLoginResult | None, error: str, session_id: int | None = None) -> None:
         with self._lock:
+            if session_id is not None and session_id != self._session_id:
+                return
             if not self._active or self._done.is_set():
                 return
             self._pending_login = None
