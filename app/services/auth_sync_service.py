@@ -13,7 +13,7 @@ from threading import Event, Lock, RLock, Thread
 from typing import Callable
 
 from app.utils.path_utils import app_root
-from app.models import CREDENTIAL_TYPE_CODEX_AUTH, LoadStrategy
+from app.models import CREDENTIAL_TYPE_CODEX_AUTH, LoadStrategy, LoginCredentials
 
 
 _MANAGER_METADATA_KEY = "_codex_session_manager"
@@ -328,6 +328,64 @@ class AuthSyncService:
         metadata = data.get(_MANAGER_METADATA_KEY)
         return metadata if isinstance(metadata, dict) else {}
 
+    @_serialize_auth_files
+    def get_login_credentials(self, refresh_token: str) -> dict[str, str]:
+        target_path = self._find_auth_file_by_refresh_token(refresh_token)
+        if target_path is None:
+            return {}
+        data = self._read_auth_data(target_path)
+        if data is None:
+            return {}
+        metadata = self._manager_metadata(data)
+        credentials = metadata.get("login_credentials")
+        if not isinstance(credentials, dict):
+            return {}
+        return {
+            "email": str(credentials.get("email") or "").strip(),
+            "password": str(credentials.get("password") or ""),
+            "totp_secret": str(credentials.get("totp_secret") or "").strip(),
+        }
+
+    @_serialize_auth_files
+    def set_login_credentials(
+        self,
+        refresh_token: str,
+        email: str,
+        password: str,
+        totp_secret: str,
+    ) -> tuple[bool, str]:
+        target_path = self._find_auth_file_by_refresh_token(refresh_token)
+        if target_path is None:
+            return False, f"找不到刷新令牌对应的授权文件: {refresh_token}"
+        data = self._read_auth_data(target_path)
+        if data is None:
+            return False, f"授权文件格式无效: {target_path}"
+        metadata = dict(self._manager_metadata(data))
+        credentials = LoginCredentials.from_dict({
+            "email": email.strip(),
+            "password": password,
+            "totp_secret": totp_secret.strip(),
+        })
+        try:
+            credentials.validate()
+        except ValueError as exc:
+            return False, str(exc)
+        values = {"email": credentials.email, "password": credentials.password, "totp_secret": credentials.totp_secret}
+        if any(values.values()):
+            metadata["login_credentials"] = values
+            data[_MANAGER_METADATA_KEY] = metadata
+        else:
+            metadata.pop("login_credentials", None)
+            if metadata:
+                data[_MANAGER_METADATA_KEY] = metadata
+            else:
+                data.pop(_MANAGER_METADATA_KEY, None)
+        try:
+            self._write_auth_data(target_path, data)
+        except OSError as exc:
+            return False, str(exc)
+        return True, ""
+
     def _load_strategy(self, data: dict[str, object]) -> str:
         metadata = self._manager_metadata(data)
         strategy = str(metadata.get("load_strategy") or "").strip()
@@ -516,6 +574,25 @@ class AuthSyncService:
                 message = "云端没有当前账号，已保留当前授权及管理记录。"
 
         # 下载期间的新登录已由上面的实时读取处理；应用前再次检查外部修改。
+        if staged_auth.is_dir():
+            for path in staged_auth.glob("*.json"):
+                data = self._read_auth_data(path)
+                tokens = data.get("tokens") if data is not None else None
+                if not isinstance(tokens, dict):
+                    continue
+                account_id = str(data.get("account_id") or tokens.get("account_id") or "")
+                refresh_token = str(tokens.get("refresh_token") or "")
+                local_path = self._auth_file_path(account_id, refresh_token)
+                if not local_path.exists():
+                    local_path = self._find_auth_file_by_refresh_token(refresh_token)
+                local_data = self._read_auth_data(local_path) if local_path is not None else None
+                local_credentials = self._manager_metadata(local_data or {}).get("login_credentials")
+                metadata = dict(self._manager_metadata(data))
+                metadata.pop("login_credentials", None)
+                if isinstance(local_credentials, dict):
+                    metadata["login_credentials"] = dict(local_credentials)
+                data[_MANAGER_METADATA_KEY] = metadata
+                self._write_auth_data(path, data)
         if self._read_auth_data(self.source_path) != current:
             raise RuntimeError("当前授权在拉取期间发生变化，请重新拉取。")
         try:

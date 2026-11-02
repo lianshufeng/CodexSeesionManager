@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -65,7 +66,17 @@ class CloudSyncService:
         for path in files:
             relative_path = path.relative_to(self.auth_dir).as_posix()
             key = f"{prefix}auth/{relative_path}"
-            client.upload_file(str(path), self.config.bucket_name, key)
+            if path.suffix.lower() == ".json":
+                data = json.loads(path.read_text(encoding="utf-8-sig"))
+                metadata = data.get("_codex_session_manager") if isinstance(data, dict) else None
+                if isinstance(metadata, dict):
+                    metadata.pop("login_credentials", None)
+                client.put_object(
+                    Bucket=self.config.bucket_name, Key=key,
+                    Body=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                )
+            else:
+                client.upload_file(str(path), self.config.bucket_name, key)
         if config_path.exists() and config_path.is_file():
             client.upload_file(str(config_path), self.config.bucket_name, f"{prefix}config.json")
         return self._build_version(client, prefix)

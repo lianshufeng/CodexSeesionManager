@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import List
 
@@ -130,3 +130,35 @@ class ResetCreditInfo:
 class ResetCreditState:
     info: ResetCreditInfo | None = None
     failed: bool = False
+
+
+@dataclass
+class LoginCredentials:
+    email: str = ""
+    password: str = field(default="", repr=False)
+    totp_secret: str = field(default="", repr=False)
+
+    @property
+    def has_password(self) -> bool:
+        return bool(self.email and self.password)
+
+    def validate(self) -> None:
+        if self.email and ("@" not in self.email or any(c.isspace() for c in self.email)):
+            raise ValueError("登录邮箱格式无效。")
+        if self.totp_secret:
+            import base64
+            try:
+                secret = self.totp_secret
+                decoded = base64.b32decode(secret + "=" * (-len(secret) % 8))
+                if len(decoded) < 10:
+                    raise ValueError
+            except (ValueError, TypeError) as exc:
+                raise ValueError("2FA 密钥必须是有效的 Base32 验证器密钥。") from exc
+
+    @classmethod
+    def from_dict(cls, values: dict[str, str]) -> "LoginCredentials":
+        return cls(
+            email=values.get("email", "").strip(),
+            password=values.get("password", ""),
+            totp_secret="".join(values.get("totp_secret", "").split()).upper().rstrip("="),
+        )

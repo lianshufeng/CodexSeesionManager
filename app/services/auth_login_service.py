@@ -3,16 +3,24 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import secrets
-from threading import Lock, Thread
+import socket
+import shutil
+import subprocess
+import sys
+from threading import Event, Lock, Thread
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Callable
 from urllib import error, parse, request
 
 from app.services.auth_sync_service import AuthSyncService
+from app.models import LoginCredentials
+from app.services.browser_auth_service import BrowserAuthService
 
 
 _AUTH_URL = "https://auth.openai.com/oauth/authorize"
@@ -22,6 +30,15 @@ _CALLBACK_PATH = "/auth/callback"
 _CALLBACK_PORTS = (1455, 1457)
 _SCOPE = "openid profile email offline_access api.connectors.read api.connectors.invoke"
 _OPENAI_AUTH_CLAIM = "https://api.openai.com/auth"
+
+
+class _CallbackServer(HTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
 
 @dataclass
@@ -36,6 +53,7 @@ class _PendingLogin:
     code_verifier: str
     redirect_uri: str
     proxy_url: str
+    expected_account_id: str = ""
 
 
 class AuthLoginService:
@@ -45,16 +63,25 @@ class AuthLoginService:
         self._callback_server: HTTPServer | None = None
         self._callback_port = 0
         self._callback_thread: Thread | None = None
+        self._callback_port_hint: int | None = None
         self._pending_login: _PendingLogin | None = None
         self._result_callback: Callable[[AuthLoginResult | None, str], None] | None = None
+        self._done = Event()
+        self._active = False
+        self._outcome: tuple[AuthLoginResult | None, str] | None = None
 
     def set_result_callback(self, callback: Callable[[AuthLoginResult | None, str], None]) -> None:
         self._result_callback = callback
 
-    def start_callback_listener(self, log: Callable[[str], None] | None = None) -> None:
+    def start_callback_listener(
+        self,
+        log: Callable[[str], None] | None = None,
+        callback_port: int | None = None,
+    ) -> None:
         with self._lock:
             if self._callback_server is not None:
                 return
+            self._callback_port_hint = callback_port
             server = self._build_callback_server()
             self._callback_server = server
             self._callback_port = int(server.server_address[1])
@@ -67,8 +94,24 @@ class AuthLoginService:
         self,
         proxy_url: str = "",
         log: Callable[[str], None] | None = None,
+        credentials: LoginCredentials | None = None,
+        expected_account_id: str = "",
+        callback_port: int | None = None,
     ) -> None:
-        self.start_callback_listener(log)
+        if credentials is not None:
+            credentials.validate()
+        with self._lock:
+            if self._active:
+                raise RuntimeError("已有登录流程正在进行，请完成或取消后重试。")
+            self._active = True
+            self._done = Event()
+            self._outcome = None
+        try:
+            self.start_callback_listener(log, callback_port)
+        except Exception:
+            with self._lock:
+                self._active = False
+            raise
         code_verifier = self._token_urlsafe(96)
         code_challenge = self._code_challenge(code_verifier)
         state = self._token_urlsafe(32)
@@ -81,9 +124,73 @@ class AuthLoginService:
                 code_verifier=code_verifier,
                 redirect_uri=redirect_uri,
                 proxy_url=proxy_url,
+                expected_account_id=expected_account_id,
             )
-        if log is not None:
-            log(f"[AuthLogin] 已打开网页登录，等待回调: {redirect_uri}")
+        Thread(
+            target=self._login_worker, args=(authorize_url, credentials, proxy_url, log),
+            daemon=True, name="browser-auth-login",
+        ).start()
+
+    def _login_worker(self, authorize_url, credentials, proxy_url, log) -> None:
+        status = lambda message: log(f"[AuthLogin] {message}") if log is not None else None
+        try:
+            if credentials is not None and credentials.has_password:
+                BrowserAuthService().run(authorize_url, credentials, self._done, status, proxy_url)
+            else:
+                status("凭据未配置完整，请在无痕窗口中手动登录")
+                self._open_authorize_url(authorize_url)
+                if not self._done.wait(300):
+                    raise RuntimeError("登录超时，请重新更新授权。")
+        except RuntimeError as exc:
+            self._notify_result(None, str(exc))
+        except Exception:
+            # 浏览器异常可能携带输入内容，不将原始异常写入日志。
+            self._notify_result(None, "自动登录未能完成，请重试或手动登录。")
+        finally:
+            self.stop_callback_listener()
+            with self._lock:
+                self._active = False
+                outcome = self._outcome
+            callback = self._result_callback
+            if callback is not None and outcome is not None:
+                callback(*outcome)
+
+    def cancel_login(self) -> None:
+        self._notify_result(None, "登录已取消。")
+
+    def stop_callback_listener(self) -> None:
+        with self._lock:
+            server = self._callback_server
+            self._callback_server = None
+            thread = self._callback_thread
+            self._callback_thread = None
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join(timeout=2)
+
+    def _open_authorize_url(self, authorize_url: str) -> None:
+        """优先使用 Chrome 无痕窗口，找不到 Chrome 时回退到系统默认浏览器。"""
+        if sys.platform == "win32":
+            local_app_data = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+            candidates = [
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Google", "Chrome", "Application", "chrome.exe"),
+                os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
+                shutil.which("chrome.exe") or "",
+            ]
+            chrome_path = next((path for path in candidates if path and os.path.exists(path)), "")
+            if chrome_path:
+                try:
+                    subprocess.Popen(
+                        [chrome_path, "--incognito", "--new-window", authorize_url],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    return
+                except OSError:
+                    pass
         webbrowser.open(authorize_url)
 
     def _build_callback_server(self) -> HTTPServer:
@@ -138,12 +245,15 @@ class AuthLoginService:
                 self.end_headers()
                 self.wfile.write(body)
 
-        for port in _CALLBACK_PORTS:
+        ports = (self._callback_port_hint,) if self._callback_port_hint is not None else _CALLBACK_PORTS
+        for port in ports:
             try:
-                server = HTTPServer(("127.0.0.1", port), CallbackHandler)
+                server = _CallbackServer(("127.0.0.1", port), CallbackHandler)
             except OSError:
                 continue
             return server
+        if self._callback_port_hint == 0:
+            raise RuntimeError("无法监听随机登录回调端口。")
         raise RuntimeError("无法监听 Codex 登录回调端口 1455 或 1457。")
 
     def _take_pending_login(self, state: str) -> _PendingLogin | None:
@@ -165,7 +275,13 @@ class AuthLoginService:
                 pending_login.proxy_url,
             )
             auth_data = self._build_auth_data(token_data)
-            account_id, refresh_token = self.auth_sync_service.save_logged_in_auth_file(auth_data)
+            account_id = str(auth_data["tokens"].get("account_id") or "")
+            if pending_login.expected_account_id and account_id != pending_login.expected_account_id:
+                raise RuntimeError("登录结果与选中账号不一致，未保存授权。")
+            with self._lock:
+                if self._done.is_set():
+                    return "登录已取消，未保存授权。"
+                account_id, refresh_token = self.auth_sync_service.save_logged_in_auth_file(auth_data)
         except Exception as exc:
             error_message = str(exc)
             self._notify_result(None, error_message)
@@ -174,9 +290,12 @@ class AuthLoginService:
         return ""
 
     def _notify_result(self, result: AuthLoginResult | None, error: str) -> None:
-        callback = self._result_callback
-        if callback is not None:
-            callback(result, error)
+        with self._lock:
+            if not self._active or self._done.is_set():
+                return
+            self._pending_login = None
+            self._outcome = (result, error)
+            self._done.set()
 
     def _request_tokens(
         self,
