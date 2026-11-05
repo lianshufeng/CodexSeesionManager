@@ -3705,7 +3705,7 @@ del "%~f0" >nul 2>nul
 
     def _is_quota_warmup_candidate(self, quota: str) -> bool:
         percentages = self._quota_percentages(quota)
-        return bool(percentages) and percentages[0] >= 99 and all(value > 0 for value in percentages)
+        return bool(percentages) and percentages[0] == 100 and all(value > 0 for value in percentages)
 
     def _format_auth_load_mark(self, row: AuthFileRow, load_refresh_token: str) -> str:
         if row.refresh_token == load_refresh_token:
