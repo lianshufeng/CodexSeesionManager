@@ -101,6 +101,30 @@ Codex 可能存在 WebSocket 或其他长连接。目标 token 切换后，旧�
 
 自动负载默认开启。如果关闭自动负载，代理会保留原始 token 的计数逻辑，不再主动替换为选举目标。
 
+## 远程状态服务的 MQTT 协议
+
+远程状态服务使用 Mosquitto，同时接受 MQTT 3.1.1 和 5.0 客户端连接同一个端口。Postman 可以选择 V3.1.1 或 V5。服务随手动注入启动，停止时会结束其启动的 Mosquitto 子进程。
+
+监听地址默认为 `0.0.0.0`，账号密码沿用窗口配置，默认 `admin` / `admin@2026`。其他机器使用本机实际 IP 和配置端口连接。附加后在 Codex 中切换会话，窗口显示“可写”后即可发送命令。写端通过父进程发送与目标 App Server 接收的两条相同请求确认，使用独立异步完成事件写入原管道，支持桌面端空闲时主动投递。
+
+订阅 `codex/<PID>/observed/input`、`codex/<PID>/observed/output` 接收协议事件，订阅 `codex/<PID>/status` 查看 `attached` 和 `writerReady`。向 `codex/<PID>/command` 发布下面的 JSON，并订阅 `codex/<PID>/reply/demo_001` 接收结果。
+
+```json
+{"id":"demo_001","method":"thread/start","params":{"cwd":"E:/git/github/docker-codex"}}
+```
+
+从结果取得 `result.thread.id`，再使用新的请求 ID 发布 `turn/start`。
+
+```json
+{"id":"demo_002","method":"turn/start","params":{"threadId":"替换为会话ID","input":[{"type":"text","text":"请阅读项目 Dockerfile，用中文解释其构建与启动流程。"}]}}
+```
+
+还支持 `thread/list`、`thread/read`、`thread/resume`、`thread/turns/list`、`thread/items/list`、`model/list` 和 `turn/interrupt`。轮次最终结果通过 `observed/output` 的 `turn/completed` 事件接收。`rpc/respond` 可以回答仍待处理的审批或提问，`params` 传 `requestId` 和协议要求的 `result` 对象，其回包仅确认回答已写入。审批和提问的事件仍会送达原桌面界面。
+
+命令关闭 Retain。请求 ID 在本次附加期间应保持唯一，重复 ID 返回已缓存回包，单次附加最多处理 128 条不同命令。编码后的单条命令上限为 4 KiB，写入最多等待 5 秒，写完后最多等待响应 15 秒。响应超时后仍会转发迟到结果，投递不确定时需先查询状态。管理器重启后缓存清空，客户端应先查询会话，避免重复提交。当前监听为普通 TCP，公网加密接入可由外部 TLS 通道提供。
+
+Windows 源码运行时，从 [Mosquitto 官网](https://mosquitto.org/download/) 安装 Broker，或将官方运行文件及所需 DLL 放入程序根目录的 `mosquitto/`。也支持从 PATH 查找。Mosquitto 是外部运行文件，Python 依赖仍统一在 `requirement.txt` 中维护。构建前需准备好 Mosquitto，打包配置会收集 Broker、DLL 和许可文件。
+
 ## 构建发布
 
 仓库包含 GitHub Actions 工作流，可在 GitHub 页面手动触发 Windows 构建。触发后会使用 GitHub Windows 主机打包程序，并按北京时间生成形如 `202605061739` 的 tag 发布 zip 包。

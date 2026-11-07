@@ -52,6 +52,8 @@ from app.services.relay_config_service import RelayConfigService
 from app.services.codex_local_config_service import CodexLocalConfigService
 from app.services.packaged_app_launch_service import activate_packaged_app, packaged_app_id
 from app.services.codex_retry_service import CodexRetryService
+from app.services.app_server_mqtt_service import AppServerMqttService
+from app.ui.app_server_mqtt_window import AppServerMqttWindow
 from app.utils.path_utils import app_root
 from tkinter import messagebox, ttk
 
@@ -108,6 +110,8 @@ class ProxyWindow:
         loaded_config = self.config_service.load()
         auto_retry_enabled = loaded_config.auto_retry if loaded_config is not None else False
         self.codex_retry_service = CodexRetryService(port=remote_port, enabled=auto_retry_enabled)
+        self._app_server_mqtt = AppServerMqttService()
+        self._app_server_mqtt_window: AppServerMqttWindow | None = None
         self.service = ProxyService()
         self._timezone_proxies: list[TimezoneProxyService] = []
         self._timezone_launch_busy = False
@@ -416,6 +420,7 @@ class ProxyWindow:
         install_actions.pack(fill="x")
         ttk.Button(install_actions, text="刷新", command=self.refresh_all).pack(side="right")
         ttk.Button(install_actions, text="结束进程", command=self.kill_codex_processes).pack(side="right", padx=(0, 8))
+        ttk.Button(install_actions, text="远程状态服务", command=self._open_app_server_mqtt).pack(side="right", padx=(0, 8))
 
         tree_wrap = ttk.Frame(table_frame)
         tree_wrap.pack(fill="x", pady=(6, 0))
@@ -5016,6 +5021,7 @@ del "%~f0" >nul 2>nul
 
     def _shutdown_app(self) -> None:
         self._closing = True
+        self._app_server_mqtt.stop(wait=True)
         self.codex_retry_service.stop()
         if self._token_history_window is not None and self._token_history_window.window.winfo_exists():
             self._token_history_window.close()
@@ -5038,3 +5044,10 @@ del "%~f0" >nul 2>nul
                 pass
         self._token_history_service.stop()
         self.root.destroy()
+
+    def _open_app_server_mqtt(self) -> None:
+        dialog = self._app_server_mqtt_window
+        if dialog is not None and dialog.window.winfo_exists():
+            dialog.show()
+            return
+        self._app_server_mqtt_window = AppServerMqttWindow(self.root, self._app_server_mqtt)

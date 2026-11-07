@@ -11,6 +11,8 @@
 /data/quota_warmup.json
 /data/quota_warmup.tmp
 /data/connection_affinity.json
+/data/app_server_mqtt.json
+/data/app_server_mqtt.tmp
 /.idea
 
 *.log
