@@ -38,7 +38,8 @@ class MosquittoBroker:
         (directory / 'users').write_text(f'{username}:$7${iterations}${salt64}${digest64}\n', encoding='utf-8')
         (directory / 'mosquitto.conf').write_text(
             f'listener {port} {host}\nallow_anonymous false\npassword_file users\n'
-            'persistence false\nconnection_messages false\nlog_dest stderr\n', encoding='utf-8',
+            'persistence false\nconnection_messages false\nlog_dest stderr\nmax_packet_size 268435455\nmax_queued_messages 4096\nmax_queued_bytes 16777216\n',
+            encoding='utf-8',
         )
 
     @property

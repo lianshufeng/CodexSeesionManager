@@ -119,9 +119,9 @@ Codex 可能存在 WebSocket 或其他长连接。目标 token 切换后，旧�
 {"id":"demo_002","method":"turn/start","params":{"threadId":"替换为会话ID","input":[{"type":"text","text":"请阅读项目 Dockerfile，用中文解释其构建与启动流程。"}]}}
 ```
 
-还支持 `thread/list`、`thread/read`、`thread/resume`、`thread/turns/list`、`thread/items/list`、`model/list` 和 `turn/interrupt`。轮次最终结果通过 `observed/output` 的 `turn/completed` 事件接收。`rpc/respond` 可以回答仍待处理的审批或提问，`params` 传 `requestId` 和协议要求的 `result` 对象，其回包仅确认回答已写入。审批和提问的事件仍会送达原桌面界面。
+普通请求按标准 app-server JSON-RPC 转发，方法支持情况由 app-server 返回，桥不逐项维护业务方法白名单。会话命名使用 `thread/name/set`，参数为 `threadId` 和 `name`，名称直接保存到执行端。桌面连接已经完成初始化，桥拒绝重复的 `initialize` 和 `initialized`。轮次最终结果通过 `observed/output` 的 `turn/completed` 事件接收。`rpc/respond` 可以回答仍待处理的审批或提问，`params` 传 `requestId` 和协议要求的 `result` 对象，其回包仅确认回答已写入。审批和提问的事件仍会送达原桌面界面。
 
-命令关闭 Retain。请求 ID 在本次附加期间应保持唯一，重复 ID 返回已缓存回包，单次附加最多处理 128 条不同命令。编码后的单条命令上限为 4 KiB，写入最多等待 5 秒，写完后最多等待响应 15 秒。响应超时后仍会转发迟到结果，投递不确定时需先查询状态。管理器重启后缓存清空，客户端应先查询会话，避免重复提交。当前监听为普通 TCP，公网加密接入可由外部 TLS 通道提供。
+命令关闭 Retain。请求 ID 在本次附加期间应保持唯一，近期重复 ID 返回已缓存回包。桥不设置累计请求数、业务并发数或单条 JSON 的业务上限，MQTT 协议和管道背压仍适用。状态公布 `methods: "*"`、`protocolVersion: 1`、`runId`、`maxRequestBytes: null` 和 `fileTransfer`。文件使用独立 MQTT 二进制主题，每块 512 KiB，不设置文件总大小上限。请求、响应和观察事件均保留原始业务字段，不按方法或字段名过滤。MQTT 账号可接收执行端协议事件，需作为可信后端凭据保管。投递不确定时先查询执行状态，避免重复提交。当前监听为普通 TCP，公网加密接入可由外部 TLS 通道提供。
 
 Windows 源码运行时，从 [Mosquitto 官网](https://mosquitto.org/download/) 安装 Broker，或将官方运行文件及所需 DLL 放入程序根目录的 `mosquitto/`。也支持从 PATH 查找。Mosquitto 是外部运行文件，Python 依赖仍统一在 `requirement.txt` 中维护。构建前需准备好 Mosquitto，打包配置会收集 Broker、DLL 和许可文件。
 

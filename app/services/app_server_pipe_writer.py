@@ -62,8 +62,8 @@ class AppServerPipeWriter:
             raise RuntimeError('桌面客户端已经重启，请重新附加')
 
     def write(self, payload: bytes) -> None:
-        if not payload.endswith(b'\n') or len(payload) > 4096:
-            raise ValueError('命令必须为完整 JSONL，且不超过 4 KiB')
+        if not payload.endswith(b'\n'):
+            raise ValueError('命令必须为完整 JSONL')
         with self._lock:
             self._check_parent()
             if not self.ready:

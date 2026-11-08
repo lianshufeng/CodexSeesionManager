@@ -420,7 +420,7 @@ class ProxyWindow:
         install_actions.pack(fill="x")
         ttk.Button(install_actions, text="刷新", command=self.refresh_all).pack(side="right")
         ttk.Button(install_actions, text="结束进程", command=self.kill_codex_processes).pack(side="right", padx=(0, 8))
-        ttk.Button(install_actions, text="远程状态服务", command=self._open_app_server_mqtt).pack(side="right", padx=(0, 8))
+        ttk.Button(install_actions, text="远程服务", command=self._open_app_server_mqtt).pack(side="right", padx=(0, 8))
 
         tree_wrap = ttk.Frame(table_frame)
         tree_wrap.pack(fill="x", pady=(6, 0))

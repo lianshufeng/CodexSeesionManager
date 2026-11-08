@@ -19,6 +19,7 @@ import psutil
 
 from app.services.mosquitto_broker import MosquittoBroker
 from app.services.app_server_pipe_writer import AppServerPipeWriter
+from app.services.file_transfer import FileTransfers, CAPABILITIES
 from app.utils.path_utils import app_root
 
 
@@ -85,13 +86,6 @@ class _ProbeCleanupError(RuntimeError):
 
 
 class AppServerMqttService:
-    METHODS = frozenset({'model/list', 'thread/list', 'thread/read', 'thread/start', 'thread/resume',
-                         'thread/turns/list', 'thread/items/list', 'turn/start', 'turn/interrupt'})
-    RESPOND_METHODS = frozenset({'item/commandExecution/requestApproval', 'item/fileChange/requestApproval',
-                                 'item/permissions/requestApproval', 'item/tool/requestUserInput'})
-    SENSITIVE = re.compile(r'password|secret|authorization|^token$|(?:access|refresh|id|api|bearer)[_-]?(?:token|key)|cookie', re.I)
-    CHUNK_LIMIT = 4 * 1024 * 1024
-    RESPONSE_TIMEOUT = 15
     RETRY_DELAYS = (1, 2, 4)
     PUBLISH_TIMEOUT = 5
 
@@ -101,6 +95,7 @@ class AppServerMqttService:
         self.status = '未启动'
         self.error = ''
         self.count = 0
+        self._reply_expiry = {}
         self.dropped = 0
         self.target: AppServerTarget | None = None
         self.broker_running = False
@@ -295,7 +290,7 @@ class AppServerMqttService:
                         if self.status == '目标进程已退出' or not self._same_process(target):
                             self.status = '目标进程已退出'
                             raise RuntimeError('App Server 已退出或已重启，请刷新后重试') from exc
-                        if not has_attached or isinstance(exc, _ProbeCleanupError) or not broker.running:
+                        if not has_attached or not broker.running:
                             raise
                         if failures == len(self.RETRY_DELAYS):
                             self.status = '已断开'
@@ -356,8 +351,8 @@ class AppServerMqttService:
             except Exception:
                 raise RuntimeError('MQTT 桥接客户端连接失败') from None
             connected = True
-            grants = await asyncio.wait_for(client.subscribe([(f'{prefix}/command', 1)]), 5)
-            if grants != [1]:
+            grants = await asyncio.wait_for(client.subscribe([(f'{prefix}/command', 1), (f'{prefix}/files/request/+', 1)]), 5)
+            if grants != [1, 1]:
                 raise RuntimeError('订阅 MQTT 命令主题失败')
             if self._stop.is_set():
                 return
@@ -434,6 +429,17 @@ class AppServerMqttService:
 
     async def _bridge(self, client, writer, prefix, chunks, detached, process_exited, probe_errors, broker, seen) -> None:
         loop = asyncio.get_running_loop()
+        run_id = uuid.uuid4().hex
+        files = FileTransfers()
+        file_tasks = set()
+
+        async def transfer_file(topic, payload):
+            request_id = topic.rsplit('/', 1)[-1]
+            try:
+                response = await asyncio.to_thread(self._file_as_target, files, payload)
+                await asyncio.wait_for(client.publish(f'{prefix}/files/reply/{request_id}', response, qos=1, retain=False), self.PUBLISH_TIMEOUT)
+            except Exception as exc:
+                self._record('文件传输失败', type(exc).__name__)
 
         async def publish(topic, message, *, retain=False, qos=0):
             started = loop.time()
@@ -444,13 +450,18 @@ class AppServerMqttService:
             finally:
                 self._publish_peak = max(self._publish_peak, loop.time() - started)
 
+        async def publish_status(attached, writer_ready):
+            await publish('status', {'attached': attached, 'writerReady': writer_ready,
+                                     'protocolVersion': 1, 'runId': run_id, 'maxRequestBytes': None,
+                                     'fileTransfer': CAPABILITIES,
+                                     'methods': '*'}, retain=True, qos=1)
+
         buffers = {'input': b'', 'output': b''}
-        skip_line = {'input': True, 'output': True}
         requests = OrderedDict()
         parent_buffers = {}
         parent_requests = OrderedDict()
         input_requests = OrderedDict()
-        pending = None
+        pending = {}
         routes = {}
         receive = None
         try:
@@ -466,7 +477,7 @@ class AppServerMqttService:
                 if self.dropped:
                     raise RuntimeError('捕获队列溢出，消息边界已失效')
                 if receive is None:
-                    await publish('status', {'attached': True, 'writerReady': False}, retain=True)
+                    await publish_status(True, False)
                     if detached.is_set() or self.dropped or not probe_errors.empty():
                         continue
                     if self._stop.is_set():
@@ -486,7 +497,7 @@ class AppServerMqttService:
                             handle = meta['handle']
                             stream = parent_buffers.get(handle, b'') + data
                             lines = stream.split(b'\n')
-                            parent_buffers[handle] = lines.pop()[-self.CHUNK_LIMIT:]
+                            parent_buffers[handle] = lines.pop()
                             if len(parent_buffers) > 32:
                                 parent_buffers.clear()
                             for line in lines:
@@ -497,19 +508,14 @@ class AppServerMqttService:
                                         parent_requests.popitem(last=False)
                             self._confirm_writer(writer, parent_requests, input_requests)
                             if writer.ready:
-                                await publish('status', {'attached': True, 'writerReady': True}, retain=True)
+                                await publish_status(True, True)
                         continue
                     if meta['kind'] != 'bytes':
                         continue
                     direction = meta['direction']
                     lines = (buffers[direction] + data).split(b'\n')
                     buffers[direction] = lines.pop()
-                    if len(buffers[direction]) > self.CHUNK_LIMIT:
-                        buffers[direction] = b''
-                        skip_line[direction] = True
                     for line in lines:
-                        if len(line) > self.CHUNK_LIMIT:
-                            continue
                         try:
                             message = json.loads(line)
                         except (ValueError, UnicodeError):
@@ -524,32 +530,24 @@ class AppServerMqttService:
                                     input_requests.popitem(last=False)
                                 self._confirm_writer(writer, parent_requests, input_requests)
                                 if writer.ready:
-                                    await publish('status', {'attached': True, 'writerReady': True}, retain=True)
-                        uncertain = skip_line[direction]
-                        skip_line[direction] = False
+                                    await publish_status(True, True)
                         request_id = message.get('id')
                         if isinstance(request_id, str) and request_id.startswith('csm-mqtt:'):
                             external_id = routes.pop(request_id, None) if direction == 'output' else None
                             if external_id is not None:
                                 message['id'] = external_id
-                                reply = self._redact(message)
+                                reply = message
                                 seen[external_id] = reply
-                                await publish(f'reply/{external_id}', reply, qos=1)
-                                if pending and request_id == pending[0]:
-                                    pending = None
+                                self._reply_expiry[external_id] = loop.time() + 60
+                                await publish(f'reply/{quote(str(external_id), safe="")}', reply, qos=1)
+                                pending.pop(request_id, None)
                             continue
                         if direction == 'output':
                             self._record_protocol_event(message)
-                        message = self._observed(message, direction, requests, uncertain)
-                        await publish(f'observed/{direction}', message)
+                        observed = self._observed(message, direction, requests)
+                        if observed is not None:
+                            await publish(f'observed/{direction}', observed)
                         self.count += 1
-                if pending and loop.time() >= pending[2]:
-                    stage, error = 'response_timeout', '命令已写入，等待响应超时，请查询状态后再决定是否重试'
-                    self._record('MQTT 命令超时', error)
-                    reply = {'id': pending[1], 'error': error, 'stage': stage}
-                    seen[pending[1]] = reply
-                    await publish(f'reply/{pending[1]}', reply, qos=1)
-                    pending = None
                 if receive.done() and not (self._stop.is_set() or self.dropped or detached.is_set()
                                            or not probe_errors.empty()):
                     received = receive.result()
@@ -558,23 +556,53 @@ class AppServerMqttService:
                     packet = received.publish_packet
                     receive = asyncio.create_task(client.deliver_message())
                     if packet and not packet.retain_flag:
-                        pending = await self._command(packet.payload.data, writer, publish, pending, seen, requests)
-                        if pending is not None:
-                            routes[pending[0]] = pending[1]
+                        if received.topic.startswith(f'{prefix}/files/request/'):
+                            request_id = received.topic.rsplit('/', 1)[-1]
+                            if re.fullmatch(r'[A-Za-z0-9-]{1,64}', request_id) and len(packet.payload.data) <= 540672:
+                                task = asyncio.create_task(transfer_file(received.topic, packet.payload.data))
+                                file_tasks.add(task)
+                                task.add_done_callback(file_tasks.discard)
+                        else:
+                            pending = await self._command(packet.payload.data, writer, publish, pending, seen, requests)
+                            routes.update(pending)
                 # Yield to MQTT tasks between batches without throttling a capture backlog.
                 await asyncio.sleep(0.025 if chunks.empty() else 0)
         finally:
-            if pending and seen[pending[1]].get('stage') == 'delivery_unknown':
-                request_id = pending[1]
+            if file_tasks:
+                await asyncio.gather(*file_tasks, return_exceptions=True)
+            for request_id in pending.values():
                 seen[request_id] = {'id': request_id, 'stage': 'delivery_unknown',
-                                    'error': '命令已写入，断开前未收到响应，请查询状态'}
+                                    'error': '连接中断前尚未收到响应，请查询执行状态'}
             if receive is not None:
                 receive.cancel()
                 await asyncio.gather(receive, return_exceptions=True)
             try:
-                await asyncio.wait_for(publish('status', {'attached': False, 'writerReady': False}, retain=True), 1)
+                await asyncio.wait_for(publish_status(False, False), 1)
             except Exception as exc:
                 self._record('MQTT 状态更新失败', str(exc))
+
+    def _file_as_target(self, files, payload):
+        import win32api
+        import win32con
+        import win32security
+
+        process = win32api.OpenProcess(0x1000, False, self.target.pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        try:
+            token = win32security.OpenProcessToken(process, win32con.TOKEN_QUERY | win32con.TOKEN_DUPLICATE)
+            try:
+                impersonation = win32security.DuplicateToken(token, win32security.SecurityImpersonation)
+                try:
+                    win32security.ImpersonateLoggedOnUser(impersonation)
+                    try:
+                        return files.handle(payload)
+                    finally:
+                        win32security.RevertToSelf()
+                finally:
+                    impersonation.Close()
+            finally:
+                token.Close()
+        finally:
+            process.Close()
 
     def _confirm_writer(self, writer, parent_requests, input_requests) -> None:
         matches = [parent_requests[key] for key in input_requests if key in parent_requests]
@@ -600,86 +628,84 @@ class AppServerMqttService:
         return hashlib.sha256(json.dumps(message, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
 
     async def _command(self, data, writer, publish, pending, seen, requests):
-        if len(data) > 4096:
-            return pending
         try:
             command = json.loads(data)
         except (ValueError, UnicodeError):
             return pending
         if not isinstance(command, dict):
             return pending
-        request_id = command.get('id')
-        if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', request_id):
+        if 'id' not in command:
+            if not writer.ready or command.get('method') in ('initialize', 'initialized'):
+                return pending
+            await asyncio.to_thread(writer.write, (json.dumps(command, ensure_ascii=False) + '\n').encode())
             return pending
+        request_id = command.get('id')
+        if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
+            return pending
+        for key, expiry in list(self._reply_expiry.items()):
+            if expiry <= asyncio.get_running_loop().time():
+                self._reply_expiry.pop(key, None)
+                seen.pop(key, None)
         if request_id in seen:
-            await publish(f'reply/{request_id}', seen[request_id], qos=1)
+            if not seen[request_id].get('stage'):
+                await publish(f'reply/{quote(str(request_id), safe="")}', seen[request_id], qos=1)
             return pending
         method = command.get('method')
         params = command.get('params', {})
-        if not isinstance(method, str) or method not in self.METHODS | {'rpc/respond'} or not isinstance(params, dict):
-            error = '不支持的方法'
-        elif pending:
-            error = '已有命令等待响应'
-        elif not writer.ready:
-            error = '写端尚未确认，请在 Codex 中切换一次会话'
-        elif len(seen) >= 128:
-            error = '已达到本次服务运行的命令数量上限'
-        else:
+        error = None if writer.ready else '写端尚未确认，请在桌面切换一次会话'
+        if method in ('initialize', 'initialized'):
+            error = '桌面连接已经初始化，请直接发送业务请求'
+        if not error:
             rpc_id = f'csm-mqtt:{uuid.uuid4().hex}'
-            message = {'id': rpc_id, 'method': method, 'params': params}
-            server_id = params.get('requestId')
+            message = {**command, 'id': rpc_id}
+            server_id = params.get('requestId') if isinstance(params, dict) else None
             if method == 'rpc/respond':
-                if (not isinstance(server_id, (str, int)) or isinstance(server_id, bool)
-                        or requests.get(('output', server_id)) not in self.RESPOND_METHODS
-                        or not isinstance(params.get('result'), dict)):
-                    await publish(f'reply/{request_id}', {'id': request_id, 'error': '审批或提问已失效，或回答格式错误'}, qos=1)
+                if (not isinstance(params, dict) or isinstance(server_id, bool) or not isinstance(server_id, (str, int))
+                        or ('result' in params) == ('error' in params)):
+                    await publish(f'reply/{quote(str(request_id), safe="")}', {'id': request_id, 'error': '反向请求回答格式无效'}, qos=1)
                     return pending
-                message = {'id': server_id, 'result': params['result']}
-            payload = json.dumps(message) + '\n'
-            if len(payload.encode()) > 4096:
-                await publish(f'reply/{request_id}', {'id': request_id, 'error': '编码后的命令超过 4 KiB'}, qos=1)
-                return pending
+                if ('output', server_id) not in requests:
+                    await publish(f'reply/{quote(str(request_id), safe="")}', {'id': request_id, 'error': '反向请求已结束'}, qos=1)
+                    return pending
+                message = {'id': server_id, **{key: params[key] for key in ('result', 'error') if key in params}}
+            elif 'method' not in command:
+                if ('result' in command) == ('error' in command) or ('output', request_id) not in requests:
+                    await publish(f'reply/{quote(str(request_id), safe="")}', {'id': request_id, 'error': '反向请求已结束'}, qos=1)
+                    return pending
+                message = command
+            payload = json.dumps(message, ensure_ascii=False) + '\n'
             seen[request_id] = {'id': request_id, 'stage': 'delivery_unknown', 'error': '投递处理中，请勿重复执行'}
+            self._reply_expiry[request_id] = asyncio.get_running_loop().time() + 3600
             try:
                 await asyncio.to_thread(writer.write, payload.encode())
             except Exception as exc:
                 reply = {'id': request_id, 'error': str(exc), 'stage': 'delivery_unknown'}
                 seen[request_id] = reply
-                await publish(f'reply/{request_id}', reply, qos=1)
+                await publish(f'reply/{quote(str(request_id), safe="")}', reply, qos=1)
                 return pending
             else:
-                if method == 'rpc/respond':
-                    requests.pop(('output', server_id), None)
+                if method == 'rpc/respond' or 'method' not in command:
+                    requests.pop(('output', server_id if method else request_id), None)
                     reply = {'id': request_id, 'result': {'written': True}}
                     seen[request_id] = reply
-                    await publish(f'reply/{request_id}', reply, qos=1)
+                    self._reply_expiry[request_id] = asyncio.get_running_loop().time() + 60
+                    await publish(f'reply/{quote(str(request_id), safe="")}', reply, qos=1)
                     return pending
-                return rpc_id, request_id, asyncio.get_running_loop().time() + self.RESPONSE_TIMEOUT
-        await publish(f'reply/{request_id}', {'id': request_id, 'error': error}, qos=1)
+                pending[rpc_id] = request_id
+                return pending
+        await publish(f'reply/{quote(str(request_id), safe="")}', {'id': request_id, 'error': error}, qos=1)
         return pending
 
     @classmethod
-    def _redact(cls, value):
-        if isinstance(value, dict):
-            return {key: '[已隐藏]' if cls.SENSITIVE.search(key) else cls._redact(item)
-                    for key, item in value.items()}
-        if isinstance(value, list):
-            return [cls._redact(item) for item in value]
-        return value
-
-    @classmethod
-    def _observed(cls, message, direction, requests, uncertain):
-        method = message.get('method')
+    def _observed(cls, message, direction, requests):
         request_id = message.get('id')
-        if isinstance(request_id, (str, int)):
-            opposite = 'output' if direction == 'input' else 'input'
+        method = message.get('method')
+        if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
             if isinstance(method, str):
                 requests[(direction, request_id)] = method
-                if len(requests) > 2048:
-                    requests.popitem(last=False)
             else:
+                opposite = 'output' if direction == 'input' else 'input'
                 method = requests.pop((opposite, request_id), None)
-                uncertain = uncertain or method is None
-        if uncertain or (isinstance(method, str) and re.search(r'auth|login|attestation|credential|oauth|token(?!Usage)', method, re.I)):
-            return {key: message[key] for key in ('id', 'method') if key in message} | {'payloadOmitted': True}
-        return cls._redact(message)
+        if method == 'serverRequest/resolved':
+            requests.pop(('output', (message.get('params') or {}).get('requestId')), None)
+        return message
