@@ -41,6 +41,24 @@ jobs:
           python --version
           python -m pip freeze
 
+      - name: Install Mosquitto
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "mosquitto-2.0.22-install-windows-x64.exe"
+          Invoke-WebRequest -Uri "https://mosquitto.org/files/binary/win64/mosquitto-2.0.22-install-windows-x64.exe" -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList "/S" -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Mosquitto installation failed with exit code $($process.ExitCode)."
+          }
+          $mosquitto = Join-Path $env:ProgramFiles "mosquitto\mosquitto.exe"
+          if (!(Test-Path -LiteralPath $mosquitto -PathType Leaf)) {
+            throw "Mosquitto executable was not installed: $mosquitto"
+          }
+          & $mosquitto -h
+          if ($LASTEXITCODE -ne 0) {
+            throw "Mosquitto executable check failed with exit code $LASTEXITCODE."
+          }
+
       - name: Prepare build variables
         id: vars
         shell: pwsh
@@ -73,6 +91,9 @@ jobs:
         run: |
           if (!(Test-Path "$env:BUILD_EXE_DIR\codex_session.exe")) {
             throw "codex_session.exe was not generated."
+          }
+          if (!(Test-Path "$env:BUILD_EXE_DIR\mosquitto\mosquitto.exe")) {
+            throw "Mosquitto was not included in the build."
           }
           Compress-Archive -Path "$env:BUILD_EXE_DIR\*" -DestinationPath "$env:ZIP_PATH" -Force
 
