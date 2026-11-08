@@ -199,8 +199,7 @@ class AppServerMqttService:
 
     @staticmethod
     def _detail(*parts: object) -> str:
-        detail = ' · '.join(' '.join(part.split()) for part in parts if isinstance(part, str) and part.strip())
-        return f'{detail[:399]}…' if len(detail) > 400 else detail
+        return ' · '.join(part for part in parts if isinstance(part, str) and part.strip())
 
     def _record_item(self, item: object, completed: bool, thread_id: str) -> None:
         if not isinstance(item, dict):

@@ -22,6 +22,9 @@ class AppServerMqttWindow:
         self._refresh_job = None
         self._last_events = ()
         self._was_busy = False
+        self._detail_popup = None
+        self._detail_hide_job = None
+        self._hovered_detail = ''
         frame = ttk.Frame(self.window, padding=12)
         frame.grid(sticky='nsew')
         self.window.rowconfigure(0, weight=1)
@@ -72,6 +75,9 @@ class AppServerMqttWindow:
             self.events.column(column, width=width, minwidth=50, stretch=column == 'detail')
         scrollbar = ttk.Scrollbar(log_frame, orient='vertical', command=self.events.yview)
         self.events.configure(yscrollcommand=scrollbar.set)
+        self.events.bind('<Motion>', lambda event: self._show_detail(event.x_root, event.y_root))
+        self.events.bind('<Leave>', self._schedule_detail_hide)
+        self.events.bind('<MouseWheel>', lambda _: self._hide_detail())
         self.events.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
         actions = ttk.Frame(frame)
@@ -98,10 +104,71 @@ class AppServerMqttWindow:
         self.update_status()
 
     def hide(self) -> None:
+        self._hide_detail()
         if self._refresh_job is not None:
             self.window.after_cancel(self._refresh_job)
             self._refresh_job = None
         self.window.withdraw()
+
+    def _show_detail(self, x: int, y: int) -> None:
+        cell_x = x - self.events.winfo_rootx()
+        cell_y = y - self.events.winfo_rooty()
+        row = self.events.identify_row(cell_y)
+        if not row or self.events.identify_column(cell_x) != '#4':
+            self._hide_detail()
+            return
+        detail = self.events.item(row, 'text')
+        if not detail:
+            self._hide_detail()
+            return
+        if self._detail_popup is not None and detail == self._hovered_detail:
+            return
+        self._hide_detail()
+        self._hovered_detail = detail
+        popup = self._detail_popup = tk.Toplevel(self.window)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.attributes('-topmost', True)
+        body = tk.Text(popup, width=min(72, max(20, len(detail))), height=1,
+                       wrap='word', padx=8, pady=5, relief='solid', borderwidth=1,
+                       takefocus=False)
+        body.insert('1.0', detail)
+        body.configure(state='disabled')
+        body.pack(side='left', fill='both', expand=True)
+        popup.update_idletasks()
+        lines = int(body.tk.call(str(body), 'count', '-update', '-displaylines', '1.0', 'end'))
+        body.configure(height=min(16, lines))
+        if lines > 16:
+            scrollbar = ttk.Scrollbar(popup, orient='vertical', command=body.yview)
+            scrollbar.pack(side='right', fill='y')
+            body.configure(yscrollcommand=scrollbar.set)
+        popup.bind('<Leave>', self._schedule_detail_hide)
+        popup.update_idletasks()
+        left = max(0, min(x + 8, popup.winfo_screenwidth() - popup.winfo_reqwidth()))
+        height = popup.winfo_reqheight()
+        top = y + 8 if y + 8 + height <= popup.winfo_screenheight() else max(0, y - height - 8)
+        popup.geometry(f'+{left}+{top}')
+        popup.deiconify()
+
+    def _schedule_detail_hide(self, _event: tk.Event) -> None:
+        if self._detail_popup is not None and self._detail_hide_job is None:
+            self._detail_hide_job = self.window.after(250, self._hide_detail_if_left)
+
+    def _hide_detail_if_left(self) -> None:
+        self._detail_hide_job = None
+        widget = self.window.winfo_containing(*self.window.winfo_pointerxy())
+        if widget in (self.events, self._detail_popup) or str(widget).startswith(f'{self._detail_popup}.'):
+            return
+        self._hide_detail()
+
+    def _hide_detail(self) -> None:
+        if self._detail_hide_job is not None:
+            self.window.after_cancel(self._detail_hide_job)
+            self._detail_hide_job = None
+        if self._detail_popup is not None:
+            self._detail_popup.destroy()
+            self._detail_popup = None
+        self._hovered_detail = ''
 
     def refresh(self) -> None:
         self.processes = {str(target.pid): target for target in discover_app_servers()}
@@ -154,7 +221,13 @@ class AppServerMqttWindow:
             for item in self.events.get_children():
                 self.events.delete(item)
             for row in reversed(rows):
-                self.events.insert('', 'end', values=row, tags=('completed',) if row[2] == '轮次完成' else ())
+                preview = ' '.join(row[3][:400].split())
+                self.events.insert('', 'end', values=(*row[:3], preview), text=row[3],
+                                   tags=('completed',) if row[2] == '轮次完成' else ())
             self.events.yview_moveto(scroll_position)
             self._last_events = rows
+            if self._detail_popup is not None:
+                x, y = self.window.winfo_pointerxy()
+                if self.window.winfo_containing(x, y) is self.events:
+                    self._show_detail(x, y)
         self._refresh_job = self.window.after(300, self.update_status)
