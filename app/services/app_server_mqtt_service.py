@@ -80,6 +80,10 @@ def discover_app_servers() -> list[AppServerTarget]:
             and 'app-server' in (info['cmdline'] or ()) and info['create_time'] is not None]
 
 
+class _ProbeCleanupError(RuntimeError):
+    pass
+
+
 class AppServerMqttService:
     METHODS = frozenset({'model/list', 'thread/list', 'thread/read', 'thread/start', 'thread/resume',
                          'thread/turns/list', 'thread/items/list', 'turn/start', 'turn/interrupt'})
@@ -88,6 +92,8 @@ class AppServerMqttService:
     SENSITIVE = re.compile(r'password|secret|authorization|^token$|(?:access|refresh|id|api|bearer)[_-]?(?:token|key)|cookie', re.I)
     CHUNK_LIMIT = 4 * 1024 * 1024
     RESPONSE_TIMEOUT = 15
+    RETRY_DELAYS = (1, 2, 4)
+    PUBLISH_TIMEOUT = 5
 
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
@@ -100,6 +106,7 @@ class AppServerMqttService:
         self.broker_running = False
         self.attached = False
         self.writer_ready = False
+        self._last_attach_succeeded = False
         self._parent_probe = None
         self._events: deque[tuple[str, str, str, str]] = deque(maxlen=200)
         self._events_lock = threading.Lock()
@@ -248,20 +255,71 @@ class AppServerMqttService:
         except Exception as exc:
             self.error = f'{type(exc).__name__}：{exc}'
             if self.status != '目标进程已退出':
-                self.status = '已断开' if self.status == '已附加' else '启动失败'
+                self.status = ('已断开' if self.status in ('已附加', '正在重新附加', '已断开')
+                               else '启动失败')
             self._record(self.status, self.error)
         else:
+            self.error = ''
             self.status = '已停止'
             self._record(self.status)
         finally:
             self.attached = self.broker_running = self.writer_ready = False
 
+    @staticmethod
+    def _same_process(target: AppServerTarget) -> bool:
+        try:
+            return psutil.Process(target.pid).create_time() == target.created
+        except psutil.NoSuchProcess:
+            return False
+
     async def _run(self, settings: MqttSettings, target: AppServerTarget) -> None:
+        seen = OrderedDict()
+        self._last_attach_succeeded = False
+        failures = 0
+        has_attached = False
+        with tempfile.TemporaryDirectory(prefix='codex-mqtt-') as directory:
+            broker = MosquittoBroker(Path(directory), settings.port, settings.username, settings.password, settings.host)
+            await broker.start()
+            self.broker_running = True
+            try:
+                while not self._stop.is_set():
+                    try:
+                        await self._attach_once(settings, target, broker, seen)
+                        return
+                    except Exception as exc:
+                        if self._stop.is_set():
+                            return
+                        if self._last_attach_succeeded:
+                            has_attached = True
+                            failures = 0
+                            self._last_attach_succeeded = False
+                        if self.status == '目标进程已退出' or not self._same_process(target):
+                            self.status = '目标进程已退出'
+                            raise RuntimeError('App Server 已退出或已重启，请刷新后重试') from exc
+                        if not has_attached or isinstance(exc, _ProbeCleanupError) or not broker.running:
+                            raise
+                        if failures == len(self.RETRY_DELAYS):
+                            self.status = '已断开'
+                            raise RuntimeError(f'自动重新附加连续 {failures} 次失败，最后一次错误：{exc}') from exc
+                        delay = self.RETRY_DELAYS[failures]
+                        failures += 1
+                        self.status = '正在重新附加'
+                        self.error = str(exc)
+                        self._record(self.status, f'{delay} 秒后第 {failures}/{len(self.RETRY_DELAYS)} 次尝试 · {exc}')
+                        if await asyncio.to_thread(self._stop.wait, delay):
+                            return
+            finally:
+                await asyncio.wait_for(broker.shutdown(), 3)
+                self.broker_running = False
+
+    async def _attach_once(self, settings: MqttSettings, target: AppServerTarget, broker, seen) -> None:
         import frida
         from amqtt.client import MQTTClient
 
         prefix = f'codex/{target.pid}'
         client = MQTTClient()
+        self.dropped = self._queue_peak = 0
+        self._publish_peak = 0.0
         chunks = queue.Queue(maxsize=512)
         detached = threading.Event()
         process_exited = threading.Event()
@@ -280,60 +338,64 @@ class AppServerMqttService:
                 return
             try:
                 chunks.put_nowait((message['payload'], data))
+                self._queue_peak = max(self._queue_peak, chunks.qsize())
             except queue.Full:
                 self.dropped += 1
 
-        with tempfile.TemporaryDirectory(prefix='codex-mqtt-') as directory:
-            broker = MosquittoBroker(Path(directory), settings.port, settings.username, settings.password, settings.host)
-            session = script = None
-            parent_session = parent_script = writer = None
-            ready = False
-            connected = False
-            await broker.start()
-            self.broker_running = True
+        session = script = parent_session = writer = None
+        ready = connected = False
+        try:
+            if self._stop.is_set():
+                return
+            if not self._same_process(target):
+                raise RuntimeError('App Server 已退出或已重启，请刷新后重试')
+            username = quote(settings.username, safe='')
+            password = quote(settings.password, safe='')
             try:
-                if self._stop.is_set():
-                    return
-                if target not in discover_app_servers():
-                    raise RuntimeError('App Server 已退出或已重启，请刷新后重试')
-                parent = psutil.Process(target.pid).parent()
-                if parent is None:
-                    raise RuntimeError('找不到 App Server 父客户端')
-                writer = AppServerPipeWriter(parent.pid, parent.create_time())
-                parent_session = frida.attach(parent.pid)
-                parent_script = parent_session.create_script(
-                    Path(__file__).with_name('app_server_parent_probe.js').read_text(encoding='utf-8'))
-                parent_script.on('message', on_message)
-                parent_script.load()
-                self._parent_probe = parent_script
-                session = frida.attach(target.pid)
-                session.on('detached', on_detached)
-                source = Path(__file__).with_name('app_server_probe.js').read_text(encoding='utf-8')
-                script = session.create_script(source)
-                script.on('message', on_message)
-                script.load()
-                try:
-                    script.exports_sync.ready()
-                except frida.RPCException as exc:
-                    raise RuntimeError(probe_errors.get_nowait() if not probe_errors.empty() else str(exc)) from exc
-                ready = True
-                self.attached = True
-                username = quote(settings.username, safe='')
-                password = quote(settings.password, safe='')
-                try:
-                    await asyncio.wait_for(client.connect(
-                        f'mqtt://{username}:{password}@{settings.host if settings.host != "0.0.0.0" else "127.0.0.1"}:{settings.port}'), 5)
-                except Exception:
-                    raise RuntimeError('MQTT 桥接客户端连接失败') from None
-                connected = True
-                grants = await asyncio.wait_for(client.subscribe([(f'{prefix}/command', 1)]), 5)
-                if grants != [1]:
-                    raise RuntimeError('订阅 MQTT 命令主题失败')
-                self.status = '已附加'
-                self._record('已附加', f'PID {target.pid} · 请切换一次会话以确认写端')
-                await self._bridge(client, writer, prefix, chunks, detached, process_exited, probe_errors, broker)
-            finally:
-                self.attached = False
+                await asyncio.wait_for(client.connect(
+                    f'mqtt://{username}:{password}@{settings.host if settings.host != "0.0.0.0" else "127.0.0.1"}:{settings.port}'), 5)
+            except Exception:
+                raise RuntimeError('MQTT 桥接客户端连接失败') from None
+            connected = True
+            grants = await asyncio.wait_for(client.subscribe([(f'{prefix}/command', 1)]), 5)
+            if grants != [1]:
+                raise RuntimeError('订阅 MQTT 命令主题失败')
+            if self._stop.is_set():
+                return
+            if not self._same_process(target):
+                raise RuntimeError('App Server 已退出或已重启，请刷新后重试')
+            parent = psutil.Process(target.pid).parent()
+            if parent is None:
+                raise RuntimeError('找不到 App Server 父客户端')
+            writer = AppServerPipeWriter(parent.pid, parent.create_time())
+            parent_session = frida.attach(parent.pid)
+            parent_script = parent_session.create_script(
+                Path(__file__).with_name('app_server_parent_probe.js').read_text(encoding='utf-8'))
+            parent_script.on('message', on_message)
+            parent_script.load()
+            self._parent_probe = parent_script
+            session = frida.attach(target.pid)
+            session.on('detached', on_detached)
+            if not self._same_process(target):
+                raise RuntimeError('App Server 已退出或已重启，请刷新后重试')
+            source = Path(__file__).with_name('app_server_probe.js').read_text(encoding='utf-8')
+            script = session.create_script(source)
+            script.on('message', on_message)
+            script.load()
+            try:
+                script.exports_sync.ready()
+            except frida.RPCException as exc:
+                raise RuntimeError(probe_errors.get_nowait() if not probe_errors.empty() else str(exc)) from exc
+            ready = True
+            await self._bridge(client, writer, prefix, chunks, detached, process_exited, probe_errors, broker, seen)
+        finally:
+            self.attached = self.writer_ready = False
+            if process_exited.is_set() and not self._stop.is_set():
+                self.status = '目标进程已退出'
+            if ready or self.dropped:
+                self._record('捕获统计', f'队列峰值 {self._queue_peak}/512 · 丢弃 {self.dropped} 块'
+                           f' · MQTT 发布最长 {self._publish_peak * 1000:.1f} ms')
+            try:
                 try:
                     if ready and not detached.is_set():
                         script.exports_sync.dispose()
@@ -351,41 +413,47 @@ class AppServerMqttService:
                                 with cancellation:
                                     session.detach()
                             except frida.OperationCancelledError:
-                                self._record('探针回收待完成', '监控已移除，待读取返回后回收原生回调')
+                                raise RuntimeError('旧探针未确认卸载，待读取返回后回收') from None
                             finally:
                                 timer.cancel()
                     finally:
                         try:
-                            if connected:
-                                await asyncio.wait_for(client.disconnect(), 2)
+                            if parent_session is not None:
+                                parent_session.detach()
                         finally:
-                            try:
-                                if writer is not None:
-                                    writer.close()
-                                if parent_session is not None:
-                                    parent_session.detach()
-                            finally:
-                                self._parent_probe = None
-                                await asyncio.wait_for(broker.shutdown(), 3)
-                                self.broker_running = self.writer_ready = False
+                            if writer is not None:
+                                writer.close()
+            except Exception as exc:
+                raise _ProbeCleanupError(f'探针清理失败：{exc}') from exc
+            finally:
+                self._parent_probe = None
+                if connected:
+                    try:
+                        await asyncio.wait_for(client.disconnect(), 2)
+                    except Exception as exc:
+                        self._record('MQTT 客户端清理失败', str(exc))
 
-    async def _bridge(self, client, writer, prefix, chunks, detached, process_exited, probe_errors, broker) -> None:
+    async def _bridge(self, client, writer, prefix, chunks, detached, process_exited, probe_errors, broker, seen) -> None:
+        loop = asyncio.get_running_loop()
+
         async def publish(topic, message, *, retain=False, qos=0):
-            await client.publish(f'{prefix}/{topic}', json.dumps(message, ensure_ascii=False).encode(),
-                                 qos=qos, retain=retain)
+            started = loop.time()
+            try:
+                async with asyncio.timeout(self.PUBLISH_TIMEOUT):
+                    await client.publish(f'{prefix}/{topic}', json.dumps(message, ensure_ascii=False).encode(),
+                                         qos=qos, retain=retain)
+            finally:
+                self._publish_peak = max(self._publish_peak, loop.time() - started)
 
         buffers = {'input': b'', 'output': b''}
         skip_line = {'input': True, 'output': True}
         requests = OrderedDict()
-        seen = OrderedDict()
         parent_buffers = {}
         parent_requests = OrderedDict()
         input_requests = OrderedDict()
         pending = None
-        loop = asyncio.get_running_loop()
         routes = {}
-        await publish('status', {'attached': True, 'writerReady': False}, retain=True)
-        receive = asyncio.create_task(client.deliver_message())
+        receive = None
         try:
             while not self._stop.is_set():
                 if not broker.running:
@@ -393,11 +461,22 @@ class AppServerMqttService:
                 if detached.is_set():
                     if process_exited.is_set():
                         self.status = '目标进程已退出'
-                    raise RuntimeError('请选择可用进程并重新启动服务')
+                    raise RuntimeError('App Server 探针已断开')
                 if not probe_errors.empty():
                     raise RuntimeError(probe_errors.get_nowait())
                 if self.dropped:
-                    raise RuntimeError('捕获队列溢出，请重新附加以恢复消息边界')
+                    raise RuntimeError('捕获队列溢出，消息边界已失效')
+                if receive is None:
+                    await publish('status', {'attached': True, 'writerReady': False}, retain=True)
+                    if detached.is_set() or self.dropped or not probe_errors.empty():
+                        continue
+                    if self._stop.is_set():
+                        return
+                    self.attached = True
+                    self.status, self.error = '已附加', ''
+                    self._last_attach_succeeded = True
+                    self._record('已附加', f'PID {prefix.rsplit("/", 1)[-1]} · 请切换一次会话以确认写端')
+                    receive = asyncio.create_task(client.deliver_message())
                 for _ in range(64):
                     try:
                         meta, data = chunks.get_nowait()
@@ -472,7 +551,8 @@ class AppServerMqttService:
                     seen[pending[1]] = reply
                     await publish(f'reply/{pending[1]}', reply, qos=1)
                     pending = None
-                if receive.done():
+                if receive.done() and not (self._stop.is_set() or self.dropped or detached.is_set()
+                                           or not probe_errors.empty()):
                     received = receive.result()
                     if received is None:
                         raise RuntimeError('MQTT 桥接客户端已断开')
@@ -482,11 +562,20 @@ class AppServerMqttService:
                         pending = await self._command(packet.payload.data, writer, publish, pending, seen, requests)
                         if pending is not None:
                             routes[pending[0]] = pending[1]
-                await asyncio.sleep(0.025)
+                # Yield to MQTT tasks between batches without throttling a capture backlog.
+                await asyncio.sleep(0.025 if chunks.empty() else 0)
         finally:
-            receive.cancel()
-            await asyncio.gather(receive, return_exceptions=True)
-            await asyncio.wait_for(publish('status', {'attached': False, 'writerReady': False}, retain=True), 1)
+            if pending and seen[pending[1]].get('stage') == 'delivery_unknown':
+                request_id = pending[1]
+                seen[request_id] = {'id': request_id, 'stage': 'delivery_unknown',
+                                    'error': '命令已写入，断开前未收到响应，请查询状态'}
+            if receive is not None:
+                receive.cancel()
+                await asyncio.gather(receive, return_exceptions=True)
+            try:
+                await asyncio.wait_for(publish('status', {'attached': False, 'writerReady': False}, retain=True), 1)
+            except Exception as exc:
+                self._record('MQTT 状态更新失败', str(exc))
 
     def _confirm_writer(self, writer, parent_requests, input_requests) -> None:
         matches = [parent_requests[key] for key in input_requests if key in parent_requests]
@@ -535,7 +624,7 @@ class AppServerMqttService:
         elif not writer.ready:
             error = '写端尚未确认，请在 Codex 中切换一次会话'
         elif len(seen) >= 128:
-            error = '已达到本次附加的命令数量上限'
+            error = '已达到本次服务运行的命令数量上限'
         else:
             rpc_id = f'csm-mqtt:{uuid.uuid4().hex}'
             message = {'id': rpc_id, 'method': method, 'params': params}
