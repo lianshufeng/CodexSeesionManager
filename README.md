@@ -109,6 +109,8 @@ Codex 可能存在 WebSocket 或其他长连接。目标 token 切换后，旧�
 
 订阅 `codex/<PID>/observed/input`、`codex/<PID>/observed/output` 接收协议事件，订阅 `codex/<PID>/status` 查看 `attached` 和 `writerReady`。向 `codex/<PID>/command` 发布下面的 JSON，并订阅 `codex/<PID>/reply/demo_001` 接收结果。
 
+订阅固定主题 `codex/status` 可以发现当前目标，状态包含 `pid`、`attached`、`writerReady` 和 `runId`。同一桌面进程下唯一的新 App Server 接管后，请改用新 PID 的主题。观察流出现缺口时，`codex/<PID>/observed/gap` 会报告缺失。
+
 ```json
 {"id":"demo_001","method":"thread/start","params":{"cwd":"E:/git/github/docker-codex"}}
 ```
