@@ -8,8 +8,10 @@ import queue
 import re
 import tempfile
 import threading
+import time
 import uuid
 from collections import OrderedDict, deque
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -86,8 +88,11 @@ class _ProbeCleanupError(RuntimeError):
 
 
 class AppServerMqttService:
-    RETRY_DELAYS = (1, 2, 4)
+    RETRY_DELAYS = (0, 1, 2)
+    PROBE_TIMEOUT = 5
     PUBLISH_TIMEOUT = 5
+    OBSERVED_QUEUE_BYTES = 16 * 1024 * 1024
+    CAPTURE_QUEUE_BYTES = 32 * 1024 * 1024
 
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
@@ -113,6 +118,27 @@ class AppServerMqttService:
     def _record(self, event: str, detail: str = '', thread_id: str = '') -> None:
         with self._events_lock:
             self._events.append((datetime.now().strftime('%H:%M:%S'), thread_id, event, detail))
+
+    @contextmanager
+    def _stage(self, label, target, attempt):
+        started = time.monotonic()
+        result = '完成'
+        try:
+            yield
+        except BaseException as exc:
+            result = f'失败 · {type(exc).__name__}'
+            raise
+        finally:
+            self._record(label, f'PID {target.pid} · 尝试 {attempt} · {result} · {time.monotonic() - started:.3f} 秒')
+
+    @asynccontextmanager
+    async def _probe_deadline(self, label, timeout=None):
+        timeout = self.PROBE_TIMEOUT if timeout is None else timeout
+        try:
+            async with asyncio.timeout(timeout):
+                yield
+        except TimeoutError as exc:
+            raise TimeoutError(f'{label}超时（{timeout} 秒）') from exc
 
     def _record_protocol_event(self, message: dict) -> None:
         method = message.get('method')
@@ -270,15 +296,18 @@ class AppServerMqttService:
         seen = OrderedDict()
         self._last_attach_succeeded = False
         failures = 0
+        attempt = 0
         has_attached = False
         with tempfile.TemporaryDirectory(prefix='codex-mqtt-') as directory:
             broker = MosquittoBroker(Path(directory), settings.port, settings.username, settings.password, settings.host)
-            await broker.start()
+            with self._stage('MQTT 端口就绪', target, 1):
+                await broker.start()
             self.broker_running = True
             try:
                 while not self._stop.is_set():
+                    attempt += 1
                     try:
-                        await self._attach_once(settings, target, broker, seen)
+                        await self._attach_once(settings, target, broker, seen, attempt)
                         return
                     except Exception as exc:
                         if self._stop.is_set():
@@ -290,7 +319,7 @@ class AppServerMqttService:
                         if self.status == '目标进程已退出' or not self._same_process(target):
                             self.status = '目标进程已退出'
                             raise RuntimeError('App Server 已退出或已重启，请刷新后重试') from exc
-                        if not has_attached or not broker.running:
+                        if isinstance(exc, _ProbeCleanupError) or not has_attached or not broker.running:
                             raise
                         if failures == len(self.RETRY_DELAYS):
                             self.status = '已断开'
@@ -299,22 +328,24 @@ class AppServerMqttService:
                         failures += 1
                         self.status = '正在重新附加'
                         self.error = str(exc)
-                        self._record(self.status, f'{delay} 秒后第 {failures}/{len(self.RETRY_DELAYS)} 次尝试 · {exc}')
-                        if await asyncio.to_thread(self._stop.wait, delay):
+                        when = f'{delay} 秒后' if delay else '立即'
+                        self._record(self.status, f'PID {target.pid} · {when}第 {failures}/{len(self.RETRY_DELAYS)} 次尝试 · {exc}')
+                        if delay and await asyncio.to_thread(self._stop.wait, delay):
                             return
             finally:
                 await asyncio.wait_for(broker.shutdown(), 3)
                 self.broker_running = False
 
-    async def _attach_once(self, settings: MqttSettings, target: AppServerTarget, broker, seen) -> None:
-        import frida
+    async def _attach_once(self, settings: MqttSettings, target: AppServerTarget, broker, seen, attempt) -> None:
+        from frida import aio as frida
         from amqtt.client import MQTTClient
 
         prefix = f'codex/{target.pid}'
-        client = MQTTClient()
+        client = None
         self.dropped = self._queue_peak = 0
         self._publish_peak = 0.0
         chunks = queue.Queue(maxsize=512)
+        capture_stats = {'bytes': 0, 'peak': 0, 'wait': 0.0}
         detached = threading.Event()
         process_exited = threading.Event()
         probe_errors = queue.SimpleQueue()
@@ -322,6 +353,8 @@ class AppServerMqttService:
         def on_detached(reason, _crash) -> None:
             if reason == 'process-terminated':
                 process_exited.set()
+            if not cleaning and not self._stop.is_set():
+                self._record('App Server 探针断开', f'PID {target.pid} · 尝试 {attempt} · {reason}')
             detached.set()
 
         def on_message(message, data) -> None:
@@ -330,30 +363,57 @@ class AppServerMqttService:
                 return
             if message['type'] != 'send':
                 return
+            if message['payload'].get('kind') == 'parentBytes' and writer is not None and writer.ready:
+                return
             try:
-                chunks.put_nowait((message['payload'], data))
+                if capture_stats['bytes'] + len(data) > self.CAPTURE_QUEUE_BYTES:
+                    raise queue.Full
+                chunks.put_nowait((message['payload'], data, time.monotonic()))
+                capture_stats['bytes'] += len(data)
+                capture_stats['peak'] = max(capture_stats['peak'], capture_stats['bytes'])
                 self._queue_peak = max(self._queue_peak, chunks.qsize())
             except queue.Full:
                 self.dropped += 1
 
         session = script = parent_session = writer = None
-        ready = connected = False
+        ready = cleaning = False
+
+        async def disconnect():
+            nonlocal client
+            if client is None:
+                return
+            try:
+                with self._stage('MQTT 桥接断开', target, attempt):
+                    await asyncio.wait_for(client.disconnect(), 2)
+            except Exception as exc:
+                self._record('MQTT 客户端清理失败', type(exc).__name__)
+            finally:
+                client = None
+
+        async def connect():
+            nonlocal client
+            await disconnect()
+            client = MQTTClient()
+            username = quote(settings.username, safe='')
+            password = quote(settings.password, safe='')
+            host = settings.host if settings.host != '0.0.0.0' else '127.0.0.1'
+            try:
+                with self._stage('MQTT 桥接连接', target, attempt):
+                    await asyncio.wait_for(client.connect(f'mqtt://{username}:{password}@{host}:{settings.port}'), 5)
+            except Exception:
+                raise RuntimeError('MQTT 桥接客户端连接失败') from None
+            with self._stage('MQTT 桥接订阅', target, attempt):
+                grants = await asyncio.wait_for(client.subscribe([(f'{prefix}/command', 1), (f'{prefix}/files/request/+', 1)]), 5)
+                if grants != [1, 1]:
+                    raise RuntimeError('订阅 MQTT 命令主题失败')
+            return client
+
         try:
             if self._stop.is_set():
                 return
             if not self._same_process(target):
                 raise RuntimeError('App Server 已退出或已重启，请刷新后重试')
-            username = quote(settings.username, safe='')
-            password = quote(settings.password, safe='')
-            try:
-                await asyncio.wait_for(client.connect(
-                    f'mqtt://{username}:{password}@{settings.host if settings.host != "0.0.0.0" else "127.0.0.1"}:{settings.port}'), 5)
-            except Exception:
-                raise RuntimeError('MQTT 桥接客户端连接失败') from None
-            connected = True
-            grants = await asyncio.wait_for(client.subscribe([(f'{prefix}/command', 1), (f'{prefix}/files/request/+', 1)]), 5)
-            if grants != [1, 1]:
-                raise RuntimeError('订阅 MQTT 命令主题失败')
+            await connect()
             if self._stop.is_set():
                 return
             if not self._same_process(target):
@@ -362,37 +422,46 @@ class AppServerMqttService:
             if parent is None:
                 raise RuntimeError('找不到 App Server 父客户端')
             writer = AppServerPipeWriter(parent.pid, parent.create_time())
-            parent_session = frida.attach(parent.pid)
-            parent_script = parent_session.create_script(
-                Path(__file__).with_name('app_server_parent_probe.js').read_text(encoding='utf-8'))
-            parent_script.on('message', on_message)
-            parent_script.load()
+            with self._stage('父进程探针注入', target, attempt):
+                async with self._probe_deadline('父进程探针注入'):
+                    parent_session = await frida.attach(parent.pid)
+                    parent_script = await parent_session.create_script(
+                        Path(__file__).with_name('app_server_parent_probe.js').read_text(encoding='utf-8'))
+                    parent_script.on('message', on_message)
+                    await parent_script.load()
             self._parent_probe = parent_script
-            session = frida.attach(target.pid)
-            session.on('detached', on_detached)
-            if not self._same_process(target):
-                raise RuntimeError('App Server 已退出或已重启，请刷新后重试')
-            source = Path(__file__).with_name('app_server_probe.js').read_text(encoding='utf-8')
-            script = session.create_script(source)
-            script.on('message', on_message)
-            script.load()
-            try:
-                script.exports_sync.ready()
-            except frida.RPCException as exc:
-                raise RuntimeError(probe_errors.get_nowait() if not probe_errors.empty() else str(exc)) from exc
-            ready = True
-            await self._bridge(client, writer, prefix, chunks, detached, process_exited, probe_errors, broker, seen)
+            with self._stage('App Server 探针注入', target, attempt):
+                async with self._probe_deadline('App Server 探针注入'):
+                    session = await frida.attach(target.pid)
+                    session.on('detached', on_detached)
+                    if not self._same_process(target):
+                        raise RuntimeError('App Server 已退出或已重启，请刷新后重试')
+                    source = Path(__file__).with_name('app_server_probe.js').read_text(encoding='utf-8')
+                    script = await session.create_script(source)
+                    script.on('message', on_message)
+                    await script.load()
+                    ready = True
+                    try:
+                        await script.exports.ready()
+                    except frida.RPCException as exc:
+                        raise RuntimeError(probe_errors.get_nowait() if not probe_errors.empty() else str(exc)) from exc
+            await self._bridge(client, writer, prefix, chunks, detached, process_exited, probe_errors, broker, seen,
+                               target, attempt, connect, capture_stats)
         finally:
+            cleaning = True
             self.attached = self.writer_ready = False
             if process_exited.is_set() and not self._stop.is_set():
                 self.status = '目标进程已退出'
             if ready or self.dropped:
                 self._record('捕获统计', f'队列峰值 {self._queue_peak}/512 · 丢弃 {self.dropped} 块'
+                            f' · 字节峰值 {capture_stats["peak"]} · 最长排队 {capture_stats["wait"] * 1000:.1f} ms'
                            f' · MQTT 发布最长 {self._publish_peak * 1000:.1f} ms')
             try:
                 try:
                     if ready and not detached.is_set():
-                        script.exports_sync.dispose()
+                        with self._stage('App Server 探针停止捕获', target, attempt):
+                            async with self._probe_deadline('App Server 探针停止捕获', 2):
+                                await script.exports.dispose()
                         if writer is not None and writer.ready:
                             # Release a pre-existing read callback before unloading Frida.
                             wake = {'id': f'csm-mqtt:{uuid.uuid4().hex}', 'method': 'thread/list', 'params': {'limit': 1}}
@@ -400,20 +469,15 @@ class AppServerMqttService:
                 finally:
                     try:
                         if session is not None and not detached.is_set():
-                            cancellation = frida.Cancellable()
-                            timer = threading.Timer(2, cancellation.cancel)
-                            timer.start()
-                            try:
-                                with cancellation:
-                                    session.detach()
-                            except frida.OperationCancelledError:
-                                raise RuntimeError('旧探针未确认卸载，待读取返回后回收') from None
-                            finally:
-                                timer.cancel()
+                            with self._stage('App Server 探针卸载', target, attempt):
+                                async with self._probe_deadline('App Server 探针卸载', 2):
+                                    await session.detach()
                     finally:
                         try:
                             if parent_session is not None:
-                                parent_session.detach()
+                                with self._stage('父进程探针卸载', target, attempt):
+                                    async with self._probe_deadline('父进程探针卸载', 2):
+                                        await parent_session.detach()
                         finally:
                             if writer is not None:
                                 writer.close()
@@ -421,40 +485,110 @@ class AppServerMqttService:
                 raise _ProbeCleanupError(f'探针清理失败：{exc}') from exc
             finally:
                 self._parent_probe = None
-                if connected:
-                    try:
-                        await asyncio.wait_for(client.disconnect(), 2)
-                    except Exception as exc:
-                        self._record('MQTT 客户端清理失败', str(exc))
+                await disconnect()
 
-    async def _bridge(self, client, writer, prefix, chunks, detached, process_exited, probe_errors, broker, seen) -> None:
+    async def _bridge(self, client, writer, prefix, chunks, detached, process_exited, probe_errors, broker, seen,
+                      target, attempt, reconnect, capture_stats) -> None:
         loop = asyncio.get_running_loop()
         run_id = uuid.uuid4().hex
         files = FileTransfers()
         file_tasks = set()
+        observed_queue = deque()
+        replies = deque()
+        outgoing = asyncio.Event()
+        observed_bytes = observed_peak = observed_dropped = reply_bytes = 0
+        status_dirty = False
 
-        async def transfer_file(topic, payload):
+        async def transfer_file(connection, topic, payload):
             request_id = topic.rsplit('/', 1)[-1]
             try:
                 response = await asyncio.to_thread(self._file_as_target, files, payload)
-                await asyncio.wait_for(client.publish(f'{prefix}/files/reply/{request_id}', response, qos=1, retain=False), self.PUBLISH_TIMEOUT)
+                await asyncio.wait_for(connection.publish(f'{prefix}/files/reply/{request_id}', response, qos=1, retain=False),
+                                       self.PUBLISH_TIMEOUT)
             except Exception as exc:
                 self._record('文件传输失败', type(exc).__name__)
 
-        async def publish(topic, message, *, retain=False, qos=0):
+        async def publish_payload(topic, payload, *, retain=False, qos=0):
             started = loop.time()
             try:
                 async with asyncio.timeout(self.PUBLISH_TIMEOUT):
-                    await client.publish(f'{prefix}/{topic}', json.dumps(message, ensure_ascii=False).encode(),
-                                         qos=qos, retain=retain)
+                    await client.publish(f'{prefix}/{topic}', payload, qos=qos, retain=retain)
             finally:
                 self._publish_peak = max(self._publish_peak, loop.time() - started)
 
+        async def publish(topic, message, *, qos):
+            nonlocal reply_bytes
+            payload = json.dumps(message, ensure_ascii=False).encode()
+            if len(replies) >= 1024 or (replies and reply_bytes + len(payload) > self.OBSERVED_QUEUE_BYTES):
+                self._record('MQTT 回复积压超限', f'PID {target.pid} · {topic} · 可用原请求 ID 查询已缓存的结果')
+                return
+            replies.append((topic, payload, qos))
+            reply_bytes += len(payload)
+            outgoing.set()
+
+        async def send_outgoing():
+            nonlocal observed_bytes, observed_dropped, reply_bytes, status_dirty
+            while True:
+                await outgoing.wait()
+                if status_dirty:
+                    status_dirty = False
+                    with self._stage('发布 MQTT 写端状态', target, attempt):
+                        await publish_status(True, writer.ready)
+                elif replies:
+                    topic, payload, qos = replies[0]
+                    await publish_payload(topic, payload, qos=qos)
+                    replies.popleft()
+                    reply_bytes -= len(payload)
+                elif observed_dropped:
+                    dropped = observed_dropped
+                    await publish_payload('observed/gap', json.dumps({'runId': run_id, 'dropped': dropped}).encode(), qos=1)
+                    observed_dropped -= dropped
+                elif observed_queue:
+                    topic, payload = observed_queue.popleft()
+                    observed_bytes -= len(payload)
+                    try:
+                        await publish_payload(topic, payload)
+                    except (Exception, asyncio.CancelledError):
+                        observed_dropped += 1
+                        raise
+                else:
+                    outgoing.clear()
+
+        def enqueue_observed(topic, message):
+            nonlocal observed_bytes, observed_peak, observed_dropped
+            payload = json.dumps(message, ensure_ascii=False).encode()
+            if len(observed_queue) >= 4096 or observed_bytes + len(payload) > self.OBSERVED_QUEUE_BYTES:
+                if not observed_dropped:
+                    self._record('MQTT 观察消息积压超限', f'PID {target.pid} · 开始丢弃观察消息')
+                observed_dropped += 1
+                outgoing.set()
+                return
+            observed_queue.append((topic, payload))
+            observed_bytes += len(payload)
+            observed_peak = max(observed_peak, observed_bytes)
+            outgoing.set()
+
         async def publish_status(attached, writer_ready):
-            await publish('status', {'attached': attached, 'writerReady': writer_ready,
-                                     'protocolVersion': 1, 'runId': run_id, 'maxRequestBytes': None,
-                                     'fileTransfer': CAPABILITIES,
-                                     'methods': '*'}, retain=True, qos=1)
+            payload = {'attached': attached, 'writerReady': writer_ready, 'protocolVersion': 1,
+                       'runId': run_id, 'maxRequestBytes': None, 'fileTransfer': CAPABILITIES, 'methods': '*'}
+            await publish_payload('status', json.dumps(payload, ensure_ascii=False).encode(), retain=True, qos=1)
+
+        async def mqtt_ready(reconnect_needed):
+            nonlocal client
+            if reconnect_needed:
+                client = await reconnect()
+            with self._stage('发布 MQTT 附加状态', target, attempt):
+                await publish_status(True, writer.ready)
+
+        async def recover_mqtt():
+            for delay in self.RETRY_DELAYS:
+                await asyncio.sleep(delay)
+                try:
+                    await mqtt_ready(True)
+                    return
+                except Exception as exc:
+                    self._record('MQTT 重连失败', f'PID {target.pid} · {type(exc).__name__}')
+            raise RuntimeError('MQTT 桥接重连次数已耗尽')
 
         buffers = {'input': b'', 'output': b''}
         requests = OrderedDict()
@@ -463,9 +597,11 @@ class AppServerMqttService:
         input_requests = OrderedDict()
         pending = {}
         routes = {}
-        receive = None
+        receive = sender = None
+        connecting = asyncio.create_task(mqtt_ready(False))
         try:
             while not self._stop.is_set():
+                received = None
                 if not broker.running:
                     raise RuntimeError('Mosquitto 已退出，请重新启动服务')
                 if detached.is_set():
@@ -475,21 +611,53 @@ class AppServerMqttService:
                 if not probe_errors.empty():
                     raise RuntimeError(probe_errors.get_nowait())
                 if self.dropped:
-                    raise RuntimeError('捕获队列溢出，消息边界已失效')
-                if receive is None:
-                    await publish_status(True, False)
-                    if detached.is_set() or self.dropped or not probe_errors.empty():
-                        continue
-                    if self._stop.is_set():
-                        return
-                    self.attached = True
-                    self.status, self.error = '已附加', ''
-                    self._last_attach_succeeded = True
-                    self._record('已附加', f'PID {prefix.rsplit("/", 1)[-1]} · 请切换一次会话以确认写端')
-                    receive = asyncio.create_task(client.deliver_message())
-                for _ in range(64):
+                    raise RuntimeError(f'捕获队列溢出，消息边界已失效 · 丢弃 {self.dropped} 块'
+                                       f' · MQTT 发布最长 {self._publish_peak * 1000:.1f} ms'
+                                       f' · 观察消息积压 {observed_bytes} 字节')
+                if connecting is not None and connecting.done():
                     try:
-                        meta, data = chunks.get_nowait()
+                        connecting.result()
+                    except Exception:
+                        if self.status == 'MQTT 正在重连':
+                            raise
+                        self.status = 'MQTT 正在重连'
+                        connecting = asyncio.create_task(recover_mqtt())
+                    else:
+                        connecting = None
+                        event = 'MQTT 已重连' if self.status == 'MQTT 正在重连' else '已附加'
+                        self.attached = True
+                        self.status, self.error = '已附加', ''
+                        self._last_attach_succeeded = True
+                        self._record(event, f'PID {target.pid}')
+                        sender = asyncio.create_task(send_outgoing())
+                        receive = asyncio.create_task(client.deliver_message())
+                if receive is not None:
+                    try:
+                        if not client.session.transitions.is_connected():
+                            raise ConnectionError('MQTT 桥接客户端已断开')
+                        if sender.done():
+                            sender.result()
+                        if receive.done():
+                            if receive.cancelled():
+                                raise ConnectionError('MQTT 桥接客户端已断开')
+                            received = receive.result()
+                            if received is None:
+                                raise ConnectionError('MQTT 桥接客户端已断开')
+                    except Exception as exc:
+                        self.status = 'MQTT 正在重连'
+                        self._record(self.status, f'PID {target.pid} · {type(exc).__name__}')
+                        sender.cancel()
+                        receive.cancel()
+                        await asyncio.gather(sender, receive, return_exceptions=True)
+                        sender = receive = None
+                        connecting = asyncio.create_task(recover_mqtt())
+                for _ in range(64):
+                    if self.dropped or detached.is_set():
+                        break
+                    try:
+                        meta, data, queued_at = chunks.get_nowait()
+                        capture_stats['bytes'] -= len(data)
+                        capture_stats['wait'] = max(capture_stats['wait'], time.monotonic() - queued_at)
                     except queue.Empty:
                         break
                     if meta['kind'] == 'parentBytes':
@@ -506,9 +674,10 @@ class AppServerMqttService:
                                     parent_requests[fingerprint] = handle
                                     if len(parent_requests) > 128:
                                         parent_requests.popitem(last=False)
-                            self._confirm_writer(writer, parent_requests, input_requests)
+                            await self._confirm_writer(writer, parent_requests, input_requests)
                             if writer.ready:
-                                await publish_status(True, True)
+                                status_dirty = True
+                                outgoing.set()
                         continue
                     if meta['kind'] != 'bytes':
                         continue
@@ -516,6 +685,8 @@ class AppServerMqttService:
                     lines = (buffers[direction] + data).split(b'\n')
                     buffers[direction] = lines.pop()
                     for line in lines:
+                        if self.dropped or detached.is_set():
+                            break
                         try:
                             message = json.loads(line)
                         except (ValueError, UnicodeError):
@@ -528,9 +699,10 @@ class AppServerMqttService:
                                 input_requests[fingerprint] = True
                                 if len(input_requests) > 128:
                                     input_requests.popitem(last=False)
-                                self._confirm_writer(writer, parent_requests, input_requests)
+                                await self._confirm_writer(writer, parent_requests, input_requests)
                                 if writer.ready:
-                                    await publish_status(True, True)
+                                    status_dirty = True
+                                    outgoing.set()
                         request_id = message.get('id')
                         if isinstance(request_id, str) and request_id.startswith('csm-mqtt:'):
                             external_id = routes.pop(request_id, None) if direction == 'output' else None
@@ -539,27 +711,24 @@ class AppServerMqttService:
                                 reply = message
                                 seen[external_id] = reply
                                 self._reply_expiry[external_id] = loop.time() + 60
-                                await publish(f'reply/{quote(str(external_id), safe="")}', reply, qos=1)
                                 pending.pop(request_id, None)
+                                await publish(f'reply/{quote(str(external_id), safe="")}', reply, qos=1)
                             continue
                         if direction == 'output':
                             self._record_protocol_event(message)
                         observed = self._observed(message, direction, requests)
                         if observed is not None:
-                            await publish(f'observed/{direction}', observed)
+                            enqueue_observed(f'observed/{direction}', observed)
                         self.count += 1
-                if receive.done() and not (self._stop.is_set() or self.dropped or detached.is_set()
-                                           or not probe_errors.empty()):
-                    received = receive.result()
-                    if received is None:
-                        raise RuntimeError('MQTT 桥接客户端已断开')
+                if received is not None and not (
+                        self._stop.is_set() or self.dropped or detached.is_set() or not probe_errors.empty()):
                     packet = received.publish_packet
                     receive = asyncio.create_task(client.deliver_message())
                     if packet and not packet.retain_flag:
                         if received.topic.startswith(f'{prefix}/files/request/'):
                             request_id = received.topic.rsplit('/', 1)[-1]
                             if re.fullmatch(r'[A-Za-z0-9-]{1,64}', request_id) and len(packet.payload.data) <= 540672:
-                                task = asyncio.create_task(transfer_file(received.topic, packet.payload.data))
+                                task = asyncio.create_task(transfer_file(client, received.topic, packet.payload.data))
                                 file_tasks.add(task)
                                 task.add_done_callback(file_tasks.discard)
                         else:
@@ -568,18 +737,23 @@ class AppServerMqttService:
                 # Yield to MQTT tasks between batches without throttling a capture backlog.
                 await asyncio.sleep(0.025 if chunks.empty() else 0)
         finally:
+            mqtt_tasks = [task for task in (sender, receive, connecting) if task is not None]
+            for task in mqtt_tasks:
+                task.cancel()
+            await asyncio.gather(*mqtt_tasks, return_exceptions=True)
+            self._record('MQTT 观察发送统计', f'积压峰值 {observed_peak} 字节 · 结束时未发完 {observed_bytes} 字节'
+                         f' · 待报告缺口 {observed_dropped} 条')
             if file_tasks:
                 await asyncio.gather(*file_tasks, return_exceptions=True)
             for request_id in pending.values():
                 seen[request_id] = {'id': request_id, 'stage': 'delivery_unknown',
                                     'error': '连接中断前尚未收到响应，请查询执行状态'}
-            if receive is not None:
-                receive.cancel()
-                await asyncio.gather(receive, return_exceptions=True)
             try:
                 await asyncio.wait_for(publish_status(False, False), 1)
             except Exception as exc:
                 self._record('MQTT 状态更新失败', str(exc))
+            else:
+                self._record('已发布 MQTT 断开状态', f'PID {target.pid} · 尝试 {attempt}')
 
     def _file_as_target(self, files, payload):
         import win32api
@@ -604,13 +778,14 @@ class AppServerMqttService:
         finally:
             process.Close()
 
-    def _confirm_writer(self, writer, parent_requests, input_requests) -> None:
+    async def _confirm_writer(self, writer, parent_requests, input_requests) -> None:
         matches = [parent_requests[key] for key in input_requests if key in parent_requests]
         for fingerprint in input_requests:
             if fingerprint in parent_requests and matches.count(parent_requests[fingerprint]) >= 2:
                 writer.confirm(parent_requests[fingerprint])
                 if self._parent_probe is not None:
-                    self._parent_probe.exports_sync.dispose()
+                    async with self._probe_deadline('父进程探针停止捕获', 2):
+                        await self._parent_probe.exports.dispose()
                 self.writer_ready = True
                 self._record('写端已确认', 'MQTT 命令可以主动投递')
                 parent_requests.clear()
