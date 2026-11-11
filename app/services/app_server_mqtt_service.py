@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from collections import Counter, OrderedDict, deque
+from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -111,6 +112,41 @@ class AppServerMqttService:
         self._parent_probe = None
         self._events: deque[tuple[str, str, str, str]] = deque(maxlen=200)
         self._events_lock = threading.Lock()
+        self._protocol_callback = None
+        self._local_requests = queue.Queue(maxsize=128)
+        self._local_requests_lock = threading.Lock()
+
+    def set_protocol_callback(self, callback) -> None:
+        self._protocol_callback = callback
+
+    def _notify_protocol(self, message, direction) -> None:
+        if self._protocol_callback is not None and message.get('method') in {
+            'error', 'turn/started', 'turn/completed', 'turn/start', 'turn/steer', 'turn/interrupt',
+            'thread/archive', 'thread/delete', 'thread/closed', 'thread/archived', 'thread/deleted',
+        }:
+            self._protocol_callback(message, direction)
+
+    def request(self, method, params, *, guard=None) -> Future:
+        future = Future()
+        with self._local_requests_lock:
+            if not self.attached or not self.writer_ready or self._stop.is_set():
+                future.set_result({'error': {'message': 'App Server 尚未就绪'}})
+                return future
+            try:
+                self._local_requests.put_nowait((method, params, guard, future))
+            except queue.Full:
+                future.set_result({'error': {'message': '本地请求队列已满'}})
+        return future
+
+    def _fail_local_requests(self) -> None:
+        futures = []
+        with self._local_requests_lock:
+            while not self._local_requests.empty():
+                *_request, future = self._local_requests.get_nowait()
+                futures.append(future)
+        for future in futures:
+            if not future.done():
+                future.set_result({'error': {'message': 'App Server 已断开，请稍后重试'}})
 
     def recent_events(self) -> tuple[tuple[str, str, str, str], ...]:
         with self._events_lock:
@@ -168,6 +204,7 @@ class AppServerMqttService:
                 await asyncio.gather(task, return_exceptions=True)
 
     def _record_protocol_event(self, message: dict) -> None:
+        self._notify_protocol(message, 'output')
         method = message.get('method')
         params = message.get('params')
         if not isinstance(method, str) or not isinstance(params, dict):
@@ -311,6 +348,7 @@ class AppServerMqttService:
             self._record(self.status)
         finally:
             self.attached = self.broker_running = self.writer_ready = False
+            self._fail_local_requests()
 
     @staticmethod
     def _same_process(target: AppServerTarget) -> bool:
@@ -663,6 +701,7 @@ class AppServerMqttService:
         parent_requests = OrderedDict()
         input_requests = OrderedDict()
         pending = {}
+        local_pending = {}
         expected = Counter()
         resync = set()
         carry = None
@@ -726,6 +765,12 @@ class AppServerMqttService:
                     raise RuntimeError('App Server 探针已断开')
                 if not probe_errors.empty():
                     raise RuntimeError(probe_errors.get_nowait())
+                for rpc_id, (deadline, future) in list(local_pending.items()):
+                    if loop.time() >= deadline:
+                        local_pending.pop(rpc_id)
+                        if not future.done():
+                            future.set_result({'error': {'message': '等待 App Server 回复超时'},
+                                               'deliveryUnknown': True})
                 if command is not None and command.done():
                     command.result()
                     command = None
@@ -818,6 +863,15 @@ class AppServerMqttService:
                             continue
                         if not isinstance(message, dict):
                             continue
+                        request_id = message.get('id')
+                        if isinstance(request_id, str) and request_id.startswith('csm-local:'):
+                            if direction == 'output':
+                                entry = local_pending.pop(request_id, None)
+                                if entry is not None and not entry[1].done():
+                                    entry[1].set_result(message)
+                            continue
+                        if direction == 'input':
+                            self._notify_protocol(message, direction)
                         if direction == 'input' and not writer.ready:
                             fingerprint = self._request_fingerprint(line)
                             if fingerprint:
@@ -842,6 +896,27 @@ class AppServerMqttService:
                         if observed is not None:
                             enqueue_observed(f'observed/{direction}', observed)
                         self.count += 1
+                # 先消费捕获到的用户输入，再检查本地继续请求，避免覆盖用户手动恢复。
+                if command is None and received is None and chunks.empty() and carry is None:
+                    try:
+                        method, params, guard, future = self._local_requests.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        valid = writer.ready and not detached.is_set() and (guard is None or guard())
+                        if future.cancelled():
+                            pass
+                        elif not valid:
+                            future.set_result({'error': {'message': '会话或连接状态已变化，取消请求'}})
+                        else:
+                            rpc_id = f'csm-local:{uuid.uuid4().hex}'
+                            local_pending[rpc_id] = (loop.time() + 10, future)
+                            payload = {'id': rpc_id, 'method': method, 'params': params}
+                            try:
+                                await asyncio.to_thread(writer.write, (json.dumps(payload, ensure_ascii=False) + '\n').encode())
+                            except Exception as exc:
+                                local_pending.pop(rpc_id, None)
+                                future.set_result({'error': {'message': str(exc)}, 'deliveryUnknown': True})
                 if received is not None and not (
                         self._stop.is_set() or detached.is_set() or not probe_errors.empty()):
                     packet = received.publish_packet
@@ -867,6 +942,11 @@ class AppServerMqttService:
                 else:
                     await asyncio.sleep(0)
         finally:
+            self.attached = self.writer_ready = False
+            self._fail_local_requests()
+            for _deadline, future in local_pending.values():
+                if not future.done():
+                    future.set_result({'error': {'message': '连接断开，投递状态待确认'}, 'deliveryUnknown': True})
             mqtt_tasks = [task for task in (sender, receive, connecting) if task is not None]
             for task in mqtt_tasks:
                 task.cancel()

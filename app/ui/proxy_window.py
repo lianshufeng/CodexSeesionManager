@@ -53,6 +53,7 @@ from app.services.codex_local_config_service import CodexLocalConfigService
 from app.services.packaged_app_launch_service import activate_packaged_app, packaged_app_id
 from app.services.codex_retry_service import CodexRetryService
 from app.services.app_server_mqtt_service import AppServerMqttService
+from app.services.quota_recovery_service import QuotaRecoveryService
 from app.ui.app_server_mqtt_window import AppServerMqttWindow
 from app.utils.path_utils import app_root
 from tkinter import messagebox, ttk
@@ -282,6 +283,13 @@ class ProxyWindow:
         self._quota_refresh_pending = False
         self._ui_queue: Queue[Callable[[], None]] = Queue()
         self._closing = False
+        self.quota_recovery_service = QuotaRecoveryService(
+            self.correct_traffic, self._continue_after_quota_error, self._log_quota_recovery,
+        )
+        self.quota_recovery_service.set_enabled(auto_retry_enabled)
+        self._app_server_mqtt.set_protocol_callback(
+            lambda message, direction: self._post_ui(
+                lambda: self.quota_recovery_service.observe(message, direction)))
         self._last_install_rows_signature: tuple[tuple[str, str, str, str], ...] | None = None
         self._last_auth_rows_signature: tuple[
             tuple[bool, bool, bool, str, str, str, str, str, str, int], ...
@@ -487,7 +495,7 @@ class ProxyWindow:
         self._auto_retry_check.pack(side="left", padx=(8, 0))
         self._bind_widget_tooltip(
             self._auto_retry_check,
-            "自动重试容量错误。",
+            "自动重试容量错误。远程服务已连接时，额度不足会触发矫正流量，并在 5 秒倒计时结束后恢复执行。",
         )
         quota_warmup_check = ttk.Checkbutton(
             auth_options,
@@ -1164,7 +1172,24 @@ class ProxyWindow:
 
     def _on_auto_retry_toggled(self) -> None:
         self.codex_retry_service.set_enabled(self.auto_retry_var.get())
+        self.quota_recovery_service.set_enabled(self.auto_retry_var.get())
         self._persist_config()
+
+    @staticmethod
+    def _log_quota_recovery(message: str, thread_id: str) -> None:
+        print(f"[QuotaRecovery] {message} thread={thread_id}", flush=True)
+
+    def _continue_after_quota_error(self, thread_id: str) -> None:
+        future = self._app_server_mqtt.request(
+            "turn/start", {"threadId": thread_id, "input": []},
+            guard=lambda: self.quota_recovery_service.enabled and not self._closing,
+        )
+
+        def report(result) -> None:
+            error = result.result().get("error")
+            self._log_quota_recovery(f"恢复执行失败：{error}" if error else "已请求恢复执行", thread_id)
+
+        future.add_done_callback(report)
 
     def _persist_config(self) -> None:
         try:
@@ -1906,6 +1931,7 @@ class ProxyWindow:
         self.auto_load_var.set(loaded_config.auto_load)
         self.auto_retry_var.set(loaded_config.auto_retry)
         self.codex_retry_service.set_enabled(loaded_config.auto_retry)
+        self.quota_recovery_service.set_enabled(loaded_config.auto_retry)
         self.quota_warmup_var.set(loaded_config.quota_warmup)
         self.quota_warmup_model_var.set(loaded_config.quota_warmup_model)
         self.auto_reset_credit_var.set(loaded_config.auto_reset_credit)
@@ -2623,7 +2649,7 @@ del "%~f0" >nul 2>nul
         print(f"[ProxyWindow] 授权已保存: {account_text}", flush=True)
 
     def correct_traffic(self) -> None:
-        if self._correct_traffic_refreshing:
+        if self._correct_traffic_refreshing or self._correct_traffic_after_id is not None:
             return
         self._correct_traffic_refreshing = True
         if self._correct_traffic_button is not None:
@@ -3302,6 +3328,7 @@ del "%~f0" >nul 2>nul
         if seconds <= 0:
             self._correct_traffic_button.config(text="矫正流量", state=tk.NORMAL)
             self._correct_traffic_after_id = None
+            self.quota_recovery_service.correction_finished()
             return
         self._correct_traffic_button.config(text=f"重置中 {seconds}", state=tk.DISABLED)
         self._correct_traffic_after_id = self.root.after(
@@ -5020,6 +5047,7 @@ del "%~f0" >nul 2>nul
 
     def _shutdown_app(self) -> None:
         self._closing = True
+        self.quota_recovery_service.set_enabled(False)
         self._app_server_mqtt.stop(wait=True)
         self.codex_retry_service.stop()
         if self._token_history_window is not None and self._token_history_window.window.winfo_exists():

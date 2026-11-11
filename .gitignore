@@ -20,3 +20,4 @@
 /app/services/tokenizer_cache
 /tests/*
 !/tests/test_browser_auth.py
+!/tests/test_quota_recovery.py
