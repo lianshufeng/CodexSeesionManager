@@ -68,9 +68,6 @@ class CloudSyncService:
             key = f"{prefix}auth/{relative_path}"
             if path.suffix.lower() == ".json":
                 data = json.loads(path.read_text(encoding="utf-8-sig"))
-                metadata = data.get("_codex_session_manager") if isinstance(data, dict) else None
-                if isinstance(metadata, dict):
-                    metadata.pop("login_credentials", None)
                 client.put_object(
                     Bucket=self.config.bucket_name, Key=key,
                     Body=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),

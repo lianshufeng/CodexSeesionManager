@@ -588,8 +588,7 @@ class AuthSyncService:
                 local_data = self._read_auth_data(local_path) if local_path is not None else None
                 local_credentials = self._manager_metadata(local_data or {}).get("login_credentials")
                 metadata = dict(self._manager_metadata(data))
-                metadata.pop("login_credentials", None)
-                if isinstance(local_credentials, dict):
+                if "login_credentials" not in metadata and isinstance(local_credentials, dict):
                     metadata["login_credentials"] = dict(local_credentials)
                 data[_MANAGER_METADATA_KEY] = metadata
                 self._write_auth_data(path, data)

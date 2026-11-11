@@ -140,13 +140,16 @@ class BrowserAuthAcceptance(unittest.TestCase):
             self.assertEqual(sync.list_auth_rows()[0].refresh_token, "new-refresh")
             self.assertIsNone(service._callback_server)
 
-    def test_cloud_upload_excludes_credentials(self):
+    def test_cloud_sync_preserves_and_updates_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "auth").mkdir()
             path = root / "auth" / "test.json"
-            data = {"tokens": {}, "_codex_session_manager": {
-                "note": "测试备注", "login_credentials": {"password": "test-password"},
+            credentials = {
+                "email": "test@example.com", "password": "test-password", "totp_secret": "JBSWY3DPEHPK3PXP",
+            }
+            data = {"tokens": {"account_id": "test", "refresh_token": "refresh", "access_token": "access"}, "_codex_session_manager": {
+                "note": "测试备注", "login_credentials": credentials,
             }}
             path.write_text(json.dumps(data), encoding="utf-8")
             service = CloudSyncService(CloudSyncConfig("", "bucket", "", ""), root)
@@ -155,9 +158,29 @@ class BrowserAuthAcceptance(unittest.TestCase):
             service._next_version_prefix = lambda _: "20261101_1/"
             service._build_version = lambda *_: None
             service.sync_auth()
-            uploaded = json.loads(client.put_object.call_args.kwargs["Body"])
-            self.assertNotIn("login_credentials", uploaded["_codex_session_manager"])
+            payload = client.put_object.call_args.kwargs["Body"]
+            self.assertEqual(json.loads(payload), data)
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), data)
+            key = "20261101_1/auth/test.json"
+            service._list_object_keys = lambda *_: [key]
+            client.download_file.side_effect = lambda bucket, key, target: Path(target).write_bytes(payload)
+            sync = AuthSyncService(source_path=root / "source.json", target_dir=root / "auth")
+
+            def apply_version(version_root):
+                sync.apply_cloud_version(version_root, service._apply_pulled_version)
+
+            path.unlink()
+            self.assertEqual(service.pull_version("20261101_1/", apply_version), 1)
+            self.assertEqual(sync.get_login_credentials("refresh"), credentials)
+            sync.set_login_credentials("refresh", "old@example.com", "old-password", "")
+            service.pull_version("20261101_1/", apply_version)
+            self.assertEqual(sync.get_login_credentials("refresh"), credentials)
+
+            legacy_data = json.loads(payload)
+            legacy_data["_codex_session_manager"].pop("login_credentials")
+            payload = json.dumps(legacy_data).encode("utf-8")
+            service.pull_version("20261101_1/", apply_version)
+            self.assertEqual(sync.get_login_credentials("refresh"), credentials)
 
     def test_missing_totp_waits_for_user_and_untrusted_origin_is_not_filled(self):
         with sync_playwright() as playwright:
