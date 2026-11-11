@@ -53,7 +53,6 @@ class _PendingLogin:
     code_verifier: str
     redirect_uri: str
     proxy_url: str
-    expected_account_id: str = ""
 
 
 class AuthLoginService:
@@ -97,11 +96,10 @@ class AuthLoginService:
         proxy_url: str = "",
         log: Callable[[str], None] | None = None,
         credentials: LoginCredentials | None = None,
-        expected_account_id: str = "",
         callback_port: int | None = None,
     ) -> None:
         with self._login_lock:
-            self._start_login(proxy_url, log, credentials, expected_account_id, callback_port)
+            self._start_login(proxy_url, log, credentials, callback_port)
 
     @property
     def session_id(self) -> int:
@@ -113,7 +111,6 @@ class AuthLoginService:
         proxy_url: str = "",
         log: Callable[[str], None] | None = None,
         credentials: LoginCredentials | None = None,
-        expected_account_id: str = "",
         callback_port: int | None = None,
     ) -> None:
         if credentials is not None:
@@ -147,7 +144,6 @@ class AuthLoginService:
                 code_verifier=code_verifier,
                 redirect_uri=redirect_uri,
                 proxy_url=proxy_url,
-                expected_account_id=expected_account_id,
             )
         Thread(
             target=self._login_worker, args=(authorize_url, credentials, proxy_url, log, session_id, done),
@@ -159,8 +155,7 @@ class AuthLoginService:
         try:
             status("请在浏览器中登录，可从登录信息窗口复制账号、密码和验证码")
             self._open_authorize_url(authorize_url)
-            if not done.wait(300):
-                raise RuntimeError("登录超时，请重新更新授权。")
+            done.wait()
         except RuntimeError as exc:
             self._notify_result(None, str(exc), session_id)
         except Exception:
@@ -298,9 +293,6 @@ class AuthLoginService:
                 pending_login.proxy_url,
             )
             auth_data = self._build_auth_data(token_data)
-            account_id = str(auth_data["tokens"].get("account_id") or "")
-            if pending_login.expected_account_id and account_id != pending_login.expected_account_id:
-                raise RuntimeError("登录结果与选中账号不一致，未保存授权。")
             with self._lock:
                 if pending_login.session_id != self._session_id or self._done.is_set():
                     return "登录已取消，未保存授权。"

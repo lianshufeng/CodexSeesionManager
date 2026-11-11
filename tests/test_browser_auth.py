@@ -133,7 +133,7 @@ class BrowserAuthAcceptance(unittest.TestCase):
                 with build_opener(ProxyHandler({})).open(callback, timeout=5) as response:
                     self.assertEqual(response.status, 200)
             with patch.object(service, "_open_authorize_url", side_effect=simulate_browser):
-                service.start_login(credentials=LoginCredentials("test@example.com", "test-password"), expected_account_id="test", callback_port=0)
+                service.start_login(credentials=LoginCredentials("test@example.com", "test-password"), callback_port=0)
                 self.assertTrue(finished.wait(10))
             self.assertEqual(len(outcomes), 1)
             self.assertEqual(outcomes[0][1], "")

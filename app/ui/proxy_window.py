@@ -2592,7 +2592,6 @@ del "%~f0" >nul 2>nul
             self.auth_login_service.start_login(
                 proxy_url, log=lambda message: print(message, flush=True),
                 credentials=credentials,
-                expected_account_id=row.account_id if isinstance(row, AuthFileRow) else "",
             )
             if self._login_credentials_window is not None and self._login_credentials_window.winfo_exists():
                 self._login_credentials_window.destroy()
