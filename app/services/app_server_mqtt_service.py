@@ -98,6 +98,10 @@ class AppServerMqttService:
 
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
+        self._launch_thread: threading.Thread | None = None
+        self._retiring_threads: list[threading.Thread] = []
+        self._launch_cancel = threading.Event()
+        self.settings: MqttSettings | None = None
         self._stop = threading.Event()
         self.status = '未启动'
         self.error = ''
@@ -312,26 +316,102 @@ class AppServerMqttService:
 
     @property
     def busy(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return any(thread is not None and thread.is_alive()
+                   for thread in (self._thread, self._launch_thread, *self._retiring_threads))
+
+    def start_after_launch(self, exe: Path, pid: int, launched_at: float,
+                           *, timeout: float = 30, interval: float = 0.5) -> None:
+        """等待本次桌面启动的子进程，旧探针清理完成后复用注入流程。"""
+        previous = tuple(dict.fromkeys(thread for thread in (
+            self._thread, self._launch_thread, *self._retiring_threads)
+            if thread is not None and thread.is_alive()))
+        self.stop()
+        self._retiring_threads = list(previous)
+        cancel = self._launch_cancel = threading.Event()
+        self.status, self.error = '等待 App Server', ''
+        self._record(self.status, f'{exe.name} · 最多等待 {timeout:g} 秒')
+        self._launch_thread = threading.Thread(
+            target=self._wait_after_launch,
+            args=(exe, pid, launched_at, timeout, interval, previous, cancel), daemon=True)
+        self._launch_thread.start()
+
+    def _wait_after_launch(self, exe: Path, pid: int, launched_at: float,
+                           timeout: float, interval: float, previous: tuple,
+                           cancel: threading.Event) -> None:
+        deadline = time.monotonic() + timeout
+        try:
+            for thread in previous:
+                while thread is not None and thread.is_alive():
+                    if cancel.wait(interval):
+                        return
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('旧远程服务尚未停止，请稍后手动重试')
+            if cancel.is_set():
+                return
+            self.target = None
+            self.status = '等待 App Server'
+            settings = MqttSettingsStore().load()
+            self.settings = settings
+            while not cancel.is_set():
+                candidates = []
+                for target in discover_app_servers():
+                    if target.created < launched_at:
+                        continue
+                    try:
+                        parents = psutil.Process(target.pid).parents()
+                        if any(parent.create_time() >= launched_at
+                               and (parent.pid == pid or Path(parent.exe()) == exe)
+                               for parent in parents):
+                            candidates.append(target)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                if len(candidates) == 1:
+                    if cancel.is_set():
+                        return
+                    self._stop.clear()
+                    # stop() 同时设置两个事件，避免取消与开始注入交错。
+                    if cancel.is_set():
+                        self._stop.set()
+                        return
+                    self._prepare_start(settings, candidates[0])
+                    self._worker(settings, candidates[0])
+                    return
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('未找到本次启动唯一对应的 App Server，可在远程服务窗口手动重试')
+                cancel.wait(interval)
+        except Exception as exc:
+            self.status, self.error = '自动注入失败', f'{type(exc).__name__}：{exc}'
+            self._record(self.status, self.error)
+        finally:
+            if cancel.is_set():
+                self.status, self.error = '已停止', ''
+
+    def _prepare_start(self, settings: MqttSettings, target: AppServerTarget) -> None:
+        settings.validate()
+        self.settings = settings
+        self.status, self.error = '正在启动', ''
+        self.target = target
+        self._record('正在启动', f'PID {target.pid} · MQTT 端口 {settings.port}')
+        self.count = self.dropped = 0
 
     def start(self, settings: MqttSettings, target: AppServerTarget) -> None:
         if self.busy:
             raise RuntimeError('监听已经启动或正在停止')
         settings.validate()
         self._stop.clear()
-        self.status, self.error = '正在启动', ''
-        self.target = target
-        self._record('正在启动', f'PID {target.pid} · MQTT 端口 {settings.port}')
-        self.count = self.dropped = 0
+        self._prepare_start(settings, target)
         self._thread = threading.Thread(target=self._worker, args=(settings, target), daemon=True)
         self._thread.start()
 
     def stop(self, *, wait: bool = False) -> None:
+        self._launch_cancel.set()
         self._stop.set()
         if self.busy:
             self.status = '正在停止'
-        if wait and self._thread is not None:
-            self._thread.join(timeout=5)
+        if wait:
+            for thread in dict.fromkeys((self._thread, self._launch_thread, *self._retiring_threads)):
+                if thread is not None:
+                    thread.join(timeout=5)
 
     def _worker(self, settings: MqttSettings, target: AppServerTarget) -> None:
         try:

@@ -4842,14 +4842,17 @@ del "%~f0" >nul 2>nul
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         continue
             try:
-                activate_packaged_app(app_id, args[1:])
+                launched_at = time.time()
+                pid = activate_packaged_app(app_id, args[1:])
             except OSError as exc:
                 self.codex_local_config_service.set_proxy_environment(None)
                 messagebox.showerror("启动失败", str(exc))
                 return False
             self.codex_retry_service.start()
+            self._app_server_mqtt.start_after_launch(exe, pid, launched_at)
             return True
-        subprocess.Popen(
+        launched_at = time.time()
+        process = subprocess.Popen(
             args,
             cwd=current_dir,
             env=env,
@@ -4859,6 +4862,7 @@ del "%~f0" >nul 2>nul
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.codex_retry_service.start()
+        self._app_server_mqtt.start_after_launch(exe, process.pid, launched_at)
         return True
 
     def _is_cli_codex_executable(self, path: Path) -> bool:

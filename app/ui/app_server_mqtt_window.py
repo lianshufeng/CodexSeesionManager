@@ -22,6 +22,7 @@ class AppServerMqttWindow:
         self._refresh_job = None
         self._last_events = ()
         self._was_busy = False
+        self._displayed_settings = None
         self._detail_popup = None
         self._detail_hide_job = None
         self._hovered_detail = ''
@@ -175,6 +176,8 @@ class AppServerMqttWindow:
         self.targets.configure(values=list(self.processes))
         if self.service.busy and self.service.target is not None:
             self.target.set(str(self.service.target.pid))
+        elif self.service.busy:
+            self.target.set('')
         elif self.target.get() not in self.processes:
             self.target.set(next(iter(self.processes)) if len(self.processes) == 1 else '')
 
@@ -204,6 +207,16 @@ class AppServerMqttWindow:
             self.window.after_cancel(self._refresh_job)
             self._refresh_job = None
         busy = self.service.busy
+        if not busy:
+            self._displayed_settings = None
+        if busy:
+            self.target.set(str(self.service.target.pid) if self.service.target is not None else '')
+        settings = self.service.settings
+        if busy and settings is not None and settings != self._displayed_settings:
+            for variable, value in ((self.port, str(settings.port)), (self.host, settings.host),
+                                    (self.username, settings.username), (self.password, settings.password)):
+                variable.set(value)
+            self._displayed_settings = settings
         if self._was_busy and not busy:
             self.refresh()
         self._was_busy = busy

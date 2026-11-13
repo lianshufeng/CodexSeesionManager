@@ -21,3 +21,4 @@
 /tests/*
 !/tests/test_browser_auth.py
 !/tests/test_quota_recovery.py
+!/tests/test_app_server_auto_start.py
