@@ -47,12 +47,23 @@ class CloudSyncService:
         self.auth_dir = self.root_dir / "auth"
 
     def list_versions(self) -> list[CloudSyncVersion]:
-        client = self._create_client()
-        prefixes = self._list_version_prefixes(client)
-        versions = [self._build_version(client, prefix) for prefix in prefixes]
-        return sorted(versions, key=lambda item: self._version_sort_key(item.prefix), reverse=True)
+        versions, _ = self._list_versions(self._create_client())
+        return versions
+
+    def list_versions_with_files(self, prefix: str) -> tuple[list[CloudSyncVersion], list[CloudSyncFile]]:
+        self._validate_version_prefix(prefix)
+        return self._list_versions(self._create_client(), files_prefix=prefix)
 
     def sync_auth(self) -> CloudSyncVersion:
+        client, prefix = self._upload_auth()
+        return self._build_version(client, prefix)
+
+    def sync_auth_and_list_versions(self) -> list[CloudSyncVersion]:
+        client, _ = self._upload_auth()
+        versions, _ = self._list_versions(client)
+        return versions
+
+    def _upload_auth(self):
         if not self.auth_dir.exists() or not self.auth_dir.is_dir():
             raise RuntimeError(f"找不到 auth 目录: {self.auth_dir}")
 
@@ -76,7 +87,7 @@ class CloudSyncService:
                 client.upload_file(str(path), self.config.bucket_name, key)
         if config_path.exists() and config_path.is_file():
             client.upload_file(str(config_path), self.config.bucket_name, f"{prefix}config.json")
-        return self._build_version(client, prefix)
+        return client, prefix
 
     def delete_version(self, prefix: str) -> None:
         self._validate_version_prefix(prefix)
@@ -101,16 +112,18 @@ class CloudSyncService:
                 key = str(item.get("Key") or "")
                 if not key or key.endswith("/"):
                     continue
-                modified = item.get("LastModified")
-                files.append(
-                    CloudSyncFile(
-                        key=key,
-                        relative_path=key.removeprefix(prefix),
-                        size=int(item.get("Size") or 0),
-                        last_modified=modified.strftime("%Y-%m-%d %H:%M:%S") if modified is not None else "",
-                    )
-                )
+                files.append(self._version_file(item, key, prefix))
         return sorted(files, key=lambda item: item.relative_path)
+
+    @staticmethod
+    def _version_file(item, key: str, prefix: str) -> CloudSyncFile:
+        modified = item.get("LastModified")
+        return CloudSyncFile(
+            key=key,
+            relative_path=key.removeprefix(prefix),
+            size=int(item.get("Size") or 0),
+            last_modified=modified.strftime("%Y-%m-%d %H:%M:%S") if modified is not None else "",
+        )
 
     def download_file_to(self, key: str, target_path: Path) -> None:
         if not key:
@@ -205,10 +218,10 @@ class CloudSyncService:
             return f"https://{value}"
         return value
 
-    def _list_version_prefixes(self, client) -> list[str]:
+    def _list_version_prefixes(self, client, key_prefix: str) -> list[str]:
         prefixes: set[str] = set()
         paginator = client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.config.bucket_name, Delimiter="/"):
+        for page in paginator.paginate(Bucket=self.config.bucket_name, Prefix=key_prefix, Delimiter="/"):
             for item in page.get("CommonPrefixes", []):
                 prefix = str(item.get("Prefix") or "")
                 if _VERSION_PREFIX_PATTERN.match(prefix):
@@ -221,32 +234,43 @@ class CloudSyncService:
                     prefixes.add(prefix)
         return list(prefixes)
 
-    def _build_version(self, client, prefix: str) -> CloudSyncVersion:
-        keys = []
-        size = 0
-        last_modified = ""
+    def _list_versions(
+        self, client, *, key_prefix: str = "", files_prefix: str = "",
+    ) -> tuple[list[CloudSyncVersion], list[CloudSyncFile]]:
+        versions: dict[str, CloudSyncVersion] = {}
+        files: list[CloudSyncFile] = []
         paginator = client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.config.bucket_name, Prefix=prefix):
+        for page in paginator.paginate(Bucket=self.config.bucket_name, Prefix=key_prefix):
             for item in page.get("Contents", []):
-                keys.append(str(item.get("Key") or ""))
-                size += int(item.get("Size") or 0)
-                modified = item.get("LastModified")
-                if modified is not None:
-                    modified_text = modified.strftime("%Y-%m-%d %H:%M:%S")
-                    if modified_text > last_modified:
-                        last_modified = modified_text
-        return CloudSyncVersion(
-            name=prefix.rstrip("/"),
-            prefix=prefix,
-            object_count=len(keys),
-            size=size,
-            last_modified=last_modified,
+                key = str(item.get("Key") or "")
+                name, separator, _ = key.partition("/")
+                prefix = f"{name}/"
+                if _VERSION_PREFIX_PATTERN.match(prefix) is None:
+                    continue
+                version = versions.get(prefix)
+                if version is None:
+                    version = versions[prefix] = CloudSyncVersion(name, prefix, 0, 0, "")
+                if not separator:
+                    continue
+                file_item = self._version_file(item, key, prefix)
+                version.object_count += 1
+                version.size += file_item.size
+                version.last_modified = max(version.last_modified, file_item.last_modified)
+                if prefix == files_prefix and not key.endswith("/"):
+                    files.append(file_item)
+        return (
+            sorted(versions.values(), key=lambda item: self._version_sort_key(item.prefix), reverse=True),
+            sorted(files, key=lambda item: item.relative_path),
         )
+
+    def _build_version(self, client, prefix: str) -> CloudSyncVersion:
+        versions, _ = self._list_versions(client, key_prefix=prefix)
+        return versions[0] if versions else CloudSyncVersion(prefix.rstrip("/"), prefix, 0, 0, "")
 
     def _next_version_prefix(self, client) -> str:
         today = datetime.now().strftime("%Y%m%d")
         max_version = 0
-        for prefix in self._list_version_prefixes(client):
+        for prefix in self._list_version_prefixes(client, f"{today}_"):
             match = _VERSION_PREFIX_PATTERN.match(prefix)
             if match is None or match.group(1) != today:
                 continue

@@ -1374,16 +1374,19 @@ class ProxyWindow:
         Thread(target=self._cloud_sync_worker, args=(service, action, selected_version), daemon=True).start()
 
     def _create_cloud_sync_service(self) -> CloudSyncService | None:
-        config = CloudSyncConfig(
+        config = self._cloud_sync_config()
+        if not config.s3_address or not config.bucket_name or not config.account or not config.password:
+            messagebox.showwarning("云同步", "请先填写云同步配置。", parent=self._cloud_storage_window)
+            return None
+        return CloudSyncService(config, root_dir=app_root())
+
+    def _cloud_sync_config(self) -> CloudSyncConfig:
+        return CloudSyncConfig(
             s3_address=self.cloud_s3_address_var.get().strip(),
             bucket_name=self.cloud_bucket_name_var.get().strip(),
             account=self.cloud_account_var.get().strip(),
             password=self.cloud_password_var.get(),
         )
-        if not config.s3_address or not config.bucket_name or not config.account or not config.password:
-            messagebox.showwarning("云同步", "请先填写云同步配置。", parent=self._cloud_storage_window)
-            return None
-        return CloudSyncService(config, root_dir=app_root())
 
     def _get_selected_cloud_sync_version(self) -> CloudSyncVersion | None:
         if self._cloud_sync_tree is None:
@@ -1618,8 +1621,7 @@ class ProxyWindow:
                         service.delete_file(key)
                     elif prefix:
                         service.delete_prefix(prefix)
-                    files = service.list_version_files(version.prefix)
-                    versions = service.list_versions()
+                    versions, files = service.list_versions_with_files(version.prefix)
                 except Exception as exc:
                     error = str(exc)
                 self._post_ui(lambda: finish_delete(files, versions, error))
@@ -1668,18 +1670,13 @@ class ProxyWindow:
             if action == CloudSyncAction.REFRESH:
                 versions = service.list_versions()
             elif action == CloudSyncAction.UPLOAD:
-                service.sync_auth()
-                versions = service.list_versions()
+                versions = service.sync_auth_and_list_versions()
             elif action == CloudSyncAction.PULL:
                 assert selected_version is not None
                 def apply_version(version_root: Path) -> None:
                     nonlocal message
                     message = self.auth_sync_service.apply_cloud_version(version_root, service._apply_pulled_version)
                 service.pull_version(selected_version.prefix, apply_version=apply_version)
-                try:
-                    versions = service.list_versions()
-                except Exception:
-                    message += "\n本地数据已更新，但云端版本列表刷新失败，请稍后重试。"
             elif action == CloudSyncAction.DELETE:
                 assert selected_version is not None
                 service.delete_version(selected_version.prefix)
@@ -1700,10 +1697,13 @@ class ProxyWindow:
         if error:
             messagebox.showerror("云同步失败", error, parent=self._cloud_storage_window)
             return
-        if versions or action != CloudSyncAction.PULL:
+        if action != CloudSyncAction.PULL:
             self._render_cloud_sync_versions(versions)
         if action == CloudSyncAction.PULL:
+            previous_cloud_config = self._cloud_sync_config()
             self._reload_config_from_disk()
+            if self._cloud_sync_config() != previous_cloud_config:
+                self._render_cloud_sync_versions([])
             self.auth_sync_service.invalidate_cached_state()
             self.refresh_auth_files(update_status=False)
             self.auth_usage_service.request_refresh()
@@ -1884,8 +1884,9 @@ class ProxyWindow:
             elif prefix:
                 service.delete_prefix(prefix)
             if self._cloud_file_version is not None:
-                files = service.list_version_files(self._cloud_file_version.prefix)
-            versions = service.list_versions()
+                versions, files = service.list_versions_with_files(self._cloud_file_version.prefix)
+            else:
+                versions = service.list_versions()
         except Exception as exc:
             error = str(exc)
         self._post_ui(lambda: self._finish_cloud_file_delete(files, versions, error))
